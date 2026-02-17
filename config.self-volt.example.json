@@ -1,0 +1,108 @@
+{
+  "server": {
+    "name": "Self-Volt",
+    "version": "1.0.0",
+    "mode": "self-volt",
+    "url": "http://localhost:5000"
+  },
+  "storage": {
+    "type": "json",
+    "json": {
+      "dataDir": "./data"
+    },
+    "sqlite": {
+      "dbPath": "./data/voltage.db"
+    },
+    "mysql": {
+      "host": "localhost",
+      "port": 3306,
+      "database": "voltchat",
+      "user": "root",
+      "password": "",
+      "connectionLimit": 10
+    },
+    "mariadb": {
+      "host": "localhost",
+      "port": 3306,
+      "database": "voltchat",
+      "user": "root",
+      "password": ""
+    },
+    "postgres": {
+      "host": "localhost",
+      "port": 5432,
+      "database": "voltchat",
+      "user": "postgres",
+      "password": ""
+    },
+    "cockroachdb": {
+      "host": "localhost",
+      "port": 26257,
+      "database": "voltchat",
+      "user": "root",
+      "password": "",
+      "ssl": true
+    },
+    "mssql": {
+      "host": "localhost",
+      "port": 1433,
+      "database": "voltchat",
+      "user": "sa",
+      "password": ""
+    },
+    "mongodb": {
+      "host": "localhost",
+      "port": 27017,
+      "database": "voltchat",
+      "user": "",
+      "password": ""
+    },
+    "redis": {
+      "host": "localhost",
+      "port": 6379,
+      "password": "",
+      "db": 0
+    }
+  },
+  "auth": {
+    "type": "local",
+    "local": {
+      "enabled": true,
+      "allowRegistration": true,
+      "minPasswordLength": 8,
+      "passwordRequirements": {
+        "requireUppercase": false,
+        "requireNumbers": true,
+        "requireSymbols": false
+      }
+    },
+    "oauth": {
+      "enabled": false
+    }
+  },
+  "security": {
+    "jwtSecret": "CHANGE_ME_IN_PRODUCTION",
+    "jwtExpiry": "7d",
+    "bcryptRounds": 12
+  },
+  "federation": {
+    "enabled": false,
+    "serverName": null,
+    "allowedServers": []
+  },
+  "features": {
+    "discovery": false,
+    "selfVolt": true,
+    "ageVerification": false,
+    "voiceChannels": true,
+    "videoChannels": true,
+    "e2eEncryption": true,
+    "communities": true,
+    "threads": true
+  },
+  "limits": {
+    "maxUploadSize": 10485760,
+    "maxServersPerUser": 100,
+    "maxMessageLength": 4000
+  }
+}

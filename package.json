@@ -1,0 +1,33 @@
+{
+  "name": "voltage",
+  "version": "1.0.0",
+  "description": "Voltage - The decentralized chat platform (Volt)",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "volt": "./scripts/scale.js"
+  },
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "migrate": "node scripts/migrate.js",
+    "scale": "node scripts/scale.js",
+    "setup": "node scripts/scale.js setup"
+  },
+  "keywords": ["chat", "messaging", "federation", "decentralized", "voltage", "volt"],
+  "author": "Volt Team",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.7",
+    "bcrypt": "^5.1.1",
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "node-cache": "^5.1.2",
+    "socket.io": "^4.7.4",
+    "uuid": "^9.0.1"
+  }
+}
