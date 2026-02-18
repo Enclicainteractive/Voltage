@@ -2,7 +2,10 @@ import { v4 as uuidv4 } from 'uuid'
 import { addMessage, editMessage, deleteMessage, findChannelById } from '../routes/channelRoutes.js'
 import { dmMessageService, dmService, userService, reactionService } from './dataService.js'
 import { e2eService, userKeyService } from './e2eService.js'
+import { e2eTrueService } from './e2eTrueService.js'
+import { botService } from './botService.js'
 import * as crypto from './cryptoService.js'
+import config from '../config/config.js'
 
 const onlineUsers = new Map()
 const userSockets = new Map()
@@ -101,7 +104,7 @@ const isChannelAgeRestricted = (channelId) => {
 
 // Parse mentions from message content (@username, @everyone, @here)
 const parseMentions = (content) => {
-  const mentions = { users: [], everyone: false, here: false }
+  const mentions = { users: [], usernames: [], everyone: false, here: false }
   const mentionRegex = /@([a-zA-Z0-9_\-\.]+)/g
   let match
 
@@ -118,8 +121,13 @@ const parseMentions = (content) => {
         u.username?.toLowerCase() === username.toLowerCase() || 
         u.email?.toLowerCase().startsWith(username.toLowerCase())
       )
-      if (mentionedUser && !mentions.users.includes(mentionedUser.id)) {
-        mentions.users.push(mentionedUser.id)
+      if (mentionedUser) {
+        if (!mentions.users.includes(mentionedUser.id)) {
+          mentions.users.push(mentionedUser.id)
+        }
+        if (!mentions.usernames.includes(mentionedUser.username || username)) {
+          mentions.usernames.push(mentionedUser.username || username)
+        }
       }
     }
   }
@@ -129,73 +137,55 @@ const parseMentions = (content) => {
 
 // Send notification events for mentions
 const sendMentionNotifications = (io, senderSocket, channelId, message, mentions) => {
-  const channelUsers = io.sockets.adapter.rooms.get(`channel:${channelId}`) || new Set()
+  const serverId = senderSocket.currentServer
+  const notifyPayloadBase = {
+    channelId,
+    messageId: message.id,
+    senderId: message.userId,
+    senderName: message.username,
+    content: message.content.slice(0, 100)
+  }
 
-  // Handle @everyone - notify all users in the channel
+  // @everyone — notify ALL server members (not just those in the channel room)
   if (mentions.everyone) {
-    channelUsers.forEach(socketId => {
-      const socket = io.sockets.sockets.get(socketId)
-      if (socket && socket.user.id !== message.userId) {
-        socket.emit('notification:mention', {
-          type: 'everyone',
-          channelId,
-          messageId: message.id,
-          senderId: message.userId,
-          senderName: message.username,
-          content: message.content.slice(0, 100)
-        })
+    const serverRoom = serverId ? (io.sockets.adapter.rooms.get(`server:${serverId}`) || new Set()) : new Set()
+    // Fall back to channel room if no server room
+    const targetRoom = serverRoom.size > 0 ? serverRoom : (io.sockets.adapter.rooms.get(`channel:${channelId}`) || new Set())
+    const notified = new Set()
+
+    targetRoom.forEach(socketId => {
+      const s = io.sockets.sockets.get(socketId)
+      if (s && s.user.id !== message.userId && !notified.has(s.user.id)) {
+        s.emit('notification:mention', { type: 'everyone', ...notifyPayloadBase })
+        notified.add(s.user.id)
       }
     })
-    return // @everyone supersedes other mentions
+    return // @everyone supersedes other mention types
   }
 
-  // Handle @here - notify online users in the channel
+  // @here — notify ONLINE server members
   if (mentions.here) {
-    channelUsers.forEach(socketId => {
-      const socket = io.sockets.sockets.get(socketId)
-      if (socket && socket.user.id !== message.userId && onlineUsers.has(socket.user.id)) {
-        socket.emit('notification:mention', {
-          type: 'here',
-          channelId,
-          messageId: message.id,
-          senderId: message.userId,
-          senderName: message.username,
-          content: message.content.slice(0, 100)
-        })
+    const serverRoom = serverId ? (io.sockets.adapter.rooms.get(`server:${serverId}`) || new Set()) : new Set()
+    const targetRoom = serverRoom.size > 0 ? serverRoom : (io.sockets.adapter.rooms.get(`channel:${channelId}`) || new Set())
+    const notified = new Set()
+
+    targetRoom.forEach(socketId => {
+      const s = io.sockets.sockets.get(socketId)
+      if (s && s.user.id !== message.userId && onlineUsers.has(s.user.id) && !notified.has(s.user.id)) {
+        s.emit('notification:mention', { type: 'here', ...notifyPayloadBase })
+        notified.add(s.user.id)
       }
     })
   }
 
-  // Handle @username mentions
+  // @username — notify the specific user via their personal room (works whether online or offline reconnect)
   mentions.users.forEach(targetUserId => {
-    // Don't notify self
     if (targetUserId === message.userId) return
 
-    // Find if user is online and in this channel
-    let notified = false
-    channelUsers.forEach(socketId => {
-      const socket = io.sockets.sockets.get(socketId)
-      if (socket && socket.user.id === targetUserId) {
-        socket.emit('notification:mention', {
-          type: 'user',
-          channelId,
-          messageId: message.id,
-          senderId: message.userId,
-          senderName: message.username,
-          content: message.content.slice(0, 100)
-        })
-        notified = true
-      }
-    })
-
-    // Also emit to user's DM room for persistence across sessions
+    // Emit via personal room — this reaches the user wherever they are (any channel/server view)
     io.to(`user:${targetUserId}`).emit('notification:mention', {
       type: 'user',
-      channelId,
-      messageId: message.id,
-      senderId: message.userId,
-      senderName: message.username,
-      content: message.content.slice(0, 100),
+      ...notifyPayloadBase,
       offline: !onlineUsers.has(targetUserId)
     })
   })
@@ -204,9 +194,41 @@ const sendMentionNotifications = (io, senderSocket, channelId, message, mentions
 export const setupSocketHandlers = (io) => {
   startHeartbeatMonitor(io)
 
-  io.on('connection', (socket) => {
-    const userId = socket.user.id
-    console.log(`User connected: ${userId}`)
+   io.on('connection', (socket) => {
+     // Bot sockets are authenticated via vbot_ token in authMiddleware.
+     // Route them to the dedicated bot connection handler and skip all
+     // user-specific setup (voice, presence, personal rooms, etc.).
+     if (socket.botId) {
+       const bot = botService.getBot(socket.botId)
+       if (!bot) {
+         socket.disconnect(true)
+         return
+       }
+
+       botService.setBotStatus(bot.id, 'online')
+
+       for (const serverId of bot.servers) {
+         socket.join(`server:${serverId}`)
+       }
+
+       socket.emit('bot:ready', {
+         botId: bot.id,
+         name: bot.name,
+         servers: bot.servers
+       })
+
+       console.log(`[Socket] Bot ready: ${bot.name} (${bot.id}), servers: ${bot.servers.length}`)
+
+       socket.on('disconnect', () => {
+         botService.setBotStatus(bot.id, 'offline')
+         console.log(`[Socket] Bot disconnected: ${bot.name} (${bot.id})`)
+       })
+
+       return
+     }
+
+     const userId = socket.user.id
+     console.log(`User connected: ${userId}`)
 
     // Join user's personal room for mentions/notifications
     socket.join(`user:${userId}`)
@@ -285,6 +307,14 @@ export const setupSocketHandlers = (io) => {
       // Parse mentions from content
       const mentions = parseMentions(data.content)
 
+      // Build CDN/storage metadata for the message
+      const cdnConfig = config.getCdnConfig()
+      const storageInfo = {
+        cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
+        storageNode: config.getHost(),
+        serverUrl: config.getServerUrl()
+      }
+
       const message = {
         id: uuidv4(),
         channelId: data.channelId,
@@ -294,7 +324,11 @@ export const setupSocketHandlers = (io) => {
         content: data.content,
         mentions: mentions,
         timestamp: new Date().toISOString(),
-        attachments: data.attachments || []
+        attachments: data.attachments || [],
+        storage: storageInfo,
+        encrypted: data.encrypted || false,
+        iv: data.iv || null,
+        epoch: data.epoch || null
       }
 
       addMessage(data.channelId, message)
@@ -302,6 +336,20 @@ export const setupSocketHandlers = (io) => {
 
       // Send notifications for mentions
       sendMentionNotifications(io, socket, data.channelId, message, mentions)
+
+      // Deliver to bots in the server
+      if (socket.currentServer) {
+        const serverBots = botService.getServerBots(socket.currentServer)
+        for (const bot of serverBots) {
+          if (bot.intents?.includes('GUILD_MESSAGES') || bot.intents?.includes('MESSAGE_CONTENT')) {
+            botService.deliverWebhookEvent(bot.id, 'MESSAGE_CREATE', {
+              message,
+              serverId: socket.currentServer,
+              channelId: data.channelId
+            })
+          }
+        }
+      }
     })
 
     socket.on('message:typing', (data) => {
@@ -514,6 +562,13 @@ export const setupSocketHandlers = (io) => {
     socket.on('dm:send', (data) => {
       const { conversationId, content, recipientId } = data
       
+      const cdnConfig = config.getCdnConfig()
+      const storageInfo = {
+        cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
+        storageNode: config.getHost(),
+        serverUrl: config.getServerUrl()
+      }
+
       const message = {
         id: uuidv4(),
         conversationId,
@@ -522,7 +577,11 @@ export const setupSocketHandlers = (io) => {
         avatar: socket.user.avatar,
         content,
         timestamp: new Date().toISOString(),
-        attachments: data.attachments || []
+        attachments: data.attachments || [],
+        storage: storageInfo,
+        encrypted: data.encrypted || false,
+        iv: data.iv || null,
+        epoch: data.epoch || null
       }
 
       dmMessageService.addMessage(conversationId, message)
@@ -733,6 +792,122 @@ export const setupSocketHandlers = (io) => {
       }
     })
 
+    // === True E2EE handlers ===
+
+    socket.on('e2e-true:register-device', (data) => {
+      const { deviceId, identityPublicKey, signedPreKey, signedPreKeySignature, oneTimePreKeys } = data
+      if (!deviceId || !identityPublicKey || !signedPreKey) return
+
+      e2eTrueService.uploadDeviceKeyBundle(userId, deviceId, {
+        identityPublicKey, signedPreKey, signedPreKeySignature,
+        oneTimePreKeys: oneTimePreKeys || []
+      })
+
+      socket.deviceId = deviceId
+      socket.emit('e2e-true:device-registered', { deviceId })
+    })
+
+    socket.on('e2e-true:request-device-keys', (data) => {
+      const { targetUserId, targetDeviceId } = data
+      const bundle = e2eTrueService.getDeviceKeyBundle(targetUserId, targetDeviceId)
+      socket.emit('e2e-true:device-keys', { targetUserId, targetDeviceId, bundle })
+    })
+
+    socket.on('e2e-true:distribute-sender-key', (data) => {
+      const { groupId, epoch, toUserId, toDeviceId, encryptedKeyBlob } = data
+      if (!groupId || !epoch || !toUserId || !toDeviceId || !encryptedKeyBlob) return
+
+      e2eTrueService.storeEncryptedSenderKey(
+        groupId, epoch, userId, socket.deviceId || 'default',
+        toUserId, toDeviceId, encryptedKeyBlob
+      )
+
+      e2eTrueService.queueKeyUpdate(toUserId, toDeviceId, {
+        groupId, epoch, encryptedKeyBlob,
+        fromUserId: userId, fromDeviceId: socket.deviceId || 'default'
+      })
+
+      emitToUser(io, toUserId, 'e2e-true:sender-key-available', {
+        groupId, epoch, fromUserId: userId
+      })
+    })
+
+    socket.on('e2e-true:fetch-queued-updates', (data) => {
+      const deviceId = data?.deviceId || socket.deviceId || 'default'
+      const keyUpdates = e2eTrueService.dequeueKeyUpdates(userId, deviceId)
+      const messages = e2eTrueService.dequeueEncryptedMessages(userId, deviceId)
+      socket.emit('e2e-true:queued-updates', { keyUpdates, messages })
+    })
+
+    socket.on('e2e-true:advance-epoch', (data) => {
+      const { groupId, reason } = data
+      if (!groupId) return
+      const epoch = e2eTrueService.advanceEpoch(groupId, reason || 'manual', userId)
+      if (epoch) {
+        io.to(`server:${groupId}`).emit('e2e-true:epoch-advanced', {
+          groupId, epoch: epoch.epoch, reason, triggeredBy: userId
+        })
+      }
+    })
+
+    // === Bot socket handlers ===
+
+    socket.on('bot:connect', (data) => {
+      const { botToken } = data
+      if (!botToken) return
+
+      const bot = botService.getBotByToken(botToken)
+      if (!bot) {
+        socket.emit('bot:error', { error: 'Invalid bot token' })
+        return
+      }
+
+      socket.botId = bot.id
+      botService.setBotStatus(bot.id, 'online')
+
+      for (const serverId of bot.servers) {
+        socket.join(`server:${serverId}`)
+      }
+
+      socket.emit('bot:ready', {
+        botId: bot.id,
+        name: bot.name,
+        servers: bot.servers
+      })
+    })
+
+    socket.on('bot:send-message', (data) => {
+      if (!socket.botId) return
+      const bot = botService.getBot(socket.botId)
+      if (!bot || !botService.hasPermission(socket.botId, 'messages:send')) return
+
+      const { channelId, content, embeds } = data
+
+      const cdnConfig = config.getCdnConfig()
+      const storageInfo = {
+        cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
+        storageNode: config.getHost(),
+        serverUrl: config.getServerUrl()
+      }
+
+      const message = {
+        id: uuidv4(),
+        channelId,
+        userId: bot.id,
+        username: bot.name,
+        avatar: bot.avatar,
+        content: content || '',
+        embeds: embeds || [],
+        bot: true,
+        timestamp: new Date().toISOString(),
+        attachments: [],
+        storage: storageInfo
+      }
+
+      addMessage(channelId, message)
+      io.to(`channel:${channelId}`).emit('message:new', message)
+    })
+
     socket.on('e2e:leave-server', (serverId) => {
       e2eService.removeMemberKey(serverId, userId)
       io.to(`server:${serverId}`).emit('e2e:member-left', {
@@ -744,6 +919,11 @@ export const setupSocketHandlers = (io) => {
     socket.on('disconnect', (reason) => {
       console.log(`User disconnected: ${userId}, reason: ${reason}`)
       
+      // Mark bot as offline if this was a bot socket
+      if (socket.botId) {
+        botService.setBotStatus(socket.botId, 'offline')
+      }
+
       // Do not force immediate leave; rely on heartbeat timeout to clean stale voice users
       if (socket.currentVoiceChannel) {
         markVoiceHeartbeat(userId, socket.currentVoiceChannel)

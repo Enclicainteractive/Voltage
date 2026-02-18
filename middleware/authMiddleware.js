@@ -1,5 +1,12 @@
 import jwt from 'jsonwebtoken'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import config from '../config/config.js'
+import botService from '../services/botService.js'
+
+const __authDir = path.dirname(fileURLToPath(import.meta.url))
+const USERS_FILE = path.join(__authDir, '..', '..', 'data', 'users.json')
 
 const getAvatarUrl = (userId) => {
   const imageServerUrl = config.getImageServerUrl()
@@ -72,6 +79,20 @@ export const authenticateSocket = async (socket, next) => {
     return next(new Error('Authentication error'))
   }
 
+  // Bot tokens are random hex strings prefixed with 'vbot_', not JWTs.
+  // Validate them via botService and mark the socket as a bot connection
+  // so downstream handlers can distinguish bot sockets from user sockets.
+  if (token.startsWith('vbot_')) {
+    const bot = botService.getBotByToken(token)
+    if (!bot) {
+      return next(new Error('Invalid bot token'))
+    }
+    socket.bot = { id: bot.id, name: bot.name, servers: bot.servers }
+    socket.botId = bot.id
+    console.log('[Socket] Bot connected:', bot.name, `(${bot.id})`)
+    return next()
+  }
+
   try {
     const decoded = jwt.decode(token)
     
@@ -100,23 +121,27 @@ export const authenticateSocket = async (socket, next) => {
 
 // Require owner role for admin endpoints
 export const requireOwner = (req, res, next) => {
-  // For now, check if user is the first user (assumed owner)
-  // In production, you'd have a proper admin system
   const userId = req.user?.id
+  if (!userId) {
+    return res.status(403).json({ error: 'Owner access required' })
+  }
   
-  // Allow if user ID starts with specific pattern or is in admin list
-  // This is a simple check - in production use proper admin roles
   const adminUsers = config.config.security?.adminUsers || []
-  
   if (adminUsers.includes(userId)) {
     return next()
   }
-  
-  // Also allow if it's a very early user (likely the owner)
-  // This is a heuristic - consider implementing proper admin roles
-  if (userId && userId.startsWith('u_') && userId.length < 30) {
-    // First few users are likely owners in dev
-    return next()
+
+  // Check user profile for adminRole or role fields
+  try {
+    if (fs.existsSync(USERS_FILE)) {
+      const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'))
+      const user = users[userId]
+      if (user?.adminRole === 'owner' || user?.adminRole === 'admin' || user?.role === 'admin') {
+        return next()
+      }
+    }
+  } catch (err) {
+    console.error('[Auth] Error checking user role:', err.message)
   }
   
   console.warn('[Auth] Owner access denied for user:', userId)
