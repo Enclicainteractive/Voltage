@@ -1,206 +1,187 @@
 #!/usr/bin/env bash
 # =============================================================
-#  Voltage — Setup Script  (animated TUI)
+#  Voltage Setup Script — animated TUI
 # =============================================================
-set -euo pipefail
+# Use bash explicitly; avoid set -e so animations never abort
+# on non-zero subshell exits
+set -uo pipefail
 
-# ── Real ESC byte via $'...' ANSI-C quoting ──────────────────
+# ── Real ESC byte ─────────────────────────────────────────────
 ESC=$'\033'
+R="${ESC}[0m"   B="${ESC}[1m"   DM="${ESC}[2m"
+BRED="${ESC}[91m"  BGRN="${ESC}[92m"  BYLW="${ESC}[93m"
+BBLU="${ESC}[94m"  BMAG="${ESC}[95m"  BCYN="${ESC}[96m"
+BWHT="${ESC}[97m"  CYN="${ESC}[36m"   WHT="${ESC}[37m"
 
-R="${ESC}[0m"
-B="${ESC}[1m"
-DM="${ESC}[2m"
-
-BRED="${ESC}[91m"
-BGRN="${ESC}[92m"
-BYLW="${ESC}[93m"
-BBLU="${ESC}[94m"
-BMAG="${ESC}[95m"
-BCYN="${ESC}[96m"
-BWHT="${ESC}[97m"
-CYN="${ESC}[36m"
-WHT="${ESC}[37m"
-MAG="${ESC}[35m"
-
-# ── Terminal width ────────────────────────────────────────────
+# ── Terminal width (safe) ─────────────────────────────────────
 COLS=80
-_c=$(tput cols 2>/dev/null || true)
-[[ "${_c:-0}" -gt 0 ]] 2>/dev/null && COLS=$_c
+if command -v tput &>/dev/null; then
+  _c=$(tput cols 2>/dev/null) && [[ "$_c" =~ ^[0-9]+$ ]] && COLS=$(( _c > 0 ? _c : 80 ))
+fi
 
 # ── Cursor helpers ────────────────────────────────────────────
-cur_hide() { printf "${ESC}[?25l"; }
-cur_show() { printf "${ESC}[?25h"; }
-cur_up()   { printf "${ESC}[%dA" "${1:-1}"; }
-
-# Restore cursor on exit
+cur_hide() { printf '%s' "${ESC}[?25l"; }
+cur_show() { printf '%s' "${ESC}[?25h"; }
 trap 'cur_show; printf "\n"' EXIT INT TERM
 
-# ── Padding (pure bash, no bc) ────────────────────────────────
-rpad() { local n=$1 s=''; while (( n-- > 0 )); do s+=' '; done; printf '%s' "$s"; }
+# ── Helpers ───────────────────────────────────────────────────
+# Print N spaces
+spaces() { local n=$1 s=''; while [[ $n -gt 0 ]]; do s="$s "; n=$((n-1)); done; printf '%s' "$s"; }
 
-# Strip ANSI codes, return visible length in $VIS_LEN
-vis_len() {
-  local stripped
-  stripped=$(printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g')
-  VIS_LEN=${#stripped}
-}
-
-center_print() {
-  local str="$1"
-  vis_len "$str"
-  local left=$(( (COLS - VIS_LEN) / 2 ))
-  (( left < 0 )) && left=0
-  rpad "$left"
-  printf '%s\n' "$str"
+# Center a plain string (no ANSI)
+center_plain() {
+  local str="$1" color="${2:-$R}"
+  local len=${#str}
+  local left=$(( (COLS - len) / 2 ))
+  [[ $left -lt 0 ]] && left=0
+  spaces "$left"; printf '%s%s%s\n' "$color" "$str" "$R"
 }
 
 hline() {
-  local i=0; printf "${DM}${CYN}"
-  while (( i++ < COLS )); do printf '─'; done
-  printf "${R}\n"
+  local line='' i=0
+  while [[ $i -lt $COLS ]]; do line="${line}-"; i=$((i+1)); done
+  printf '%s%s%s\n' "${DM}${CYN}" "$line" "$R"
 }
 
-# ── Status helpers ────────────────────────────────────────────
-ok()   { printf "  ${BGRN}✔${R}  %s\n" "$1"; }
-info() { printf "  ${BCYN}ℹ${R}  %s\n" "$1"; }
-warn() { printf "  ${BYLW}⚠${R}  %s\n" "$1"; }
-err()  { printf "  ${BRED}✖${R}  %s\n" "$1"; }
-step() { printf "\n  ${BBLU}▶${R}  ${B}%s${R}\n" "$1"; }
+ok()   { printf "  ${BGRN}OK${R}  %s\n"   "$1"; }
+warn() { printf "  ${BYLW}!!${R}  %s\n"   "$1"; }
+err()  { printf "  ${BRED}ERR${R} %s\n"   "$1"; }
+step() { printf "\n  ${BBLU}>>${R}  ${B}%s${R}\n" "$1"; }
 
 section() {
-  printf '\n'
-  hline
-  center_print "${B}${BWHT}$1${R}"
-  hline
-  printf '\n'
+  printf '\n'; hline
+  center_plain "$1" "${B}${BWHT}"
+  hline; printf '\n'
 }
 
-# ── Spinner ───────────────────────────────────────────────────
+# ── Spinner (background process) ─────────────────────────────
 _spin_pid=0
-
 spin_start() {
-  local msg="${1:-Please wait...}"
+  local msg="${1:-Working...}"
   cur_hide
-  ( local f='⣾⣽⣻⢿⡿⣟⣯⣷' i=0
+  (
+    local chars='-\|/' i=0
     while true; do
-      printf "\r  ${BBLU}${f:$((i%8)):1}${R}  ${CYN}${msg}${R}   "
-      sleep 0.07; (( i++ ))
-    done ) &
+      ch="${chars:$((i%4)):1}"
+      printf '\r  %s%s%s  %s%s%s   ' "$BBLU" "$ch" "$R" "$CYN" "$msg" "$R"
+      sleep 0.1
+      i=$((i+1))
+    done
+  ) &
   _spin_pid=$!
 }
-
 spin_stop() {
-  [[ $_spin_pid -ne 0 ]] && { kill "$_spin_pid" 2>/dev/null; wait "$_spin_pid" 2>/dev/null || true; }
-  _spin_pid=0
-  printf "\r%${COLS}s\r"
+  if [[ $_spin_pid -ne 0 ]]; then
+    kill "$_spin_pid" 2>/dev/null
+    wait "$_spin_pid" 2>/dev/null || true
+    _spin_pid=0
+  fi
+  printf '\r%*s\r' "$COLS" ''
   cur_show
 }
 
-# ── Animated logo — character by character ────────────────────
-LOGO=(
-  "${BBLU}██╗   ██╗ ██████╗ ██╗  ████████╗ █████╗  ██████╗ ███████╗${R}"
-  "${BBLU}██║   ██║██╔═══██╗██║  ╚══██╔══╝██╔══██╗██╔════╝ ██╔════╝${R}"
-  "${BCYN}██║   ██║██║   ██║██║     ██║   ███████║██║  ███╗█████╗  ${R}"
-  "${BCYN}╚██╗ ██╔╝██║   ██║██║     ██║   ██╔══██║██║   ██║██╔══╝  ${R}"
-  "${BMAG} ╚████╔╝ ╚██████╔╝███████╗██║   ██║  ██║╚██████╔╝███████╗${R}"
-  "${BMAG}  ╚═══╝   ╚═════╝ ╚══════╝╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝${R}"
+# ── ASCII logo (pure ASCII — no multi-byte chars) ─────────────
+# Row-by-row reveal with colour cycling: blue->cyan->magenta
+LOGO_ROWS=(
+  " _   _  ___  _    _____  _    ___  _____"
+  "| | | |/ _ \| |  |_   _|/ \  / _ \| ____|"
+  "| | | | | | | |    | | / _ \| | | |  _|"
+  "| |_| | |_| | |___ | |/ ___ \ |_| | |___"
+  " \___/ \___/|_____|_/_/   \_\___/|_____|"
 )
 
-# Plain versions for width calculation
-LOGO_PLAIN=(
-  "██╗   ██╗ ██████╗ ██╗  ████████╗ █████╗  ██████╗ ███████╗"
-  "██║   ██║██╔═══██╗██║  ╚══██╔══╝██╔══██╗██╔════╝ ██╔════╝"
-  "██║   ██║██║   ██║██║     ██║   ███████║██║  ███╗█████╗  "
-  "╚██╗ ██╔╝██║   ██║██║     ██║   ██╔══██║██║   ██║██╔══╝  "
-  " ╚████╔╝ ╚██████╔╝███████╗██║   ██║  ██║╚██████╔╝███████╗"
-  "  ╚═══╝   ╚═════╝ ╚══════╝╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝"
-)
-
-LOGO_COLOURS=("$BBLU" "$BBLU" "$BCYN" "$BCYN" "$BMAG" "$BMAG")
+LOGO_COLOURS=("$BBLU" "$BBLU" "$BCYN" "$BMAG" "$BMAG")
 
 animate_logo() {
-  cur_hide
   printf '\n'
   local ri=0
-  for plain in "${LOGO_PLAIN[@]}"; do
-    local col="${LOGO_COLOURS[$ri]}"
-    local vl=${#plain}
-    local left=$(( (COLS - vl) / 2 ))
-    (( left < 0 )) && left=0
-    rpad "$left"
-    # Print character by character
-    local ci=0
-    while (( ci < ${#plain} )); do
-      printf "${col}%s${R}" "${plain:$ci:1}"
-      sleep 0.003
-      (( ci++ ))
+  for row in "${LOGO_ROWS[@]}"; do
+    local col="${LOGO_COLOURS[$ri]:-$BMAG}"
+    local len=${#row}
+    local left=$(( (COLS - len) / 2 ))
+    [[ $left -lt 0 ]] && left=0
+    spaces "$left"
+    # Print row char by char for the animation effect
+    local i=0
+    while [[ $i -lt $len ]]; do
+      printf '%s%s%s' "$col" "${row:$i:1}" "$R"
+      i=$((i+1))
+      # tiny delay — use printf timing trick without sleep subprocess overhead
+      read -rt 0.004 _ </dev/null 2>/dev/null || true
     done
     printf '\n'
-    (( ri++ ))
+    ri=$((ri+1))
   done
-  printf '\n'
 
-  # Subtitle — character by character
-  local sub="⚡  The Decentralized Chat Platform  ⚡"
+  # Subtitle
+  printf '\n'
+  local sub="<<  The Decentralized Chat Platform  >>"
   local sl=${#sub}
   local sleft=$(( (COLS - sl) / 2 ))
-  (( sleft < 0 )) && sleft=0
-  rpad "$sleft"
+  [[ $sleft -lt 0 ]] && sleft=0
+  spaces "$sleft"
   local si=0
-  while (( si < ${#sub} )); do
-    printf "${BYLW}%s${R}" "${sub:$si:1}"
-    sleep 0.022
-    (( si++ ))
+  while [[ $si -lt $sl ]]; do
+    printf '%s%s%s' "$BYLW" "${sub:$si:1}" "$R"
+    read -rt 0.018 _ </dev/null 2>/dev/null || true
+    si=$((si+1))
   done
   printf '\n\n'
+}
+
+# ── Initialising animation (single overwriting line) ──────────
+init_animation() {
+  cur_hide
+  local i=0
+  while [[ $i -lt 16 ]]; do
+    local dots=''
+    case $((i % 4)) in
+      1) dots='.'   ;;
+      2) dots='..'  ;;
+      3) dots='...' ;;
+    esac
+    local msg="Initialising subsystems${dots}"
+    local mlen=${#msg}
+    local left=$(( (COLS - mlen) / 2 ))
+    [[ $left -lt 0 ]] && left=0
+    printf '\r'; spaces "$left"
+    printf '%s%s%s%s%s     ' "$CYN" "Initialising subsystems" "$BYLW" "$dots" "$R"
+    sleep 0.13
+    i=$((i+1))
+  done
+  printf '\r%*s\r\n' "$COLS" ''
   cur_show
 }
 
-# ── Boot sequence ─────────────────────────────────────────────
+# ── Charging bar (single growing line) ────────────────────────
+charging_bar() {
+  local label="  Charging the Volt..."
+  local ll=${#label}
+  local lleft=$(( (COLS - ll) / 2 ))
+  [[ $lleft -lt 0 ]] && lleft=0
+  spaces "$lleft"; printf '%s%s%s\n\n' "$DM" "$label" "$R"
+
+  # bar width = terminal width minus margins
+  local bw=$(( COLS - 8 ))
+  [[ $bw -lt 10 ]] && bw=10
+  local bleft=$(( (COLS - bw - 2) / 2 ))
+  [[ $bleft -lt 0 ]] && bleft=0
+
+  spaces "$bleft"; printf '%s[%s' "$BBLU" "$R"
+  local bi=0
+  while [[ $bi -lt $bw ]]; do
+    printf '%s#%s' "$BBLU" "$R"
+    read -rt 0.015 _ </dev/null 2>/dev/null || true
+    bi=$((bi+1))
+  done
+  printf '%s]%s\n\n' "$BBLU" "$R"
+}
+
 boot_sequence() {
   clear
   animate_logo
-
-  # "Initialising…" — single overwriting line
-  cur_hide
-  local i=0
-  while (( i < 16 )); do
-    local dots=''
-    case $(( i % 4 )) in 1) dots='.' ;; 2) dots='..' ;; 3) dots='...' ;; esac
-    local msg="${CYN}Initialising subsystems${BYLW}${dots}${R}"
-    # print on current line, pad right to clear leftovers
-    vis_len "Initialising subsystems${dots}"
-    local left=$(( (COLS - VIS_LEN) / 2 ))
-    (( left < 0 )) && left=0
-    printf "\r"
-    rpad "$left"
-    printf "${CYN}Initialising subsystems${BYLW}${dots}${R}     "
-    sleep 0.13
-    (( i++ ))
-  done
-  printf "\n\n"
-  cur_show
-
-  # Charging bar — grows on ONE line
-  local label="Charging the Volt..."
-  local ll=${#label}
-  local lleft=$(( (COLS - ll) / 2 ))
-  (( lleft < 0 )) && lleft=0
-  rpad "$lleft"; printf "${DM}${label}${R}\n\n"
-
-  local bw=$(( COLS - 4 ))
-  (( bw < 20 )) && bw=20
-  local bleft=$(( (COLS - bw - 2) / 2 ))
-  (( bleft < 0 )) && bleft=0
-
-  rpad "$bleft"; printf "${BBLU}[${R}"
-  local bi=0
-  while (( bi < bw )); do
-    printf "${BBLU}⚡${R}"
-    sleep 0.012
-    (( bi++ ))
-  done
-  printf "${BBLU}]${R}\n\n"
+  init_animation
+  charging_bar
   sleep 0.3
 }
 
@@ -208,19 +189,19 @@ boot_sequence() {
 ask() {
   local _var="$1" _prompt="$2" _def="${3:-}" _val=''
   if [[ -n "$_def" ]]; then
-    printf "  ${BCYN}?${R}  ${B}%s${R} ${DM}(%s)${R}: " "$_prompt" "$_def"
+    printf '  %s?%s  %s%s%s %s(%s)%s: ' "$BCYN" "$R" "$B" "$_prompt" "$R" "$DM" "$_def" "$R"
   else
-    printf "  ${BCYN}?${R}  ${B}%s${R}: " "$_prompt"
+    printf '  %s?%s  %s%s%s: ' "$BCYN" "$R" "$B" "$_prompt" "$R"
   fi
-  IFS= read -r _val
+  IFS= read -r _val || true
   [[ -z "$_val" ]] && _val="$_def"
   printf -v "$_var" '%s' "$_val"
 }
 
 ask_secret() {
   local _var="$1" _prompt="$2" _val=''
-  printf "  ${BMAG}🔒${R}  ${B}%s${R}: " "$_prompt"
-  IFS= read -rs _val; printf '\n'
+  printf '  %s*%s  %s%s%s: ' "$BMAG" "$R" "$B" "$_prompt" "$R"
+  IFS= read -rs _val || true; printf '\n'
   printf -v "$_var" '%s' "$_val"
 }
 
@@ -228,33 +209,33 @@ ask_yn() {
   local _var="$1" _prompt="$2" _def="${3:-y}" _ans=''
   local _d
   [[ "$_def" == "y" ]] && _d="${BGRN}Y${R}${DM}/n${R}" || _d="${DM}y/${R}${BGRN}N${R}"
-  printf "  ${BCYN}?${R}  ${B}%s${R} [%s]: " "$_prompt" "$_d"
-  IFS= read -r _ans
+  printf '  %s?%s  %s%s%s [%s]: ' "$BCYN" "$R" "$B" "$_prompt" "$R" "$_d"
+  IFS= read -r _ans || true
   [[ -z "$_ans" ]] && _ans="$_def"
-  if [[ "${_ans,,}" == y* ]]; then printf -v "$_var" 'true'
+  if [[ "${_ans}" =~ ^[Yy] ]]; then printf -v "$_var" 'true'
   else printf -v "$_var" 'false'; fi
 }
 
 ask_choice() {
   local _var="$1" _prompt="$2"; shift 2
   local _opts=("$@") _i=1 _ch=1
-  printf "\n  ${BCYN}?${R}  ${B}%s${R}\n" "$_prompt"
+  printf '\n  %s?%s  %s%s%s\n' "$BCYN" "$R" "$B" "$_prompt" "$R"
   for _o in "${_opts[@]}"; do
-    printf "     ${DM}%d)${R} %s\n" "$_i" "$_o"
-    (( _i++ ))
+    printf '     %s%d)%s %s\n' "$DM" "$_i" "$R" "$_o"
+    _i=$((_i+1))
   done
-  printf "\n  ${BCYN}→${R} Enter number ${DM}[1-%d]${R}: " "${#_opts[@]}"
-  IFS= read -r _ch
+  printf '\n  %s>%s Enter number %s[1-%d]%s: ' "$BCYN" "$R" "$DM" "${#_opts[@]}" "$R"
+  IFS= read -r _ch || true
   [[ -z "$_ch" || ! "$_ch" =~ ^[0-9]+$ ]] && _ch=1
-  (( _ch < 1 )) && _ch=1
-  (( _ch > ${#_opts[@]} )) && _ch=${#_opts[@]}
-  local _sel="${_opts[$(( _ch - 1 ))]}"
+  [[ $_ch -lt 1 ]] && _ch=1
+  [[ $_ch -gt ${#_opts[@]} ]] && _ch=${#_opts[@]}
+  local _sel="${_opts[$((_ch-1))]}"
   printf -v "$_var" '%s' "${_sel%% *}"
 }
 
 gen_jwt() {
   if command -v openssl &>/dev/null; then
-    openssl rand -hex 64
+    openssl rand -hex 64 2>/dev/null
   else
     node -e "process.stdout.write(require('crypto').randomBytes(64).toString('hex'))"
   fi
@@ -264,6 +245,7 @@ gen_jwt() {
 check_deps() {
   section "Checking Dependencies"
   local missing=()
+
   for cmd in node npm; do
     if command -v "$cmd" &>/dev/null; then
       local ver; ver=$("$cmd" --version 2>/dev/null | head -1)
@@ -273,21 +255,27 @@ check_deps() {
       missing+=("$cmd")
     fi
   done
+
   if command -v node &>/dev/null; then
-    local nmaj; nmaj=$(node -e "process.stdout.write(String(process.versions.node.split('.')[0]))")
-    if (( nmaj < 18 )); then
-      err "Node.js v${nmaj} is too old — Voltage requires v18+"
+    local nmaj
+    nmaj=$(node -e "process.stdout.write(String(process.versions.node.split('.')[0]))" 2>/dev/null || echo 0)
+    if [[ $nmaj -lt 18 ]]; then
+      err "Node.js v${nmaj} detected — Voltage needs v18+"
       missing+=("node>=18")
     fi
   fi
+
   for cmd in git openssl; do
-    command -v "$cmd" &>/dev/null \
-      && ok "${B}${cmd}${R} found" \
-      || warn "${B}${cmd}${R} not found ${DM}(optional)${R}"
+    if command -v "$cmd" &>/dev/null; then
+      ok "${B}${cmd}${R} found"
+    else
+      warn "${B}${cmd}${R} not found ${DM}(optional)${R}"
+    fi
   done
+
   if [[ ${#missing[@]} -gt 0 ]]; then
-    printf '\n'; err "Missing: ${missing[*]}"
-    err "Install the above then re-run this script."
+    printf '\n'; err "Missing required: ${missing[*]}"
+    err "Please install them and re-run setup."
     exit 1
   fi
   printf '\n'; ok "All required dependencies satisfied"
@@ -296,28 +284,32 @@ check_deps() {
 install_deps() {
   section "Installing Node Packages"
   spin_start "Running npm install..."
-  npm install --silent 2>/dev/null && spin_stop && ok "Packages installed" \
-    || { spin_stop; warn "Retrying verbosely..."; npm install || { err "npm install failed"; exit 1; }; ok "Packages installed"; }
+  if npm install --silent 2>/dev/null; then
+    spin_stop; ok "Packages installed"
+  else
+    spin_stop; warn "Retrying with full output..."
+    npm install || { err "npm install failed"; exit 1; }
+    ok "Packages installed"
+  fi
 }
 
-# ── Wizard ────────────────────────────────────────────────────
 run_wizard() {
   section "Configuration Wizard"
-  printf "  ${DM}${WHT}Answer each question — press Enter to keep the default.${R}\n\n"
+  printf '  %s%s%s\n\n' "$DM" "Answer each question and press Enter to accept the default." "$R"
 
   step "Server Identity"; printf '\n'
-  ask  CFG_NAME  "Server name"              "Volt"
-  ask  CFG_URL   "Public URL"               "http://localhost:3000"
-  ask  CFG_PORT  "Port"                     "3000"
+  ask  CFG_NAME   "Server name"              "Volt"
+  ask  CFG_URL    "Public URL"               "http://localhost:3000"
+  ask  CFG_PORT   "Port"                     "3000"
   ask_choice CFG_MODE "Server mode" \
     "mainline   (connect to the main Volt network)" \
-    "self-volt  (standalone / private)" \
+    "self-volt  (standalone / private instance)" \
     "federated  (federate with other Volt servers)"
 
   step "Storage Backend"; printf '\n'
   ask_choice CFG_STORAGE "Database engine" \
-    "json      (flat files — zero config, good for testing)" \
-    "sqlite    (recommended — no server needed)" \
+    "json      (flat files, zero config)" \
+    "sqlite    (recommended, no server needed)" \
     "postgres  (PostgreSQL)" \
     "mysql     (MySQL / MariaDB)"
 
@@ -341,7 +333,7 @@ run_wizard() {
   spin_start "Generating JWT secret..."
   CFG_JWT=$(gen_jwt)
   spin_stop
-  ok "JWT secret generated  ${DM}(${CFG_JWT:0:16}…)${R}"
+  ok "JWT secret generated  ${DM}(${CFG_JWT:0:16}...)${R}"
   ask CFG_JWT_EXP "Token expiry" "7d"
 
   step "Features"; printf '\n'
@@ -351,9 +343,9 @@ run_wizard() {
   ask_yn CFG_BOTS  "Enable bot API?"                "y"
   ask_yn CFG_FED   "Enable federation?"             "n"
 
-  step "Initial Admin Account"; printf '\n'
-  ask        CFG_ADMIN     "Admin username"          "admin"
-  ask_secret CFG_ADMINPASS "Admin password"
+  step "Admin Account"; printf '\n'
+  ask        CFG_ADMIN      "Admin username"          "admin"
+  ask_secret CFG_ADMINPASS  "Admin password"
   ask        CFG_ADMINEMAIL "Admin e-mail (optional)" ""
 }
 
@@ -362,13 +354,13 @@ create_dirs() {
   spin_start "Creating directories..."
   mkdir -p data uploads logs
   spin_stop
-  ok "Directories ready  ${DM}(data/  uploads/  logs/)${R}"
+  ok "Directories created  ${DM}(data/  uploads/  logs/)${R}"
 }
 
 write_env() {
   spin_start "Writing .env..."
   cat > .env <<EOF
-# Voltage — generated by setup.sh  $(date -u '+%Y-%m-%d %H:%M UTC')
+# Voltage -- generated by setup.sh $(date -u '+%Y-%m-%d %H:%M UTC')
 
 PORT=${CFG_PORT:-3000}
 NODE_ENV=production
@@ -376,7 +368,7 @@ SERVER_NAME="${CFG_NAME:-Volt}"
 SERVER_URL="${CFG_URL:-http://localhost:3000}"
 SERVER_MODE="${CFG_MODE:-mainline}"
 
-JWT_SECRET="${CFG_JWT}"
+JWT_SECRET="${CFG_JWT:-}"
 JWT_EXPIRY="${CFG_JWT_EXP:-7d}"
 BCRYPT_ROUNDS=12
 
@@ -426,22 +418,22 @@ write_config() {
     "oauth": { "enabled": ${CFG_OAUTH:-true}, "provider": "enclica" }
   },
   "security": {
-    "jwtSecret": "${CFG_JWT}",
+    "jwtSecret": "${CFG_JWT:-}",
     "jwtExpiry": "${CFG_JWT_EXP:-7d}",
     "bcryptRounds": 12,
     "rateLimit": { "windowMs": 60000, "maxRequests": 100 },
     "adminUsers": ["${CFG_ADMIN:-admin}"]
   },
   "features": {
-    "discovery": ${CFG_DISC:-true},
-    "selfVolt": true,
-    "voiceChannels": ${CFG_VOICE:-true},
-    "videoChannels": ${CFG_VOICE:-true},
-    "e2eEncryption": ${CFG_E2E:-true},
+    "discovery":         ${CFG_DISC:-true},
+    "selfVolt":          true,
+    "voiceChannels":     ${CFG_VOICE:-true},
+    "videoChannels":     ${CFG_VOICE:-true},
+    "e2eEncryption":     ${CFG_E2E:-true},
     "e2eTrueEncryption": ${CFG_E2E:-true},
-    "communities": true,
-    "bots": ${CFG_BOTS:-true},
-    "federation": ${CFG_FED:-false}
+    "communities":       true,
+    "bots":              ${CFG_BOTS:-true},
+    "federation":        ${CFG_FED:-false}
   },
   "limits": { "maxUploadSize": 10485760, "maxServersPerUser": 100, "maxMessageLength": 4000 },
   "cdn": { "enabled": false, "provider": "local", "local": { "uploadDir": "./uploads", "baseUrl": null } },
@@ -455,40 +447,40 @@ EOF
 print_summary() {
   section "Setup Complete"
   printf '\n'
-  center_print "${BBLU}${B}⚡  Voltage is ready!  ⚡${R}"
+  center_plain "<< Voltage is ready! >>" "${BBLU}${B}"
   printf '\n'
 
-  local bw=47
-  local bl=$(( (COLS - bw - 2) / 2 )); (( bl < 0 )) && bl=0
-  local p; p=$(rpad "$bl")
+  local bw=46
+  local bl=$(( (COLS - bw - 2) / 2 ))
+  [[ $bl -lt 0 ]] && bl=0
+  local p; p=$(spaces "$bl")
 
-  _br() { printf '%s'"${DM}${CYN}│${R}  %-42s  ${DM}${CYN}│${R}"'\n' "$p" "$1"; }
-  local line; line=$(rpad 0); local lc="$p${DM}${CYN}"
-  local hbar=''; local i=0; while (( i++ < bw )); do hbar+='─'; done
-  printf '%s┌%s┐\n' "$lc" "$hbar${R}"
-  _br "${B}Server:${R}   ${CFG_NAME:-Volt}"
-  _br "${B}URL:${R}      ${CFG_URL:-http://localhost:3000}"
-  _br "${B}Mode:${R}     ${CFG_MODE:-mainline}"
-  _br "${B}Storage:${R}  ${CFG_STORAGE:-sqlite}"
-  _br "${B}Admin:${R}    @${CFG_ADMIN:-admin}"
-  printf '%s└%s┘\n' "$lc" "$hbar${R}"
+  local bar=''
+  local bi=0; while [[ $bi -lt $bw ]]; do bar="${bar}-"; bi=$((bi+1)); done
 
-  printf '\n'
-  printf "  ${BYLW}To start Voltage:${R}\n\n"
-  printf "    ${BGRN}\$${R} ${B}npm start${R}      ${DM}# production${R}\n"
-  printf "    ${BGRN}\$${R} ${B}npm run dev${R}    ${DM}# development (auto-reload)${R}\n"
-  printf '\n'
-  hline
-  center_print "${DM}Thank you for running Voltage ⚡${R}"
-  hline
-  printf '\n'
+  printf '%s%s+%s+%s\n' "$p" "${DM}${CYN}" "$bar" "$R"
+  _row() { printf '%s%s|%s  %-41s  %s|%s\n' "$p" "${DM}${CYN}" "$R" "$1" "${DM}${CYN}" "$R"; }
+  _row "${B}Server:${R}   ${CFG_NAME:-Volt}"
+  _row "${B}URL:${R}      ${CFG_URL:-http://localhost:3000}"
+  _row "${B}Mode:${R}     ${CFG_MODE:-mainline}"
+  _row "${B}Storage:${R}  ${CFG_STORAGE:-sqlite}"
+  _row "${B}Admin:${R}    @${CFG_ADMIN:-admin}"
+  printf '%s%s+%s+%s\n' "$p" "${DM}${CYN}" "$bar" "$R"
+
+  printf '\n  %sTo start Voltage:%s\n\n' "$BYLW" "$R"
+  printf '    %s$%s %snpm start%s      %s# production%s\n'    "$BGRN" "$R" "$B" "$R" "$DM" "$R"
+  printf '    %s$%s %snpm run dev%s    %s# development%s\n'   "$BGRN" "$R" "$B" "$R" "$DM" "$R"
+  printf '\n'; hline
+  center_plain "Thank you for running Voltage!" "$DM"
+  hline; printf '\n'
 }
 
 # ── Main ──────────────────────────────────────────────────────
 main() {
-  [[ ! -f "server.js" && ! -f "package.json" ]] && {
-    printf '\nERROR: Run this script from inside the Voltage directory.\n\n'; exit 1
-  }
+  if [[ ! -f "server.js" && ! -f "package.json" ]]; then
+    printf '\nERROR: Run this script from inside the Voltage directory.\n\n'
+    exit 1
+  fi
   boot_sequence
   check_deps
   install_deps
