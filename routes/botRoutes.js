@@ -2,7 +2,7 @@ import express from 'express'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { botService } from '../services/botService.js'
 import { io } from '../server.js'
-import { dataService } from '../services/dataService.js'
+import { channelService, messageService } from '../services/dataService.js'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -317,7 +317,7 @@ router.get('/api/channels/:channelId', authenticateBot, (req, res) => {
   if (!botService.hasPermission(req.bot.id, 'channels:read')) {
     return res.status(403).json({ error: 'Missing channels:read permission' })
   }
-  const channel = dataService.getChannel(req.params.channelId)
+  const channel = channelService.getChannel(req.params.channelId)
   if (!channel) return res.status(404).json({ error: 'Channel not found' })
   if (!req.bot.servers.includes(channel.serverId)) {
     return res.status(403).json({ error: 'Bot not in that server' })
@@ -345,7 +345,7 @@ router.put('/api/channels/:channelId/messages/:messageId', authenticateBot, (req
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
   const { content, embeds } = req.body
-  const updated = dataService.editMessage(req.params.messageId, content)
+  const updated = messageService.editMessage(req.params.messageId, content)
   if (!updated) {
     // Message not in persistent store — emit the edit event anyway so live
     // clients update their UI (covers in-memory messages from this session)
@@ -366,7 +366,7 @@ router.delete('/api/channels/:channelId/messages/:messageId', authenticateBot, (
   if (!botService.hasPermission(req.bot.id, 'messages:delete')) {
     return res.status(403).json({ error: 'Missing messages:delete permission' })
   }
-  dataService.deleteMessage(req.params.messageId)
+  messageService.deleteMessage(req.params.messageId)
   io.to(`channel:${req.params.channelId}`).emit('message:deleted', {
     messageId: req.params.messageId,
     channelId: req.params.channelId
