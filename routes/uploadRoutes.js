@@ -153,7 +153,7 @@ router.post('/', authenticateToken, upload.array('files', 10), async (req, res) 
         serverId: serverId
       }
       
-      fileService.saveFile(fileId, attachment)
+      fileService.saveFile(attachment)
       
       return attachment
     }))

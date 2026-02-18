@@ -893,42 +893,154 @@ export const attachmentService = {
 }
 
 export const discoveryService = {
-  getDiscoveryEntry(serverId) {
-    const discovery = loadData(FILES.discovery, {})
-    return discovery[serverId] || null
+  _load() {
+    const data = loadData(FILES.discovery, {})
+    if (!data.submissions) data.submissions = []
+    if (!data.approved) data.approved = []
+    return data
   },
 
-  addToDiscovery(serverId, data) {
-    const discovery = loadData(FILES.discovery, {})
-    discovery[serverId] = {
-      ...data,
+  getDiscoveryEntry(serverId) {
+    const data = this._load()
+    return data.approved.find(s => s.serverId === serverId) || null
+  },
+
+  addToDiscovery(serverId, entryData) {
+    const data = this._load()
+    const existing = data.approved.findIndex(s => s.serverId === serverId)
+    const entry = {
+      ...entryData,
       serverId,
       addedAt: new Date().toISOString()
     }
-    saveData(FILES.discovery, discovery)
-    return discovery[serverId]
+    if (existing >= 0) {
+      data.approved[existing] = { ...data.approved[existing], ...entry }
+    } else {
+      data.approved.push(entry)
+    }
+    saveData(FILES.discovery, data)
+    return entry
   },
 
   removeFromDiscovery(serverId) {
-    const discovery = loadData(FILES.discovery, {})
-    delete discovery[serverId]
-    saveData(FILES.discovery, discovery)
-    return true
+    const data = this._load()
+    data.approved = data.approved.filter(s => s.serverId !== serverId)
+    data.submissions = data.submissions.filter(s => s.serverId !== serverId)
+    saveData(FILES.discovery, data)
+    return { success: true }
   },
 
-  getDiscoveryList(category = null, limit = 50) {
-    const discovery = loadData(FILES.discovery, {})
-    let list = Object.values(discovery)
-    
+  isInDiscovery(serverId) {
+    const data = this._load()
+    return data.approved.some(s => s.serverId === serverId)
+  },
+
+  getCategories() {
+    const data = this._load()
+    const cats = new Set()
+    data.approved.forEach(s => { if (s.category) cats.add(s.category) })
+    return [...cats].map(c => ({ id: c, name: c.charAt(0).toUpperCase() + c.slice(1) }))
+  },
+
+  getApprovedServers(limit = 50, offset = 0, category = null, search = null) {
+    const data = this._load()
+    let list = data.approved.filter(s => s.status === 'approved')
+
     if (category) {
       list = list.filter(s => s.category === category)
     }
-    
+    if (search) {
+      const q = search.toLowerCase()
+      list = list.filter(s =>
+        (s.name && s.name.toLowerCase().includes(q)) ||
+        (s.description && s.description.toLowerCase().includes(q))
+      )
+    }
+
+    return {
+      servers: list.slice(offset, offset + limit),
+      total: list.length
+    }
+  },
+
+  submitServer(serverId, description, category, userId) {
+    const data = this._load()
+    const existing = data.submissions.find(s => s.serverId === serverId && s.status === 'pending')
+    if (existing) {
+      return { error: 'Server already has a pending submission' }
+    }
+    if (data.approved.some(s => s.serverId === serverId)) {
+      return { error: 'Server is already in discovery' }
+    }
+
+    const servers = loadData(FILES.servers, [])
+    const serverList = Array.isArray(servers) ? servers : Object.values(servers)
+    const server = serverList.find(s => s.id === serverId)
+
+    const submission = {
+      id: `disc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      serverId,
+      name: server?.name || 'Unknown',
+      icon: server?.icon || '',
+      description: description || '',
+      category: category || 'community',
+      memberCount: server?.members?.length || 0,
+      submittedBy: userId,
+      submittedAt: new Date().toISOString(),
+      status: 'pending'
+    }
+    data.submissions.push(submission)
+    saveData(FILES.discovery, data)
+    return submission
+  },
+
+  getPendingSubmissions() {
+    const data = this._load()
+    return data.submissions.filter(s => s.status === 'pending')
+  },
+
+  approveSubmission(submissionId) {
+    const data = this._load()
+    const idx = data.submissions.findIndex(s => s.id === submissionId)
+    if (idx === -1) return { error: 'Submission not found' }
+
+    const submission = data.submissions[idx]
+    submission.status = 'approved'
+    submission.approvedAt = new Date().toISOString()
+    data.submissions.splice(idx, 1)
+    data.approved.push(submission)
+    saveData(FILES.discovery, data)
+    return submission
+  },
+
+  rejectSubmission(submissionId) {
+    const data = this._load()
+    const idx = data.submissions.findIndex(s => s.id === submissionId)
+    if (idx === -1) return { error: 'Submission not found' }
+
+    const submission = data.submissions[idx]
+    submission.status = 'rejected'
+    submission.rejectedAt = new Date().toISOString()
+    data.submissions.splice(idx, 1)
+    saveData(FILES.discovery, data)
+    return { success: true }
+  },
+
+  getDiscoveryList(category = null, limit = 50) {
+    const data = this._load()
+    let list = data.approved
+    if (category) {
+      list = list.filter(s => s.category === category)
+    }
     return list.slice(0, limit)
   },
-  
+
+  getSubmissions() {
+    return this._load()
+  },
+
   getAllDiscovery() {
-    return loadData(FILES.discovery, {})
+    return this._load()
   }
 }
 
@@ -1042,21 +1154,23 @@ export const adminService = {
 
   isAdmin(userId) {
     const user = userService.getUser(userId)
-    return user?.role === 'admin' || user?.isAdmin === true
+    const role = user?.adminRole || user?.role
+    return role === 'admin' || role === 'owner' || user?.isAdmin === true
   },
 
   isModerator(userId) {
     const user = userService.getUser(userId)
-    return user?.role === 'admin' || user?.role === 'moderator' || user?.isAdmin === true || user?.isModerator === true
+    const role = user?.adminRole || user?.role
+    return role === 'admin' || role === 'owner' || role === 'moderator' || user?.isAdmin === true || user?.isModerator === true
   },
 
   getUserRole(userId) {
     const user = userService.getUser(userId)
-    return user?.role || 'user'
+    return user?.adminRole || user?.role || 'user'
   },
 
   setUserRole(userId, role) {
-    return userService.updateProfile(userId, { role })
+    return userService.updateProfile(userId, { adminRole: role })
   },
 
   logAction(userId, action, targetId, details) {
@@ -1067,14 +1181,20 @@ export const adminService = {
     return adminLogService.getLogs(limit)
   },
 
+  getAllUsers() {
+    const users = loadData(FILES.users, {})
+    return Object.values(users)
+  },
+
   resetUserPassword(userId) {
     const tempPassword = Math.random().toString(36).slice(-8)
     const user = userService.getUser(userId)
     if (!user) return { success: false, error: 'User not found' }
     
-    const bcrypt = require('bcrypt')
-    const tempHash = bcrypt.hashSync(tempPassword, 10)
-    userService.updateProfile(userId, { passwordHash: tempHash })
+    import('bcrypt').then(({ default: bcrypt }) => {
+      const tempHash = bcrypt.hashSync(tempPassword, 10)
+      userService.updateProfile(userId, { passwordHash: tempHash })
+    })
     
     return { success: true, tempPassword }
   },

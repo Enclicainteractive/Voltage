@@ -19,6 +19,14 @@ const loadData = (file, defaultValue = {}) => {
   return defaultValue
 }
 
+const saveData = (file, data) => {
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2))
+  } catch (err) {
+    console.error(`[Data] Error saving ${file}:`, err.message)
+  }
+}
+
 const router = express.Router()
 
 const requireAdmin = (req, res, next) => {

@@ -9,6 +9,7 @@ import config from '../config/config.js'
 
 const onlineUsers = new Map()
 const userSockets = new Map()
+const botSockets = new Map()   // botId -> socketId
 const voiceChannels = new Map()
 const voiceChannelUsers = new Map()
 const webrtcPeers = new Map()
@@ -194,40 +195,71 @@ const sendMentionNotifications = (io, senderSocket, channelId, message, mentions
 export const setupSocketHandlers = (io) => {
   startHeartbeatMonitor(io)
 
-   io.on('connection', (socket) => {
-     // Bot sockets are authenticated via vbot_ token in authMiddleware.
-     // Route them to the dedicated bot connection handler and skip all
-     // user-specific setup (voice, presence, personal rooms, etc.).
-     if (socket.botId) {
-       const bot = botService.getBot(socket.botId)
-       if (!bot) {
-         socket.disconnect(true)
-         return
-       }
+  io.on('connection', (socket) => {
+    // -------------------------------------------------------------------------
+    // BOT connection path
+    // -------------------------------------------------------------------------
+    if (socket.botId) {
+      const bot = botService.getBot(socket.botId)
+      if (!bot) {
+        socket.disconnect(true)
+        return
+      }
 
-       botService.setBotStatus(bot.id, 'online')
+      botService.setBotStatus(bot.id, 'online')
+      botSockets.set(bot.id, socket.id)
 
-       for (const serverId of bot.servers) {
-         socket.join(`server:${serverId}`)
-       }
+      for (const serverId of bot.servers) {
+        socket.join(`server:${serverId}`)
+      }
 
-       socket.emit('bot:ready', {
-         botId: bot.id,
-         name: bot.name,
-         servers: bot.servers
-       })
+      socket.emit('bot:ready', {
+        botId: bot.id,
+        name: bot.name,
+        servers: bot.servers
+      })
 
-       console.log(`[Socket] Bot ready: ${bot.name} (${bot.id}), servers: ${bot.servers.length}`)
+      console.log(`[Socket] Bot ready: ${bot.name} (${bot.id}), servers: ${bot.servers.length}`)
 
-       socket.on('disconnect', () => {
-         botService.setBotStatus(bot.id, 'offline')
-         console.log(`[Socket] Bot disconnected: ${bot.name} (${bot.id})`)
-       })
+      // Allow the bot to send messages via socket (used by Wire's REST fallback)
+      socket.on('bot:send-message', (data) => {
+        if (!botService.hasPermission(bot.id, 'messages:send')) return
+        const { channelId, content, embeds } = data
+        const cdnConfig = config.getCdnConfig()
+        const message = {
+          id: uuidv4(),
+          channelId,
+          userId: bot.id,
+          username: bot.name,
+          avatar: bot.avatar,
+          content: content || '',
+          embeds: embeds || [],
+          bot: true,
+          timestamp: new Date().toISOString(),
+          attachments: [],
+          storage: {
+            cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
+            storageNode: config.getHost(),
+            serverUrl: config.getServerUrl()
+          }
+        }
+        addMessage(channelId, message)
+        io.to(`channel:${channelId}`).emit('message:new', message)
+      })
 
-       return
-     }
+      socket.on('disconnect', () => {
+        botService.setBotStatus(bot.id, 'offline')
+        botSockets.delete(bot.id)
+        console.log(`[Socket] Bot disconnected: ${bot.name} (${bot.id})`)
+      })
 
-     const userId = socket.user.id
+      return
+    }
+
+    // -------------------------------------------------------------------------
+    // USER connection path
+    // -------------------------------------------------------------------------
+    const userId = socket.user.id
      console.log(`User connected: ${userId}`)
 
     // Join user's personal room for mentions/notifications
@@ -337,17 +369,33 @@ export const setupSocketHandlers = (io) => {
       // Send notifications for mentions
       sendMentionNotifications(io, socket, data.channelId, message, mentions)
 
-      // Deliver to bots in the server
-      if (socket.currentServer) {
-        const serverBots = botService.getServerBots(socket.currentServer)
-        for (const bot of serverBots) {
-          if (bot.intents?.includes('GUILD_MESSAGES') || bot.intents?.includes('MESSAGE_CONTENT')) {
-            botService.deliverWebhookEvent(bot.id, 'MESSAGE_CREATE', {
-              message,
-              serverId: socket.currentServer,
-              channelId: data.channelId
-            })
-          }
+      // Deliver message:new to all connected bots in every server the channel belongs to
+      const allServers = socket.currentServer
+        ? [socket.currentServer]
+        : []
+      // Also check all servers this channel might belong to via bot server memberships
+      const checkedBots = new Set()
+      for (const [botId, botSocketId] of botSockets.entries()) {
+        if (checkedBots.has(botId)) continue
+        const botSocket = io.sockets.sockets.get(botSocketId)
+        if (!botSocket) continue
+        const bot = botService.getBot(botId)
+        if (!bot) continue
+        // Deliver if the bot is in any server that contains this channel
+        const botInServer = allServers.some(sid => bot.servers.includes(sid))
+          || bot.servers.some(sid => botSocket.rooms.has(`server:${sid}`))
+        if (botInServer) {
+          checkedBots.add(botId)
+          botSocket.emit('message:new', {
+            ...message,
+            serverId: socket.currentServer || null
+          })
+          // Also deliver via webhook if configured
+          botService.deliverWebhookEvent(botId, 'MESSAGE_CREATE', {
+            message,
+            serverId: socket.currentServer,
+            channelId: data.channelId
+          })
         }
       }
     })
@@ -538,6 +586,11 @@ export const setupSocketHandlers = (io) => {
       const updated = editMessage(channelId, messageId, userId, content)
       if (updated) {
         io.to(`channel:${channelId}`).emit('message:edited', updated)
+        // Deliver to connected bots
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (botSocket) botSocket.emit('message:edited', updated)
+        }
       }
     })
 
@@ -547,6 +600,11 @@ export const setupSocketHandlers = (io) => {
       const result = deleteMessage(channelId, messageId, userId)
       if (result.success) {
         io.to(`channel:${channelId}`).emit('message:deleted', { messageId, channelId })
+        // Deliver to connected bots
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (botSocket) botSocket.emit('message:deleted', { messageId, channelId })
+        }
       }
     })
 
@@ -615,27 +673,23 @@ export const setupSocketHandlers = (io) => {
     socket.on('reaction:add', (data) => {
       const { messageId, emoji, channelId } = data
       const reactions = reactionService.addReaction(messageId, userId, emoji)
-      
-      io.to(`channel:${channelId}`).emit('reaction:updated', {
-        messageId,
-        reactions,
-        action: 'add',
-        userId,
-        emoji
-      })
+      const reactionPayload = { messageId, reactions, action: 'add', userId, emoji }
+      io.to(`channel:${channelId}`).emit('reaction:updated', reactionPayload)
+      for (const [botId, botSocketId] of botSockets.entries()) {
+        const botSocket = io.sockets.sockets.get(botSocketId)
+        if (botSocket) botSocket.emit('reaction:updated', reactionPayload)
+      }
     })
 
     socket.on('reaction:remove', (data) => {
       const { messageId, emoji, channelId } = data
       const reactions = reactionService.removeReaction(messageId, userId, emoji)
-      
-      io.to(`channel:${channelId}`).emit('reaction:updated', {
-        messageId,
-        reactions,
-        action: 'remove',
-        userId,
-        emoji
-      })
+      const reactionPayload = { messageId, reactions, action: 'remove', userId, emoji }
+      io.to(`channel:${channelId}`).emit('reaction:updated', reactionPayload)
+      for (const [botId, botSocketId] of botSockets.entries()) {
+        const botSocket = io.sockets.sockets.get(botSocketId)
+        if (botSocket) botSocket.emit('reaction:updated', reactionPayload)
+      }
     })
 
     // Pinned message handlers
@@ -850,64 +904,6 @@ export const setupSocketHandlers = (io) => {
       }
     })
 
-    // === Bot socket handlers ===
-
-    socket.on('bot:connect', (data) => {
-      const { botToken } = data
-      if (!botToken) return
-
-      const bot = botService.getBotByToken(botToken)
-      if (!bot) {
-        socket.emit('bot:error', { error: 'Invalid bot token' })
-        return
-      }
-
-      socket.botId = bot.id
-      botService.setBotStatus(bot.id, 'online')
-
-      for (const serverId of bot.servers) {
-        socket.join(`server:${serverId}`)
-      }
-
-      socket.emit('bot:ready', {
-        botId: bot.id,
-        name: bot.name,
-        servers: bot.servers
-      })
-    })
-
-    socket.on('bot:send-message', (data) => {
-      if (!socket.botId) return
-      const bot = botService.getBot(socket.botId)
-      if (!bot || !botService.hasPermission(socket.botId, 'messages:send')) return
-
-      const { channelId, content, embeds } = data
-
-      const cdnConfig = config.getCdnConfig()
-      const storageInfo = {
-        cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
-        storageNode: config.getHost(),
-        serverUrl: config.getServerUrl()
-      }
-
-      const message = {
-        id: uuidv4(),
-        channelId,
-        userId: bot.id,
-        username: bot.name,
-        avatar: bot.avatar,
-        content: content || '',
-        embeds: embeds || [],
-        bot: true,
-        timestamp: new Date().toISOString(),
-        attachments: [],
-        storage: storageInfo
-      }
-
-      addMessage(channelId, message)
-      io.to(`channel:${channelId}`).emit('message:new', message)
-    })
-
     socket.on('e2e:leave-server', (serverId) => {
       e2eService.removeMemberKey(serverId, userId)
       io.to(`server:${serverId}`).emit('e2e:member-left', {
@@ -918,11 +914,6 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('disconnect', (reason) => {
       console.log(`User disconnected: ${userId}, reason: ${reason}`)
-      
-      // Mark bot as offline if this was a bot socket
-      if (socket.botId) {
-        botService.setBotStatus(socket.botId, 'offline')
-      }
 
       // Do not force immediate leave; rely on heartbeat timeout to clean stale voice users
       if (socket.currentVoiceChannel) {

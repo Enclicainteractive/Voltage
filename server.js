@@ -21,6 +21,9 @@ import authRoutes from './routes/authRoutes.js'
 import pushRoutes from './routes/pushRoutes.js'
 import adminConfigRoutes from './routes/adminConfigRoutes.js'
 import migrationRoutes from './routes/migrationRoutes.js'
+import federationRoutes from './routes/federationRoutes.js'
+import botRoutes from './routes/botRoutes.js'
+import e2eTrueRoutes from './routes/e2eTrueRoutes.js'
 import { authenticateSocket } from './middleware/authMiddleware.js'
 import { setupSocketHandlers } from './services/socketService.js'
 import config from './config/config.js'
@@ -80,6 +83,9 @@ app.use('/api/e2e', e2eRoutes)
 app.use('/api/self-volt', selfVoltRoutes)
 app.use('/api/push', pushRoutes)
 app.use('/api/migration', migrationRoutes)
+app.use('/api/federation', federationRoutes)
+app.use('/api/bots', botRoutes)
+app.use('/api/e2e-true', e2eTrueRoutes)
 
 app.get('/api/health', (req, res) => {
   res.json({ 
@@ -88,7 +94,13 @@ app.get('/api/health', (req, res) => {
     server: config.config.server.name,
     version: config.config.server.version,
     mode: config.config.server.mode,
-    url: config.getServerUrl()
+    url: config.getServerUrl(),
+    features: {
+      federation: config.config.federation?.enabled || false,
+      bots: config.config.features?.bots || false,
+      e2eTrueEncryption: config.config.features?.e2eTrueEncryption || false,
+      e2eEncryption: config.config.features?.e2eEncryption || false
+    }
   })
 })
 
@@ -162,6 +174,12 @@ httpServer.listen(PORT, () => {
   if (config.config.federation?.enabled) {
     console.log(`   Server Name:  ${config.config.federation.serverName || 'N/A'}`)
   }
+  console.log('')
+  console.log('🤖 Bots:')
+  console.log(`   Enabled:      ${config.config.features?.bots ? '✓ Yes' : '✗ No'}`)
+  console.log('')
+  console.log('🔒 True E2EE:')
+  console.log(`   Enabled:      ${config.config.features?.e2eTrueEncryption ? '✓ Yes' : '✗ No'}`)
   console.log('═'.repeat(50))
   console.log('')
 })

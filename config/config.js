@@ -190,8 +190,11 @@ const DEFAULT_CONFIG = {
     voiceChannels: true,
     videoChannels: true,
     e2eEncryption: true,
+    e2eTrueEncryption: true,
     communities: true,
-    threads: true
+    threads: true,
+    bots: true,
+    federation: true
   },
   
   limits: {

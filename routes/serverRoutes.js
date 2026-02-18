@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url'
 import { io } from '../server.js'
 import { discoveryService } from '../services/dataService.js'
 import config from '../config/config.js'
+import { botService } from '../services/botService.js'
 
 const getAvatarUrl = (userId) => {
   const imageServerUrl = config.getImageServerUrl()
@@ -14,7 +15,7 @@ const getAvatarUrl = (userId) => {
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', 'data')
+const DATA_DIR = path.join(__dirname, '..', '..', 'data')
 const SERVERS_FILE = path.join(DATA_DIR, 'servers.json')
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json')
 
@@ -156,8 +157,19 @@ router.get('/:serverId/members', authenticateToken, (req, res) => {
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
   }
-  
-  res.json(server.members || [])
+
+  const bots = botService.getServerBots(req.params.serverId)
+  const botMembers = bots.map(bot => ({
+    id: bot.id,
+    username: bot.name,
+    avatar: bot.avatar || null,
+    status: bot.status || 'offline',
+    roles: [],
+    role: null,
+    isBot: true
+  }))
+
+  res.json([...(server.members || []), ...botMembers])
 })
 
 router.get('/:serverId', authenticateToken, (req, res) => {
@@ -186,8 +198,27 @@ router.get('/:serverId', authenticateToken, (req, res) => {
     setServers(servers)
   }
   
+  // Merge bots as members with isBot flag
+  const bots = botService.getServerBots(server.id)
+  const botMembers = bots.map(bot => ({
+    id: bot.id,
+    username: bot.name,
+    avatar: bot.avatar || null,
+    status: bot.status || 'offline',
+    roles: [],
+    role: null,
+    isBot: true
+  }))
+  const serverWithBots = {
+    ...server,
+    members: [
+      ...(server.members || []),
+      ...botMembers
+    ]
+  }
+
   console.log(`[API] Get server: ${server.name}`)
-  res.json(server)
+  res.json(serverWithBots)
 })
 
 router.post('/', authenticateToken, (req, res) => {
@@ -422,7 +453,7 @@ router.delete('/:serverId/invites/:code', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Not authorized to delete invites' })
   }
 
-  inviteService.deleteInvite(req.params.serverId, req.params.code)
+  inviteService.deleteInvite(req.params.code)
   console.log(`[API] Deleted invite ${req.params.code}`)
   res.json({ success: true })
 })

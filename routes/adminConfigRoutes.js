@@ -137,13 +137,14 @@ router.put('/raw', authenticateToken, requireOwner, (req, res) => {
     const merged = config.mergeDeep(config.config, newConfig)
     
     // Save to file
-    const configPath = path.join(__dirname, '..', 'config.json')
-    fs.writeFileSync(configPath, JSON.stringify(merged, null, 2))
+    fs.writeFileSync(config.configFilePath, JSON.stringify(merged, null, 2))
     
-    // Update runtime config
-    config.config = merged
+    // Re-read from disk to guarantee in-memory matches on-disk (no cache drift)
+    const written = JSON.parse(fs.readFileSync(config.configFilePath, 'utf8'))
+    config.config = written
     
-    res.json({ success: true, message: 'Config updated from JSON. Restart server for full effect.' })
+    console.log('[Admin/Config] Raw config saved and reloaded from disk')
+    res.json({ success: true, message: 'Config saved and refreshed. Some changes (e.g. storage backend) require a restart.' })
   } catch (error) {
     console.error('[Admin/Config] Raw update error:', error)
     res.status(500).json({ error: 'Failed to update config: ' + error.message })
@@ -155,82 +156,21 @@ router.put('/', authenticateToken, requireOwner, (req, res) => {
   const updates = req.body
   
   try {
-    // Server settings
-    if (updates.server) {
-      Object.keys(updates.server).forEach(key => {
-        if (updates.server[key] !== undefined) {
-          config.config.server[key] = updates.server[key]
-        }
-      })
+    // Deep-merge updates into current in-memory config
+    config.config = config.mergeDeep(config.config, updates)
+
+    // Always write the full merged config to disk so restarts don't lose changes
+    const saved = config.save()
+    if (!saved) {
+      return res.status(500).json({ error: 'Config updated in memory but failed to write to disk' })
     }
-    
-    // Branding
-    if (updates.branding) {
-      config.config.branding = { ...config.config.branding, ...updates.branding }
-    }
-    
-    // Features
-    if (updates.features) {
-      config.config.features = { ...config.config.features, ...updates.features }
-    }
-    
-    // Limits
-    if (updates.limits) {
-      config.config.limits = { ...config.config.limits, ...updates.limits }
-    }
-    
-    // Auth - local
-    if (updates.auth?.local) {
-      config.config.auth.local = { ...config.config.auth.local, ...updates.auth.local }
-    }
-    
-    // Security
-    if (updates.security) {
-      if (updates.security.jwtExpiry) config.config.security.jwtExpiry = updates.security.jwtExpiry
-      if (updates.security.bcryptRounds) config.config.security.bcryptRounds = updates.security.bcryptRounds
-      if (updates.security.rateLimit) config.config.security.rateLimit = updates.security.rateLimit
-      if (updates.security.adminUsers) config.config.security.adminUsers = updates.security.adminUsers
-    }
-    
-    // Federation
-    if (updates.federation) {
-      config.config.federation = { ...config.config.federation, ...updates.federation }
-    }
-    
-    // Storage type
-    if (updates.storage?.type) {
-      config.config.storage.type = updates.storage.type
-    }
-    
-    // CDN
-    if (updates.cdn) {
-      config.config.cdn = { ...config.config.cdn, ...updates.cdn }
-    }
-    
-    // Cache
-    if (updates.cache) {
-      config.config.cache = { ...config.config.cache, ...updates.cache }
-    }
-    
-    // Queue
-    if (updates.queue) {
-      config.config.queue = { ...config.config.queue, ...updates.queue }
-    }
-    
-    // Monitoring
-    if (updates.monitoring) {
-      config.config.monitoring = { ...config.config.monitoring, ...updates.monitoring }
-    }
-    
-    // Save to file
-    const configPath = path.join(__dirname, '..', 'config.json')
-    if (fs.existsSync(configPath)) {
-      const currentConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'))
-      const mergedConfig = config.mergeDeep(currentConfig, config.config)
-      fs.writeFileSync(configPath, JSON.stringify(mergedConfig, null, 2))
-    }
-    
-    res.json({ success: true, message: 'Config updated. Restart server for full effect.' })
+
+    // Re-load from disk immediately to guarantee in-memory matches on-disk (no cache drift)
+    const written = JSON.parse(fs.readFileSync(config.configFilePath, 'utf8'))
+    config.config = written
+
+    console.log('[Admin/Config] Config saved and reloaded from disk')
+    res.json({ success: true, message: 'Config saved and refreshed. Some changes (e.g. storage backend) require a restart.' })
   } catch (error) {
     console.error('[Admin/Config] Update error:', error)
     res.status(500).json({ error: 'Failed to update config: ' + error.message })
@@ -241,8 +181,12 @@ router.put('/', authenticateToken, requireOwner, (req, res) => {
 router.post('/reset', authenticateToken, requireOwner, (req, res) => {
   try {
     config.reset()
-    res.json({ success: true, message: 'Config reset to defaults' })
+    // Persist the reset defaults to disk so restarts don't reload old config
+    config.save()
+    console.log('[Admin/Config] Config reset to defaults and saved to disk')
+    res.json({ success: true, message: 'Config reset to defaults and saved' })
   } catch (error) {
+    console.error('[Admin/Config] Reset error:', error)
     res.status(500).json({ error: 'Failed to reset config' })
   }
 })
@@ -252,12 +196,15 @@ router.post('/import', authenticateToken, requireOwner, (req, res) => {
   const newConfig = req.body
   
   try {
-    const configPath = path.join(__dirname, '..', 'config.json')
-    fs.writeFileSync(configPath, JSON.stringify(newConfig, null, 2))
-    config.config = newConfig
+    fs.writeFileSync(config.configFilePath, JSON.stringify(newConfig, null, 2))
+    // Re-read from disk to guarantee in-memory matches on-disk
+    const written = JSON.parse(fs.readFileSync(config.configFilePath, 'utf8'))
+    config.config = written
     
-    res.json({ success: true, message: 'Config imported. Restart server for full effect.' })
+    console.log('[Admin/Config] Config imported and reloaded from disk')
+    res.json({ success: true, message: 'Config imported and refreshed. Some changes (e.g. storage backend) require a restart.' })
   } catch (error) {
+    console.error('[Admin/Config] Import error:', error)
     res.status(500).json({ error: 'Failed to import config' })
   }
 })

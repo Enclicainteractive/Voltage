@@ -135,7 +135,10 @@
     "voiceChannels": true,
     "videoChannels": true,
     "e2eEncryption": true,
-    "communities": true
+    "e2eTrueEncryption": true,
+    "communities": true,
+    "bots": true,
+    "federation": true
   },
   "limits": {
     "maxUploadSize": 10485760,
