@@ -99,13 +99,19 @@ router.post('/migrate', async (req, res) => {
         
         results.steps[results.steps.length - 1].status = 'completed'
         results.steps[results.steps.length - 1].backupPath = backupDir
+      } else {
+        results.steps.push({ step: 'backup', status: 'skipped' })
       }
       
       results.steps.push({ step: 'export', status: 'pending' })
       
-      const exportData = await dataService.migrateData(currentType, {})
+      const exportData = dataService.exportAllData()
+      const recordCounts = {}
+      for (const [table, data] of Object.entries(exportData)) {
+        recordCounts[table] = Object.keys(data).length
+      }
       results.steps[results.steps.length - 1].status = 'completed'
-      results.steps[results.steps.length - 1].recordCounts = exportData.tables
+      results.steps[results.steps.length - 1].recordCounts = recordCounts
       
       results.steps.push({ step: 'configure', status: 'pending' })
       
@@ -118,9 +124,15 @@ router.post('/migrate', async (req, res) => {
       
       results.steps[results.steps.length - 1].status = 'completed'
       
-      results.steps.push({ step: 'restart_required', status: 'completed', message: 'Server restart required to apply new storage configuration' })
+      results.steps.push({ step: 'import', status: 'pending' })
       
-      results.message = 'Migration configuration prepared. Please restart the server to complete migration.'
+      const importResults = dataService.importAllData(exportData)
+      results.steps[results.steps.length - 1].status = 'completed'
+      results.steps[results.steps.length - 1].imported = importResults.tables
+      
+      config.save()
+      
+      results.message = 'Migration completed successfully. All data has been transferred.'
       
     } catch (err) {
       results.success = false
@@ -151,6 +163,10 @@ router.post('/test-connection', async (req, res) => {
       error: null
     }
     
+    // Helper to detect missing driver errors
+    const isDriverMissing = (err) => err.code === 'MODULE_NOT_FOUND' || err.message?.includes('Cannot find module')
+    const driverMissingMsg = (pkg) => `Node.js driver "${pkg}" is not installed. Run: npm install ${pkg}`
+    
     switch (type) {
       case 'mysql':
         try {
@@ -166,7 +182,8 @@ router.post('/test-connection', async (req, res) => {
           results.success = true
           results.tested = true
         } catch (err) {
-          results.error = err.message
+          results.error = isDriverMissing(err) ? driverMissingMsg('mysql2') : err.message
+          results.driverMissing = isDriverMissing(err)
         }
         break
         
@@ -184,7 +201,8 @@ router.post('/test-connection', async (req, res) => {
           results.success = true
           results.tested = true
         } catch (err) {
-          results.error = err.message
+          results.error = isDriverMissing(err) ? driverMissingMsg('mariadb') : err.message
+          results.driverMissing = isDriverMissing(err)
         }
         break
         
@@ -204,7 +222,8 @@ router.post('/test-connection', async (req, res) => {
           results.success = true
           results.tested = true
         } catch (err) {
-          results.error = err.message
+          results.error = isDriverMissing(err) ? driverMissingMsg('pg') : err.message
+          results.driverMissing = isDriverMissing(err)
         }
         break
         
@@ -226,7 +245,8 @@ router.post('/test-connection', async (req, res) => {
           results.success = true
           results.tested = true
         } catch (err) {
-          results.error = err.message
+          results.error = isDriverMissing(err) ? driverMissingMsg('mssql') : err.message
+          results.driverMissing = isDriverMissing(err)
         }
         break
         
@@ -241,7 +261,8 @@ router.post('/test-connection', async (req, res) => {
           results.success = true
           results.tested = true
         } catch (err) {
-          results.error = err.message
+          results.error = isDriverMissing(err) ? driverMissingMsg('mongodb') : err.message
+          results.driverMissing = isDriverMissing(err)
         }
         break
         
@@ -258,7 +279,8 @@ router.post('/test-connection', async (req, res) => {
           results.success = true
           results.tested = true
         } catch (err) {
-          results.error = err.message
+          results.error = isDriverMissing(err) ? driverMissingMsg('redis') : err.message
+          results.driverMissing = isDriverMissing(err)
         }
         break
         
@@ -297,12 +319,30 @@ router.get('/check-dependencies', (req, res) => {
     'redis': 'redis'
   }
   
+  // JSON is always available (no driver needed)
+  dependencies['json'] = { available: true, package: null, note: 'Built-in, no driver required' }
+  
   for (const [dep, storageType] of Object.entries(requiredDeps)) {
     try {
       require(dep)
-      dependencies[storageType] = { available: true }
+      dependencies[storageType] = { available: true, package: dep }
     } catch (err) {
-      dependencies[storageType] = { available: false, error: 'Not installed' }
+      dependencies[storageType] = { 
+        available: false, 
+        package: dep,
+        installCommand: `npm install ${dep}`,
+        note: `Driver not installed locally. Install with: npm install ${dep}. The database itself can be on a remote server.`
+      }
+    }
+  }
+  
+  // CockroachDB uses the same driver as postgres
+  if (dependencies['postgres']) {
+    dependencies['cockroachdb'] = { 
+      ...dependencies['postgres'],
+      note: dependencies['postgres'].available 
+        ? 'Uses the pg driver (same as PostgreSQL)' 
+        : 'Uses the pg driver (same as PostgreSQL). Install with: npm install pg'
     }
   }
   

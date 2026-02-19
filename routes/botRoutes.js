@@ -135,6 +135,9 @@ router.delete('/:botId/servers/:serverId', authenticateToken, (req, res) => {
     botId: req.params.botId
   })
 
+  // Notify the bot directly via their unique room
+  io.to(`bot:${req.params.botId}`).emit('bot:remove-from-server', { serverId: req.params.serverId })
+
   res.json({ success: true })
 })
 
@@ -190,6 +193,12 @@ router.get('/api/me', authenticateBot, (req, res) => {
 router.post('/api/channels/:channelId/messages', authenticateBot, (req, res) => {
   if (!botService.hasPermission(req.bot.id, 'messages:send')) {
     return res.status(403).json({ error: 'Missing messages:send permission' })
+  }
+
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
   }
 
   const { content, embeds, attachments } = req.body
@@ -266,6 +275,12 @@ router.post('/api/channels/:channelId/messages/:messageId/reactions', authentica
     return res.status(403).json({ error: 'Missing reactions:add permission' })
   }
 
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
+  }
+
   const { emoji } = req.body
   io.to(`channel:${req.params.channelId}`).emit('reaction:updated', {
     messageId: req.params.messageId,
@@ -322,7 +337,31 @@ router.get('/api/servers/:serverId/channels', authenticateBot, (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  res.json(server.channels || [])
+
+  // Channels may be stored in the server object OR in the separate channels.json
+  // keyed by serverId. Check both sources and return whichever has data.
+  let channels = server.channels
+  if (!channels || (Array.isArray(channels) && channels.length === 0)) {
+    // Fall back to channelService which reads from channels.json
+    const serviceChannels = channelService.getServerChannels(req.params.serverId)
+    if (serviceChannels && serviceChannels.length > 0) {
+      channels = serviceChannels
+    } else {
+      // Also try channels.json keyed by serverId (legacy format: { serverId: [channels] })
+      try {
+        const channelsFile = path.join(DATA_DIR, 'channels.json')
+        if (fs.existsSync(channelsFile)) {
+          const allChannels = JSON.parse(fs.readFileSync(channelsFile, 'utf8'))
+          if (allChannels[req.params.serverId] && Array.isArray(allChannels[req.params.serverId])) {
+            channels = allChannels[req.params.serverId]
+          }
+        }
+      } catch (err) {
+        console.error('[Bots] Error reading channels.json:', err.message)
+      }
+    }
+  }
+  res.json(channels || [])
 })
 
 router.get('/api/channels/:channelId', authenticateBot, (req, res) => {
@@ -330,8 +369,8 @@ router.get('/api/channels/:channelId', authenticateBot, (req, res) => {
     return res.status(403).json({ error: 'Missing channels:read permission' })
   }
   const channel = channelService.getChannel(req.params.channelId)
-  if (!channel) return res.status(404).json({ error: 'Channel not found' })
-  if (!req.bot.servers.includes(channel.serverId)) {
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
     return res.status(403).json({ error: 'Bot not in that server' })
   }
   res.json(channel)
@@ -339,6 +378,12 @@ router.get('/api/channels/:channelId', authenticateBot, (req, res) => {
 
 // Bot: typing indicator (fire-and-forget; clients display it briefly)
 router.post('/api/channels/:channelId/typing', authenticateBot, (req, res) => {
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
+  }
+
   io.to(`channel:${req.params.channelId}`).emit('user:typing', {
     userId:   req.bot.id,
     username: req.bot.name,
@@ -356,6 +401,13 @@ router.put('/api/channels/:channelId/messages/:messageId', authenticateBot, (req
   if (!botService.hasPermission(req.bot.id, 'messages:send')) {
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
+
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
+  }
+
   const { content, embeds } = req.body
   const updated = messageService.editMessage(req.params.messageId, content)
   if (!updated) {
@@ -378,6 +430,13 @@ router.delete('/api/channels/:channelId/messages/:messageId', authenticateBot, (
   if (!botService.hasPermission(req.bot.id, 'messages:delete')) {
     return res.status(403).json({ error: 'Missing messages:delete permission' })
   }
+
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
+  }
+
   messageService.deleteMessage(req.params.messageId)
   io.to(`channel:${req.params.channelId}`).emit('message:deleted', {
     messageId: req.params.messageId,
@@ -390,6 +449,13 @@ router.post('/api/channels/:channelId/messages/:messageId/pin', authenticateBot,
   if (!botService.hasPermission(req.bot.id, 'messages:send')) {
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
+
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
+  }
+
   io.to(`channel:${req.params.channelId}`).emit('message:pinned', {
     messageId: req.params.messageId,
     channelId: req.params.channelId,
@@ -402,6 +468,13 @@ router.delete('/api/channels/:channelId/messages/:messageId/pin', authenticateBo
   if (!botService.hasPermission(req.bot.id, 'messages:send')) {
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
+
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
+  }
+
   io.to(`channel:${req.params.channelId}`).emit('message:unpinned', {
     messageId: req.params.messageId,
     channelId: req.params.channelId
@@ -417,6 +490,13 @@ router.delete('/api/channels/:channelId/messages/:messageId/reactions', authenti
   if (!botService.hasPermission(req.bot.id, 'reactions:add')) {
     return res.status(403).json({ error: 'Missing reactions:add permission' })
   }
+
+  const channel = channelService.getChannel(req.params.channelId)
+  const serverId = channel?.serverId
+  if (serverId && !req.bot.servers.includes(serverId)) {
+    return res.status(403).json({ error: 'Bot not in this server' })
+  }
+
   const { emoji } = req.body
   io.to(`channel:${req.params.channelId}`).emit('reaction:updated', {
     messageId: req.params.messageId,

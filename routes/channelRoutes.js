@@ -46,7 +46,25 @@ if (!fs.existsSync(DATA_DIR)) {
 const loadChannels = () => {
   try {
     if (fs.existsSync(CHANNELS_FILE)) {
-      return JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'))
+      const data = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'))
+      let needsMigration = false
+      // Migrate old channels to have categoryId property
+      for (const [serverId, channels] of Object.entries(data)) {
+        if (Array.isArray(channels)) {
+          channels.forEach(channel => {
+            if (channel.categoryId === undefined) {
+              channel.categoryId = null
+              needsMigration = true
+            }
+          })
+        }
+      }
+      // Save migrated data if needed
+      if (needsMigration) {
+        fs.writeFileSync(CHANNELS_FILE, JSON.stringify(data, null, 2))
+        console.log('[Data] Migrated channels to add categoryId property')
+      }
+      return data
     }
   } catch (err) {
     console.error('[Data] Error loading channels:', err.message)
@@ -308,6 +326,27 @@ router.put('/:channelId', authenticateToken, async (req, res) => {
     return res.status(403).json({ error: 'Not authorized to edit channels' })
   }
 
+  // Validate categoryId if provided
+  if (req.body.categoryId !== undefined) {
+    const CATEGORIES_FILE = path.join(DATA_DIR, 'categories.json')
+    const loadCategories = () => {
+      try {
+        if (fs.existsSync(CATEGORIES_FILE)) {
+          return JSON.parse(fs.readFileSync(CATEGORIES_FILE, 'utf8'))
+        }
+      } catch (err) {
+        console.error('[Data] Error loading categories:', err.message)
+      }
+      return {}
+    }
+    const allCategories = loadCategories()
+    const categories = allCategories[found.serverId] || []
+    
+    if (req.body.categoryId && !categories.find(c => c.id === req.body.categoryId)) {
+      return res.status(400).json({ error: 'Invalid category' })
+    }
+  }
+
   const allChannels = found.channels
   const list = allChannels[found.serverId] || []
   const idx = list.findIndex(c => c.id === req.params.channelId)
@@ -350,6 +389,54 @@ router.delete('/:channelId', authenticateToken, (req, res) => {
   
   console.log(`[API] Deleted channel ${req.params.channelId}`)
   res.json({ success: true })
+})
+
+// Move channel to a different category
+router.put('/:channelId/move', authenticateToken, (req, res) => {
+  const { categoryId } = req.body
+  const found = getChannelServer(req.params.channelId)
+  if (!found) return res.status(404).json({ error: 'Channel not found' })
+
+  const servers = loadServers()
+  const server = servers.find(s => s.id === found.serverId)
+  if (!server) return res.status(404).json({ error: 'Server not found' })
+  if (!hasPermission(server, req.user.id, 'manage_channels')) {
+    return res.status(403).json({ error: 'Not authorized to move channels' })
+  }
+
+  // Validate categoryId if provided (null is valid for uncategorized)
+  if (categoryId) {
+    const CATEGORIES_FILE = path.join(DATA_DIR, 'categories.json')
+    const loadCategories = () => {
+      try {
+        if (fs.existsSync(CATEGORIES_FILE)) {
+          return JSON.parse(fs.readFileSync(CATEGORIES_FILE, 'utf8'))
+        }
+      } catch (err) {
+        console.error('[Data] Error loading categories:', err.message)
+      }
+      return {}
+    }
+    const allCategories = loadCategories()
+    const categories = allCategories[found.serverId] || []
+    if (!categories.find(c => c.id === categoryId)) {
+      return res.status(400).json({ error: 'Invalid category' })
+    }
+  }
+
+  const allChannels = found.channels
+  const list = allChannels[found.serverId] || []
+  const idx = list.findIndex(c => c.id === req.params.channelId)
+  if (idx === -1) return res.status(404).json({ error: 'Channel not found' })
+
+  list[idx] = { ...list[idx], categoryId: categoryId || null, updatedAt: new Date().toISOString() }
+  allChannels[found.serverId] = list
+  saveChannels(allChannels)
+  
+  io.to(`server:${found.serverId}`).emit('channel:updated', list[idx])
+  
+  console.log(`[API] Moved channel ${req.params.channelId} to category ${categoryId || 'uncategorized'}`)
+  res.json(list[idx])
 })
 
 router.get('/:channelId/messages/search', authenticateToken, (req, res) => {

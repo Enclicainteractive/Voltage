@@ -25,6 +25,7 @@ const TABLES = [
   'attachments',
   'discovery',
   'global_bans',
+  'server_bans',
   'admin_logs'
 ]
 
@@ -56,6 +57,7 @@ const initJsonStorage = () => {
       attachments: path.join(dataDir, 'attachments.json'),
       discovery: path.join(dataDir, 'discovery.json'),
       globalBans: path.join(dataDir, 'global-bans.json'),
+      serverBans: path.join(dataDir, 'server-bans.json'),
       adminLogs: path.join(dataDir, 'admin-logs.json')
     },
     load(file, defaultValue = {}) {
@@ -180,6 +182,89 @@ const initSqliteStorage = () => {
       uses INTEGER DEFAULT 0,
       maxUses INTEGER,
       expiresAt TEXT,
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS dms (
+      id TEXT PRIMARY KEY,
+      type TEXT DEFAULT 'direct',
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS dm_messages (
+      id TEXT PRIMARY KEY,
+      dmId TEXT NOT NULL,
+      senderId TEXT NOT NULL,
+      content TEXT,
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS reactions (
+      id TEXT PRIMARY KEY,
+      messageId TEXT NOT NULL,
+      userId TEXT NOT NULL,
+      emoji TEXT,
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS blocked (
+      userId TEXT NOT NULL,
+      blockedUserId TEXT NOT NULL,
+      createdAt TEXT,
+      PRIMARY KEY (userId, blockedUserId)
+    );
+    
+    CREATE TABLE IF NOT EXISTS files (
+      id TEXT PRIMARY KEY,
+      filename TEXT,
+      mimetype TEXT,
+      size INTEGER,
+      path TEXT,
+      uploadedBy TEXT,
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS attachments (
+      id TEXT PRIMARY KEY,
+      messageId TEXT,
+      fileId TEXT,
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS discovery (
+      id TEXT PRIMARY KEY,
+      serverId TEXT NOT NULL,
+      name TEXT,
+      description TEXT,
+      category TEXT,
+      tags TEXT,
+      language TEXT,
+      approved INTEGER DEFAULT 0,
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS global_bans (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      reason TEXT,
+      bannedBy TEXT,
+      expiresAt TEXT,
+      createdAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS server_bans (
+      serverId TEXT PRIMARY KEY,
+      reason TEXT,
+      bannedBy TEXT,
+      bannedAt TEXT
+    );
+    
+    CREATE TABLE IF NOT EXISTS admin_logs (
+      id TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      userId TEXT,
+      targetId TEXT,
+      details TEXT,
       createdAt TEXT
     );
   `)
@@ -1409,6 +1494,7 @@ export const FILES = {
   attachments: 'attachments',
   discovery: 'discovery',
   globalBans: 'global_bans',
+  serverBans: 'server_bans',
   adminLogs: 'admin_logs'
 }
 

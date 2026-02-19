@@ -228,7 +228,7 @@ router.post('/servers/:serverId/ban', authenticateToken, requireModerator, (req,
     return res.status(404).json(result)
   }
   
-  adminService.logAction(req.user.id, 'ban_server', req.params.serverId, { reason, bannedMembers: result.bannedMembers.length })
+  adminService.logAction(req.user.id, 'ban_server', req.params.serverId, { reason })
   
   res.json(result)
 })

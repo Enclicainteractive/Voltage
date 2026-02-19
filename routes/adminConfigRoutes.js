@@ -29,10 +29,45 @@ router.get('/', authenticateToken, requireOwner, (req, res) => {
       type: cfg.storage?.type,
       json: cfg.storage?.json ? { dataDir: cfg.storage.json.dataDir } : undefined,
       sqlite: cfg.storage?.sqlite ? { dbPath: cfg.storage.sqlite.dbPath } : undefined,
+      mysql: cfg.storage?.mysql ? { 
+        host: cfg.storage.mysql.host,
+        port: cfg.storage.mysql.port,
+        database: cfg.storage.mysql.database,
+        user: cfg.storage.mysql.user
+      } : undefined,
+      mariadb: cfg.storage?.mariadb ? { 
+        host: cfg.storage.mariadb.host,
+        port: cfg.storage.mariadb.port,
+        database: cfg.storage.mariadb.database,
+        user: cfg.storage.mariadb.user
+      } : undefined,
       postgres: cfg.storage?.postgres ? { 
         host: cfg.storage.postgres.host,
         port: cfg.storage.postgres.port,
-        database: cfg.storage.postgres.database
+        database: cfg.storage.postgres.database,
+        user: cfg.storage.postgres.user
+      } : undefined,
+      cockroachdb: cfg.storage?.cockroachdb ? { 
+        host: cfg.storage.cockroachdb.host,
+        port: cfg.storage.cockroachdb.port,
+        database: cfg.storage.cockroachdb.database,
+        user: cfg.storage.cockroachdb.user
+      } : undefined,
+      mssql: cfg.storage?.mssql ? { 
+        host: cfg.storage.mssql.host,
+        port: cfg.storage.mssql.port,
+        database: cfg.storage.mssql.database,
+        user: cfg.storage.mssql.user
+      } : undefined,
+      mongodb: cfg.storage?.mongodb ? { 
+        host: cfg.storage.mongodb.host,
+        port: cfg.storage.mongodb.port,
+        database: cfg.storage.mongodb.database
+      } : undefined,
+      redis: cfg.storage?.redis ? { 
+        host: cfg.storage.redis.host,
+        port: cfg.storage.redis.port,
+        db: cfg.storage.redis.db
       } : undefined
     },
     auth: {
@@ -113,7 +148,13 @@ router.get('/raw', authenticateToken, requireOwner, (req, res) => {
     // Mask sensitive values
     const masked = JSON.parse(JSON.stringify(configData))
     if (masked.security?.jwtSecret) masked.security.jwtSecret = '(hidden)'
+    if (masked.storage?.mysql?.password) masked.storage.mysql.password = '(hidden)'
+    if (masked.storage?.mariadb?.password) masked.storage.mariadb.password = '(hidden)'
     if (masked.storage?.postgres?.password) masked.storage.postgres.password = '(hidden)'
+    if (masked.storage?.cockroachdb?.password) masked.storage.cockroachdb.password = '(hidden)'
+    if (masked.storage?.mssql?.password) masked.storage.mssql.password = '(hidden)'
+    if (masked.storage?.mongodb?.password) masked.storage.mongodb.password = '(hidden)'
+    if (masked.storage?.redis?.password) masked.storage.redis.password = '(hidden)'
     if (masked.cdn?.s3?.secretAccessKey) masked.cdn.s3.secretAccessKey = '(hidden)'
     if (masked.cache?.redis?.password) masked.cache.redis.password = '(hidden)'
     if (masked.queue?.redis?.password) masked.queue.redis.password = '(hidden)'

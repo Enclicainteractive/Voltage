@@ -308,21 +308,34 @@ run_wizard() {
 
   step "Storage Backend"; printf '\n'
   ask_choice CFG_STORAGE "Database engine" \
-    "json      (flat files, zero config)" \
-    "sqlite    (recommended, no server needed)" \
-    "postgres  (PostgreSQL)" \
-    "mysql     (MySQL / MariaDB)"
+    "json       (flat files, zero config, for testing)" \
+    "sqlite     (recommended, single file, no server)" \
+    "postgres   (PostgreSQL)" \
+    "mysql      (MySQL)" \
+    "mariadb    (MariaDB)" \
+    "cockroachdb (CockroachDB)" \
+    "mssql      (SQL Server)" \
+    "mongodb    (MongoDB)" \
+    "redis      (Redis)"
 
   CFG_DB_HOST='' CFG_DB_PORT='' CFG_DB_NAME='' CFG_DB_USER='' CFG_DB_PASS=''
-  if [[ "$CFG_STORAGE" == "postgres" || "$CFG_STORAGE" == "mysql" ]]; then
+  if [[ "$CFG_STORAGE" == "postgres" || "$CFG_STORAGE" == "mysql" || "$CFG_STORAGE" == "mariadb" || "$CFG_STORAGE" == "cockroachdb" || "$CFG_STORAGE" == "mssql" || "$CFG_STORAGE" == "mongodb" || "$CFG_STORAGE" == "redis" ]]; then
     printf '\n'
     ask CFG_DB_HOST "Database host" "localhost"
-    [[ "$CFG_STORAGE" == "postgres" ]] \
-      && ask CFG_DB_PORT "Database port" "5432" \
-      || ask CFG_DB_PORT "Database port" "3306"
-    ask CFG_DB_NAME "Database name" "voltchat"
-    ask CFG_DB_USER "Database user" "volt"
-    ask_secret CFG_DB_PASS "Database password"
+    case "$CFG_STORAGE" in
+      postgres)     CFG_DB_PORT="${CFG_DB_PORT:-5432}" ;;
+      cockroachdb)  CFG_DB_PORT="${CFG_DB_PORT:-26257}" ;;
+      mysql)        CFG_DB_PORT="${CFG_DB_PORT:-3306}" ;;
+      mariadb)      CFG_DB_PORT="${CFG_DB_PORT:-3306}" ;;
+      mssql)        CFG_DB_PORT="${CFG_DB_PORT:-1433}" ;;
+      mongodb)      CFG_DB_PORT="${CFG_DB_PORT:-27017}" ;;
+      redis)        CFG_DB_PORT="${CFG_DB_PORT:-6379}" ;;
+    esac
+    [[ "$CFG_STORAGE" != "redis" ]] && ask CFG_DB_PORT "Database port" "$CFG_DB_PORT"
+    [[ "$CFG_STORAGE" != "redis" ]] && ask CFG_DB_NAME "Database name" "voltchat" || ask CFG_DB_NAME "Database number" "0"
+    [[ "$CFG_STORAGE" != "redis" ]] && ask CFG_DB_USER "Database user" "volt"
+    [[ "$CFG_STORAGE" != "redis" ]] && ask_secret CFG_DB_PASS "Database password"
+    [[ "$CFG_STORAGE" == "redis" ]] && ask_secret CFG_DB_PASS "Redis password (optional)"
   fi
 
   step "Authentication"; printf '\n'
@@ -408,9 +421,15 @@ write_config() {
   },
   "storage": {
     "type": "${CFG_STORAGE:-sqlite}",
+    "json": { "dataDir": "./data" },
     "sqlite": { "dbPath": "./data/voltage.db" },
-    "postgres": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-5432}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}" },
-    "mysql":    { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-3306}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}" }
+    "mysql": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-3306}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}", "connectionLimit": 10, "charset": "utf8mb4" },
+    "mariadb": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-3306}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}", "connectionLimit": 10, "charset": "utf8mb4" },
+    "postgres": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-5432}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}", "ssl": false },
+    "cockroachdb": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-26257}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}", "ssl": true },
+    "mssql": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-1433}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}", "encrypt": false, "trustServerCertificate": true },
+    "mongodb": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-27017}, "database": "${CFG_DB_NAME:-voltchat}", "user": "${CFG_DB_USER:-}", "password": "${CFG_DB_PASS:-}", "authSource": "admin" },
+    "redis": { "host": "${CFG_DB_HOST:-localhost}", "port": ${CFG_DB_PORT:-6379}, "password": "${CFG_DB_PASS:-}", "db": ${CFG_DB_NAME:-0}, "keyPrefix": "voltchat:" }
   },
   "auth": {
     "type": "all",

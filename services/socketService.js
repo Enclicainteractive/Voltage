@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid'
 import { addMessage, editMessage, deleteMessage, findChannelById } from '../routes/channelRoutes.js'
-import { dmMessageService, dmService, userService, reactionService } from './dataService.js'
+import { dmMessageService, dmService, userService, reactionService, channelService } from './dataService.js'
 import { e2eService, userKeyService } from './e2eService.js'
 import { e2eTrueService } from './e2eTrueService.js'
 import { botService } from './botService.js'
@@ -475,6 +475,9 @@ export const setupSocketHandlers = (io) => {
       botService.setBotStatus(bot.id, 'online')
       botSockets.set(bot.id, socket.id)
 
+      // Join bot's unique room for direct notifications
+      socket.join(`bot:${bot.id}`)
+
       for (const serverId of bot.servers) {
         socket.join(`server:${serverId}`)
       }
@@ -499,6 +502,14 @@ export const setupSocketHandlers = (io) => {
       socket.on('bot:send-message', (data) => {
         if (!botService.hasPermission(bot.id, 'messages:send')) return
         const { channelId, content, embeds } = data
+
+        const channel = channelService.getChannel(channelId)
+        const serverId = channel?.serverId
+        if (serverId && !bot.servers.includes(serverId)) {
+          socket.emit('bot:error', { error: 'Bot not in this server' })
+          return
+        }
+
         const cdnConfig = config.getCdnConfig()
         const message = {
           id: uuidv4(),
@@ -533,6 +544,14 @@ export const setupSocketHandlers = (io) => {
       socket.on('voice:get-participants', (data) => {
         const { channelId } = data || {}
         if (!channelId) return
+        
+        const channel = channelService.getChannel(channelId)
+        const serverId = channel?.serverId
+        if (serverId && !bot.servers.includes(serverId)) {
+          socket.emit('bot:error', { error: 'Bot not in this server' })
+          return
+        }
+        
         const participants = voiceChannelUsers.get(channelId) || []
         socket.emit('voice:participants', { channelId, participants })
       })
@@ -540,6 +559,13 @@ export const setupSocketHandlers = (io) => {
       socket.on('voice:join', (data) => {
         const { channelId, peerId } = data || {}
         if (!channelId) return
+
+        const channel = channelService.getChannel(channelId)
+        const serverId = channel?.serverId
+        if (serverId && !bot.servers.includes(serverId)) {
+          socket.emit('bot:error', { error: 'Bot not in this server' })
+          return
+        }
 
         console.log(`[Voice] Bot ${botUserId} joining channel ${channelId}`)
 
@@ -604,6 +630,14 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:leave', (channelId) => {
         if (!channelId) return
+
+        const channel = channelService.getChannel(channelId)
+        const serverId = channel?.serverId
+        if (serverId && !bot.servers.includes(serverId)) {
+          socket.emit('bot:error', { error: 'Bot not in this server' })
+          return
+        }
+
         console.log(`[Voice] Bot ${botUserId} leaving channel ${channelId}`)
         cleanupVoiceUser(io, channelId, botUserId, 'bot-leave-event')
         // Remove bot from relay map when it leaves voice
@@ -614,6 +648,13 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:offer', (data) => {
         const { to, offer, channelId } = data || {}
+        if (channelId) {
+          const channel = channelService.getChannel(channelId)
+          const serverId = channel?.serverId
+          if (serverId && !bot.servers.includes(serverId)) {
+            return
+          }
+        }
         const targetSocket = userSockets.get(to) || botSockets.get(to)
         if (targetSocket) {
           io.to(targetSocket).emit('voice:offer', { from: botUserId, fromUsername: bot.name, offer, channelId })
@@ -622,6 +663,13 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:answer', (data) => {
         const { to, answer, channelId } = data || {}
+        if (channelId) {
+          const channel = channelService.getChannel(channelId)
+          const serverId = channel?.serverId
+          if (serverId && !bot.servers.includes(serverId)) {
+            return
+          }
+        }
         const targetSocket = userSockets.get(to) || botSockets.get(to)
         if (targetSocket) {
           io.to(targetSocket).emit('voice:answer', { from: botUserId, answer, channelId })
@@ -630,6 +678,13 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:ice-candidate', (data) => {
         const { to, candidate, channelId } = data || {}
+        if (channelId) {
+          const channel = channelService.getChannel(channelId)
+          const serverId = channel?.serverId
+          if (serverId && !bot.servers.includes(serverId)) {
+            return
+          }
+        }
         const targetSocket = userSockets.get(to) || botSockets.get(to)
         if (targetSocket) {
           io.to(targetSocket).emit('voice:ice-candidate', { from: botUserId, candidate, channelId })
@@ -648,6 +703,32 @@ export const setupSocketHandlers = (io) => {
           customStatus: customStatus ?? null,
           isBot:        true
         })
+      })
+
+      // Listen for bot removal from servers - immediately disconnect from that server
+      socket.on('bot:remove-from-server', (data) => {
+        const { serverId } = data
+        if (!serverId) return
+        
+        // Reload bot data to get fresh server list
+        const freshBot = botService.getBot(bot.id)
+        if (!freshBot) {
+          socket.disconnect(true)
+          return
+        }
+
+        // If bot was removed from server, make them leave the server room
+        if (!freshBot.servers.includes(serverId)) {
+          socket.leave(`server:${serverId}`)
+          console.log(`[Socket] Bot ${bot.name} removed from server ${serverId}, left server room`)
+        }
+
+        // If bot is not in any servers, disconnect them entirely
+        if (freshBot.servers.length === 0) {
+          console.log(`[Socket] Bot ${bot.name} not in any servers, disconnecting`)
+          socket.emit('bot:kicked', { reason: 'Removed from all servers' })
+          socket.disconnect(true)
+        }
       })
 
       socket.on('disconnect', () => {
@@ -802,33 +883,30 @@ export const setupSocketHandlers = (io) => {
       // Send notifications for mentions
       sendMentionNotifications(io, socket, data.channelId, message, mentions)
 
-      // Deliver message:new to all connected bots in every server the channel belongs to
-      const allServers = socket.currentServer
-        ? [socket.currentServer]
-        : []
-      // Also check all servers this channel might belong to via bot server memberships
-      const checkedBots = new Set()
-      for (const [botId, botSocketId] of botSockets.entries()) {
-        if (checkedBots.has(botId)) continue
-        const botSocket = io.sockets.sockets.get(botSocketId)
-        if (!botSocket) continue
-        const bot = botService.getBot(botId)
-        if (!bot) continue
-        // Deliver if the bot is in any server that contains this channel
-        const botInServer = allServers.some(sid => bot.servers.includes(sid))
-          || bot.servers.some(sid => botSocket.rooms.has(`server:${sid}`))
-        if (botInServer) {
-          checkedBots.add(botId)
-          botSocket.emit('message:new', {
-            ...message,
-            serverId: socket.currentServer || null
-          })
-          // Also deliver via webhook if configured
-          botService.deliverWebhookEvent(botId, 'MESSAGE_CREATE', {
-            message,
-            serverId: socket.currentServer,
-            channelId: data.channelId
-          })
+      // Get the actual server for this channel from the existing channel variable
+      const channelServerId = channel?.serverId
+
+      // Only deliver message to bots that are in THIS specific server
+      if (channelServerId) {
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (!botSocket) continue
+          const bot = botService.getBot(botId)
+          if (!bot) continue
+          
+          // ONLY deliver if bot is actually in this server
+          if (bot.servers.includes(channelServerId)) {
+            botSocket.emit('message:new', {
+              ...message,
+              serverId: channelServerId
+            })
+            // Also deliver via webhook if configured
+            botService.deliverWebhookEvent(botId, 'MESSAGE_CREATE', {
+              message,
+              serverId: channelServerId,
+              channelId: data.channelId
+            })
+          }
         }
       }
     })
@@ -1033,10 +1111,19 @@ export const setupSocketHandlers = (io) => {
       const updated = editMessage(channelId, messageId, userId, content)
       if (updated) {
         io.to(`channel:${channelId}`).emit('message:edited', updated)
-        // Deliver to connected bots
-        for (const [botId, botSocketId] of botSockets.entries()) {
-          const botSocket = io.sockets.sockets.get(botSocketId)
-          if (botSocket) botSocket.emit('message:edited', updated)
+        
+        // Only deliver to bots in THIS server
+        const channel = channelService.getChannel(channelId)
+        const channelServerId = channel?.serverId
+        if (channelServerId) {
+          for (const [botId, botSocketId] of botSockets.entries()) {
+            const botSocket = io.sockets.sockets.get(botSocketId)
+            if (!botSocket) continue
+            const bot = botService.getBot(botId)
+            if (bot?.servers.includes(channelServerId)) {
+              botSocket.emit('message:edited', updated)
+            }
+          }
         }
       }
     })
@@ -1047,10 +1134,19 @@ export const setupSocketHandlers = (io) => {
       const result = deleteMessage(channelId, messageId, userId)
       if (result.success) {
         io.to(`channel:${channelId}`).emit('message:deleted', { messageId, channelId })
-        // Deliver to connected bots
-        for (const [botId, botSocketId] of botSockets.entries()) {
-          const botSocket = io.sockets.sockets.get(botSocketId)
-          if (botSocket) botSocket.emit('message:deleted', { messageId, channelId })
+        
+        // Only deliver to bots in THIS server
+        const channel = channelService.getChannel(channelId)
+        const channelServerId = channel?.serverId
+        if (channelServerId) {
+          for (const [botId, botSocketId] of botSockets.entries()) {
+            const botSocket = io.sockets.sockets.get(botSocketId)
+            if (!botSocket) continue
+            const bot = botService.getBot(botId)
+            if (bot?.servers.includes(channelServerId)) {
+              botSocket.emit('message:deleted', { messageId, channelId })
+            }
+          }
         }
       }
     })
@@ -1122,9 +1218,19 @@ export const setupSocketHandlers = (io) => {
       const reactions = reactionService.addReaction(messageId, userId, emoji)
       const reactionPayload = { messageId, reactions, action: 'add', userId, emoji }
       io.to(`channel:${channelId}`).emit('reaction:updated', reactionPayload)
-      for (const [botId, botSocketId] of botSockets.entries()) {
-        const botSocket = io.sockets.sockets.get(botSocketId)
-        if (botSocket) botSocket.emit('reaction:updated', reactionPayload)
+      
+      // Only deliver to bots in THIS server
+      const channel = channelService.getChannel(channelId)
+      const channelServerId = channel?.serverId
+      if (channelServerId) {
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (!botSocket) continue
+          const bot = botService.getBot(botId)
+          if (bot?.servers.includes(channelServerId)) {
+            botSocket.emit('reaction:updated', reactionPayload)
+          }
+        }
       }
     })
 
@@ -1133,9 +1239,19 @@ export const setupSocketHandlers = (io) => {
       const reactions = reactionService.removeReaction(messageId, userId, emoji)
       const reactionPayload = { messageId, reactions, action: 'remove', userId, emoji }
       io.to(`channel:${channelId}`).emit('reaction:updated', reactionPayload)
-      for (const [botId, botSocketId] of botSockets.entries()) {
-        const botSocket = io.sockets.sockets.get(botSocketId)
-        if (botSocket) botSocket.emit('reaction:updated', reactionPayload)
+      
+      // Only deliver to bots in THIS server
+      const channel = channelService.getChannel(channelId)
+      const channelServerId = channel?.serverId
+      if (channelServerId) {
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (!botSocket) continue
+          const bot = botService.getBot(botId)
+          if (bot?.servers.includes(channelServerId)) {
+            botSocket.emit('reaction:updated', reactionPayload)
+          }
+        }
       }
     })
 

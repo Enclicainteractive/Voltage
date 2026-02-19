@@ -25,8 +25,13 @@ export const FILES = {
   attachments: path.join(DATA_DIR, 'attachments.json'),
   discovery: path.join(DATA_DIR, 'discovery.json'),
   globalBans: path.join(DATA_DIR, 'global-bans.json'),
+  serverBans: path.join(DATA_DIR, 'server-bans.json'),
   adminLogs: path.join(DATA_DIR, 'admin-logs.json'),
-  systemMessages: path.join(DATA_DIR, 'system-messages.json')
+  systemMessages: path.join(DATA_DIR, 'system-messages.json'),
+  e2eTrue: path.join(DATA_DIR, 'e2e-true.json'),
+  pinnedMessages: path.join(DATA_DIR, 'pinned-messages.json'),
+  selfVolts: path.join(DATA_DIR, 'self-volts.json'),
+  serverStart: path.join(DATA_DIR, 'server-start.json')
 }
 
 let storageService = null
@@ -144,6 +149,7 @@ const getTableName = (file) => {
     [FILES.attachments]: 'attachments',
     [FILES.discovery]: 'discovery',
     [FILES.globalBans]: 'global_bans',
+    [FILES.serverBans]: 'server_bans',
     [FILES.adminLogs]: 'admin_logs'
   }
   return fileMap[file] || file
@@ -169,6 +175,7 @@ export const migrateData = async (sourceType, targetConfig) => {
       [FILES.attachments]: 'attachments',
       [FILES.discovery]: 'discovery',
       [FILES.globalBans]: 'global_bans',
+      [FILES.serverBans]: 'server_bans',
       [FILES.adminLogs]: 'admin_logs'
     })) {
       try {
@@ -198,6 +205,88 @@ export const reloadData = async () => {
   if (useStorage) {
     await loadAllData()
   }
+}
+
+export const exportAllData = () => {
+  const data = {}
+  const fileToTable = {
+    [FILES.users]: 'users',
+    [FILES.friends]: 'friends',
+    [FILES.friendRequests]: 'friend_requests',
+    [FILES.servers]: 'servers',
+    [FILES.channels]: 'channels',
+    [FILES.messages]: 'messages',
+    [FILES.serverInvites]: 'invites',
+    [FILES.dms]: 'dms',
+    [FILES.dmMessages]: 'dm_messages',
+    [FILES.reactions]: 'reactions',
+    [FILES.blocked]: 'blocked',
+    [FILES.files]: 'files',
+    [FILES.attachments]: 'attachments',
+    [FILES.discovery]: 'discovery',
+    [FILES.globalBans]: 'global_bans',
+    [FILES.serverBans]: 'server_bans',
+    [FILES.adminLogs]: 'admin_logs',
+    [FILES.systemMessages]: 'system_messages',
+    [FILES.e2eTrue]: 'e2e_true',
+    [FILES.pinnedMessages]: 'pinned_messages',
+    [FILES.selfVolts]: 'self_volts',
+    [FILES.serverStart]: 'server_start'
+  }
+  
+  for (const [file, table] of Object.entries(fileToTable)) {
+    try {
+      data[table] = loadData(file, {})
+    } catch (err) {
+      console.error(`[Data] Error exporting ${table}:`, err.message)
+      data[table] = {}
+    }
+  }
+  
+  return data
+}
+
+export const importAllData = (data) => {
+  const results = { success: true, tables: {}, errors: [] }
+  const tableToFile = {
+    users: FILES.users,
+    friends: FILES.friends,
+    friend_requests: FILES.friendRequests,
+    servers: FILES.servers,
+    channels: FILES.channels,
+    messages: FILES.messages,
+    invites: FILES.serverInvites,
+    dms: FILES.dms,
+    dm_messages: FILES.dmMessages,
+    reactions: FILES.reactions,
+    blocked: FILES.blocked,
+    files: FILES.files,
+    attachments: FILES.attachments,
+    discovery: FILES.discovery,
+    global_bans: FILES.globalBans,
+    server_bans: FILES.serverBans,
+    admin_logs: FILES.adminLogs,
+    system_messages: FILES.systemMessages,
+    e2e_true: FILES.e2eTrue,
+    pinned_messages: FILES.pinnedMessages,
+    self_volts: FILES.selfVolts,
+    server_start: FILES.serverStart
+  }
+  
+  for (const [table, file] of Object.entries(tableToFile)) {
+    try {
+      if (data[table]) {
+        saveData(file, data[table])
+        results.tables[table] = Object.keys(data[table]).length
+      } else {
+        results.tables[table] = 0
+      }
+    } catch (err) {
+      results.errors.push(`${table}: ${err.message}`)
+    }
+  }
+  
+  return results
 }
 
 export const userService = {
@@ -738,43 +827,129 @@ export const serverService = {
 }
 
 export const channelService = {
+  /**
+   * Detect whether channels.json uses the legacy format { serverId: [channels] }
+   * or the flat format { channelId: channelData }.
+   */
+  _isLegacyFormat(channels) {
+    const firstValue = Object.values(channels)[0]
+    return Array.isArray(firstValue)
+  },
+
+  /**
+   * Flatten legacy { serverId: [channels] } format into { channelId: channelData }
+   */
+  _flattenLegacy(channels) {
+    const flat = {}
+    for (const [serverId, channelList] of Object.entries(channels)) {
+      if (Array.isArray(channelList)) {
+        for (const ch of channelList) {
+          if (ch && ch.id) {
+            flat[ch.id] = { ...ch, serverId: ch.serverId || serverId }
+          }
+        }
+      }
+    }
+    return flat
+  },
+
+  /**
+   * Load channels and normalize to flat { channelId: channelData } format.
+   */
+  _loadFlat() {
+    const raw = loadData(FILES.channels, {})
+    if (Object.keys(raw).length === 0) return raw
+    if (this._isLegacyFormat(raw)) {
+      return this._flattenLegacy(raw)
+    }
+    return raw
+  },
+
   getChannel(channelId) {
-    const channels = loadData(FILES.channels, {})
+    const channels = this._loadFlat()
     return channels[channelId] || null
   },
 
   createChannel(channelData) {
-    const channels = loadData(FILES.channels, {})
-    channels[channelData.id] = {
+    const raw = loadData(FILES.channels, {})
+    if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
+      // Legacy format: add to the server's array
+      const serverId = channelData.serverId
+      if (!raw[serverId]) raw[serverId] = []
+      const existing = raw[serverId].findIndex(c => c.id === channelData.id)
+      const newChannel = { ...channelData, createdAt: channelData.createdAt || new Date().toISOString() }
+      if (existing >= 0) {
+        raw[serverId][existing] = newChannel
+      } else {
+        raw[serverId].push(newChannel)
+      }
+      saveData(FILES.channels, raw)
+      return newChannel
+    }
+    // Flat format
+    raw[channelData.id] = {
       ...channelData,
       createdAt: channelData.createdAt || new Date().toISOString()
     }
-    saveData(FILES.channels, channels)
-    return channels[channelData.id]
+    saveData(FILES.channels, raw)
+    return raw[channelData.id]
   },
 
   updateChannel(channelId, updates) {
-    const channels = loadData(FILES.channels, {})
-    if (!channels[channelId]) return null
-    
-    channels[channelId] = {
-      ...channels[channelId],
-      ...updates
+    const raw = loadData(FILES.channels, {})
+    if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
+      // Legacy format: find and update in the server arrays
+      for (const [serverId, channelList] of Object.entries(raw)) {
+        if (!Array.isArray(channelList)) continue
+        const idx = channelList.findIndex(c => c.id === channelId)
+        if (idx >= 0) {
+          channelList[idx] = { ...channelList[idx], ...updates }
+          saveData(FILES.channels, raw)
+          return channelList[idx]
+        }
+      }
+      return null
     }
-    saveData(FILES.channels, channels)
-    return channels[channelId]
+    // Flat format
+    if (!raw[channelId]) return null
+    raw[channelId] = { ...raw[channelId], ...updates }
+    saveData(FILES.channels, raw)
+    return raw[channelId]
   },
 
   deleteChannel(channelId) {
-    const channels = loadData(FILES.channels, {})
-    delete channels[channelId]
-    saveData(FILES.channels, channels)
+    const raw = loadData(FILES.channels, {})
+    if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
+      // Legacy format: remove from the server arrays
+      for (const [serverId, channelList] of Object.entries(raw)) {
+        if (!Array.isArray(channelList)) continue
+        const idx = channelList.findIndex(c => c.id === channelId)
+        if (idx >= 0) {
+          channelList.splice(idx, 1)
+          saveData(FILES.channels, raw)
+          return true
+        }
+      }
+      return true
+    }
+    // Flat format
+    delete raw[channelId]
+    saveData(FILES.channels, raw)
     return true
   },
 
   getServerChannels(serverId) {
-    const channels = loadData(FILES.channels, {})
-    return Object.values(channels).filter(ch => ch.serverId === serverId)
+    const raw = loadData(FILES.channels, {})
+    if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
+      // Legacy format: channels are stored as { serverId: [channels] }
+      const channelList = raw[serverId]
+      if (Array.isArray(channelList)) {
+        return channelList.map(ch => ({ ...ch, serverId: ch.serverId || serverId }))
+      }
+      return []
+    }
+    // Flat format
+    return Object.values(raw).filter(ch => ch.serverId === serverId)
   },
   
   getAllChannels() {
@@ -1105,31 +1280,31 @@ export const adminLogService = {
 
 export const serverBanService = {
   isServerBanned(serverId) {
-    const bans = loadData(FILES.serverBans || FILES.globalBans, {})
+    const bans = loadData(FILES.serverBans, {})
     return bans[serverId] || null
   },
 
   banServer(serverId, reason, bannedBy) {
-    const bans = loadData(FILES.serverBans || FILES.globalBans, {})
+    const bans = loadData(FILES.serverBans, {})
     bans[serverId] = {
       serverId,
       reason,
       bannedBy,
       bannedAt: new Date().toISOString()
     }
-    saveData(FILES.serverBans || FILES.globalBans, bans)
+    saveData(FILES.serverBans, bans)
     return bans[serverId]
   },
 
   unbanServer(serverId) {
-    const bans = loadData(FILES.serverBans || FILES.globalBans, {})
+    const bans = loadData(FILES.serverBans, {})
     delete bans[serverId]
-    saveData(FILES.serverBans || FILES.globalBans, bans)
+    saveData(FILES.serverBans, bans)
     return true
   },
 
   getAllServerBans() {
-    return loadData(FILES.serverBans || FILES.globalBans, {})
+    return loadData(FILES.serverBans, {})
   }
 }
 
@@ -1328,6 +1503,8 @@ export default {
   migrateData,
   getStorageInfo,
   reloadData,
+  exportAllData,
+  importAllData,
   userService,
   friendService,
   friendRequestService,

@@ -18,6 +18,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, '..', '..', 'data')
 const SERVERS_FILE = path.join(DATA_DIR, 'servers.json')
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json')
+const CATEGORIES_FILE = path.join(DATA_DIR, 'categories.json')
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true })
@@ -103,6 +104,9 @@ const setServers = (servers) => saveData(SERVERS_FILE, servers)
 const getAllChannels = () => loadData(CHANNELS_FILE, {})
 const setAllChannels = (channels) => saveData(CHANNELS_FILE, channels)
 
+const getAllCategories = () => loadData(CATEGORIES_FILE, {})
+const setAllCategories = (categories) => saveData(CATEGORIES_FILE, categories)
+
 const getMemberRoles = (server, userId) => {
   const member = server?.members?.find(m => m.id === userId)
   return member?.roles || []
@@ -185,6 +189,30 @@ router.get('/:serverId/members', authenticateToken, (req, res) => {
   }))
 
   res.json([...enrichedMembers, ...botMembers])
+})
+
+router.get('/:serverId/online-members', authenticateToken, (req, res) => {
+  const servers = getServers()
+  const server = servers.find(s => s.id === req.params.serverId)
+  
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+
+  const serverMemberIds = new Set((server.members || []).map(m => m.id))
+  
+  const onlineMembers = []
+  for (const [socketId, socket] of io.sockets.sockets) {
+    if (socket.user && serverMemberIds.has(socket.user.id)) {
+      onlineMembers.push({
+        userId: socket.user.id,
+        status: socket.user.status || 'online',
+        customStatus: socket.user.customStatus || null
+      })
+    }
+  }
+
+  res.json(onlineMembers)
 })
 
 router.get('/:serverId', authenticateToken, (req, res) => {
@@ -371,7 +399,7 @@ router.get('/:serverId/channels', authenticateToken, (req, res) => {
 })
 
 router.post('/:serverId/channels', authenticateToken, (req, res) => {
-  const { name, type } = req.body
+  const { name, type, categoryId } = req.body
   const serverId = req.params.serverId
 
   const servers = getServers()
@@ -383,11 +411,21 @@ router.post('/:serverId/channels', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Not authorized to manage channels' })
   }
   
+  // Validate categoryId if provided
+  if (categoryId) {
+    const allCategories = getAllCategories()
+    const categories = allCategories[serverId] || []
+    if (!categories.find(c => c.id === categoryId)) {
+      return res.status(400).json({ error: 'Invalid category' })
+    }
+  }
+  
   const newChannel = {
     id: uuidv4(),
     serverId,
     name,
     type: type || 'text',
+    categoryId: categoryId || null,
     createdAt: new Date().toISOString()
   }
   
@@ -863,6 +901,174 @@ router.delete('/:serverId/emojis/:emojiId', authenticateToken, (req, res) => {
   io.to(`server:${req.params.serverId}`).emit('emoji:deleted', { emojiId: req.params.emojiId, serverId: req.params.serverId })
   
   console.log(`[API] Deleted emoji ${req.params.emojiId} from server ${req.params.serverId}`)
+  res.json({ success: true })
+})
+
+// Category routes
+router.get('/:serverId/categories', authenticateToken, (req, res) => {
+  const allCategories = getAllCategories()
+  const categories = allCategories[req.params.serverId] || []
+  console.log(`[API] Get categories for server ${req.params.serverId} - returned ${categories.length} categories`)
+  res.json(categories)
+})
+
+router.post('/:serverId/categories', authenticateToken, (req, res) => {
+  const { name, position } = req.body
+  const serverId = req.params.serverId
+
+  const servers = getServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  if (!hasPermission(server, req.user.id, 'manage_channels')) {
+    return res.status(403).json({ error: 'Not authorized to manage categories' })
+  }
+  
+  const newCategory = {
+    id: uuidv4(),
+    serverId,
+    name,
+    position: position ?? 0,
+    createdAt: new Date().toISOString()
+  }
+  
+  const allCategories = getAllCategories()
+  if (!allCategories[serverId]) {
+    allCategories[serverId] = []
+  }
+  allCategories[serverId].push(newCategory)
+  setAllCategories(allCategories)
+  
+  io.to(`server:${serverId}`).emit('category:created', newCategory)
+  
+  console.log(`[API] Created category: ${name} in server ${serverId}`)
+  res.status(201).json(newCategory)
+})
+
+router.put('/:serverId/categories/order', authenticateToken, (req, res) => {
+  const { categoryIds } = req.body
+  const serverId = req.params.serverId
+  
+  if (!categoryIds || !Array.isArray(categoryIds)) {
+    return res.status(400).json({ error: 'categoryIds array required' })
+  }
+
+  const servers = getServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  if (!hasPermission(server, req.user.id, 'manage_channels')) {
+    return res.status(403).json({ error: 'Not authorized to manage categories' })
+  }
+
+  const allCategories = getAllCategories()
+  const categories = allCategories[serverId] || []
+  
+  const reorderedCategories = categoryIds.map((id, index) => {
+    const category = categories.find(c => c.id === id)
+    if (category) {
+      return { ...category, position: index }
+    }
+    return null
+  }).filter(Boolean)
+  
+  allCategories[serverId] = reorderedCategories
+  setAllCategories(allCategories)
+  
+  io.to(`server:${serverId}`).emit('category:order-updated', reorderedCategories)
+  
+  console.log(`[API] Updated category order for server ${serverId}`)
+  res.json(reorderedCategories)
+})
+
+// Individual category routes (for update/delete)
+router.put('/categories/:categoryId', authenticateToken, (req, res) => {
+  const allCategories = getAllCategories()
+  let foundCategory = null
+  let serverId = null
+  
+  // Find category across all servers
+  for (const [sid, categories] of Object.entries(allCategories)) {
+    const idx = categories.findIndex(c => c.id === req.params.categoryId)
+    if (idx !== -1) {
+      foundCategory = categories[idx]
+      serverId = sid
+      break
+    }
+  }
+  
+  if (!foundCategory) {
+    return res.status(404).json({ error: 'Category not found' })
+  }
+
+  const servers = getServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!hasPermission(server, req.user.id, 'manage_channels')) {
+    return res.status(403).json({ error: 'Not authorized to edit categories' })
+  }
+
+  // Update category
+  for (const categories of Object.values(allCategories)) {
+    const idx = categories.findIndex(c => c.id === req.params.categoryId)
+    if (idx !== -1) {
+      categories[idx] = { ...categories[idx], ...req.body, updatedAt: new Date().toISOString() }
+      setAllCategories(allCategories)
+      
+      io.to(`server:${serverId}`).emit('category:updated', categories[idx])
+      console.log(`[API] Updated category ${req.params.categoryId}`)
+      return res.json(categories[idx])
+    }
+  }
+})
+
+router.delete('/categories/:categoryId', authenticateToken, (req, res) => {
+  if (req.params.categoryId === 'uncategorized') {
+    return res.status(400).json({ error: 'Cannot delete uncategorized pseudo-category' })
+  }
+  
+  const allCategories = getAllCategories()
+  let serverId = null
+  
+  // Find category across all servers
+  for (const [sid, categories] of Object.entries(allCategories)) {
+    const idx = categories.findIndex(c => c.id === req.params.categoryId)
+    if (idx !== -1) {
+      serverId = sid
+      break
+    }
+  }
+  
+  if (!serverId) {
+    return res.status(404).json({ error: 'Category not found' })
+  }
+
+  const servers = getServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!hasPermission(server, req.user.id, 'manage_channels')) {
+    return res.status(403).json({ error: 'Not authorized to delete categories' })
+  }
+
+  // Remove category
+  allCategories[serverId] = allCategories[serverId].filter(c => c.id !== req.params.categoryId)
+  setAllCategories(allCategories)
+  
+  // Move all channels in this category to uncategorized (null)
+  const allChannels = getAllChannels()
+  if (allChannels[serverId]) {
+    allChannels[serverId] = allChannels[serverId].map(c => {
+      if (c.categoryId === req.params.categoryId) {
+        return { ...c, categoryId: null }
+      }
+      return c
+    })
+    setAllChannels(allChannels)
+  }
+  
+  io.to(`server:${serverId}`).emit('category:deleted', { categoryId: req.params.categoryId, serverId })
+  
+  console.log(`[API] Deleted category ${req.params.categoryId}`)
   res.json({ success: true })
 })
 
