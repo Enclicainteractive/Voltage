@@ -31,7 +31,8 @@ export const FILES = {
   e2eTrue: path.join(DATA_DIR, 'e2e-true.json'),
   pinnedMessages: path.join(DATA_DIR, 'pinned-messages.json'),
   selfVolts: path.join(DATA_DIR, 'self-volts.json'),
-  serverStart: path.join(DATA_DIR, 'server-start.json')
+  serverStart: path.join(DATA_DIR, 'server-start.json'),
+  callLogs: path.join(DATA_DIR, 'call-logs.json')
 }
 
 let storageService = null
@@ -1495,6 +1496,133 @@ export const systemMessageService = {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Call Log Service
+// Stores call history for DM conversations
+// ---------------------------------------------------------------------------
+export const callLogService = {
+  /**
+   * Log a call event
+   * @param {object} opts
+   * @param {string} opts.callId - Unique call identifier
+   * @param {string} opts.conversationId - DM conversation ID
+   * @param {string} opts.callerId - User who initiated the call
+   * @param {string} opts.recipientId - User who received the call
+   * @param {string} opts.type - 'audio' | 'video'
+   * @param {string} opts.status - 'started' | 'ended' | 'missed' | 'declined' | 'failed'
+   * @param {number} [opts.duration] - Duration in seconds (for ended calls)
+   * @param {string} [opts.endedBy] - User who ended the call
+   * @param {string} [opts.endedAt] - ISO timestamp when call ended
+   */
+  logCall(opts) {
+    const { callId, conversationId, callerId, recipientId, type, status, duration, endedBy, endedAt } = opts
+    const logs = loadData(FILES.callLogs, {})
+    
+    const now = new Date().toISOString()
+    
+    if (!logs[conversationId]) logs[conversationId] = []
+    
+    const existingIndex = logs[conversationId].findIndex(l => l.callId === callId)
+    
+    const logEntry = {
+      callId,
+      conversationId,
+      callerId,
+      recipientId,
+      type: type || 'audio',
+      status,
+      duration: duration || 0,
+      startedAt: existingIndex >= 0 ? logs[conversationId][existingIndex].startedAt : now,
+      endedAt: endedAt || (status === 'ended' || status === 'missed' || status === 'declined' ? now : null),
+      endedBy: endedBy || null,
+      updatedAt: now
+    }
+    
+    if (existingIndex >= 0) {
+      logs[conversationId][existingIndex] = logEntry
+    } else {
+      logs[conversationId].push(logEntry)
+    }
+    
+    saveData(FILES.callLogs, logs)
+    return logEntry
+  },
+
+  /**
+   * Get call logs for a conversation
+   * @param {string} conversationId - DM conversation ID
+   * @param {number} limit - Max number of logs to return
+   */
+  getCallLogs(conversationId, limit = 50) {
+    const logs = loadData(FILES.callLogs, {})
+    const convLogs = logs[conversationId] || []
+    return convLogs
+      .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))
+      .slice(0, limit)
+  },
+
+  /**
+   * Get call logs for a user (across all conversations)
+   * @param {string} userId - User ID
+   * @param {number} limit - Max number of logs to return
+   */
+  getCallLogsForUser(userId, limit = 50) {
+    const logs = loadData(FILES.callLogs, {})
+    const allLogs = []
+    
+    for (const convLogs of Object.values(logs)) {
+      for (const call of convLogs) {
+        if (call.callerId === userId || call.recipientId === userId) {
+          allLogs.push(call)
+        }
+      }
+    }
+    
+    return allLogs
+      .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))
+      .slice(0, limit)
+  },
+
+  /**
+   * Get a specific call by ID
+   */
+  getCall(callId) {
+    const logs = loadData(FILES.callLogs, {})
+    for (const convLogs of Object.values(logs)) {
+      const call = convLogs.find(l => l.callId === callId)
+      if (call) return call
+    }
+    return null
+  },
+
+  /**
+   * Update an existing call log
+   */
+  updateCall(callId, updates) {
+    const logs = loadData(FILES.callLogs, {})
+    for (const convId of Object.keys(logs)) {
+      const idx = logs[convId].findIndex(l => l.callId === callId)
+      if (idx >= 0) {
+        logs[convId][idx] = {
+          ...logs[convId][idx],
+          ...updates,
+          updatedAt: new Date().toISOString()
+        }
+        saveData(FILES.callLogs, logs)
+        return logs[convId][idx]
+      }
+    }
+    return null
+  },
+
+  /**
+   * Get all call logs
+   */
+  getAllCallLogs() {
+    return loadData(FILES.callLogs, {})
+  }
+}
+
 initStorage()
 
 export default {
@@ -1522,5 +1650,6 @@ export default {
   globalBanService,
   adminLogService,
   adminService,
-  serverBanService
+  serverBanService,
+  callLogService
 }

@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid'
 import { addMessage, editMessage, deleteMessage, findChannelById } from '../routes/channelRoutes.js'
-import { dmMessageService, dmService, userService, reactionService, channelService } from './dataService.js'
+import { dmMessageService, dmService, userService, reactionService, channelService, callLogService, blockService } from './dataService.js'
 import { e2eService, userKeyService } from './e2eService.js'
 import { e2eTrueService } from './e2eTrueService.js'
 import { botService } from './botService.js'
@@ -16,6 +16,14 @@ const voiceChannelUsers = new Map()
 const webrtcPeers = new Map()
 const voiceHeartbeats = new Map()
 const messageTimestamps = new Map()
+
+// DM Call state - must be at module scope so all socket connections share the same state
+// Active DM calls: callId -> { callerId, recipientId, conversationId, status, startTime, type }
+const activeDMCalls = new Map()
+// Pending incoming calls: recipientId -> [{ callId, callerId, callerInfo, conversationId, type, timestamp }]
+const pendingIncomingCalls = new Map()
+// Call timeout duration (30 seconds)
+const CALL_TIMEOUT_MS = 30000
 
 // Consensus tracking for voice connections
 const peerConnectionStates = new Map()  // userId -> { channelId, states: Map<targetPeerId, state>, lastUpdate }
@@ -47,17 +55,13 @@ const markVoiceHeartbeat = (userId, channelId) => {
 //   TURN_PASS  credential
 // ---------------------------------------------------------------------------
 const getIceServers = () => {
+  // Use openrelayproject TURN servers for relay when STUN fails
   const servers = [
     // STUN — direct P2P when peers are on open networks
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-
-    // ── Public TURN relay servers ──────────────────────────────────────────
-    // These relay audio when STUN-only ICE fails (symmetric NAT, firewalls).
-    // All use hardcoded public credentials — no account or API key needed.
-
-    // Open Relay Project (metered.ca) — widely used public TURN
+    
+    // Open Relay Project (metered.ca) — free public TURN
     {
       urls: 'turn:openrelay.metered.ca:80',
       username: 'openrelayproject',
@@ -69,38 +73,21 @@ const getIceServers = () => {
       credential: 'openrelayproject'
     },
     {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
       urls: 'turns:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-
-    // Numb (viagenie.ca) — long-running free public TURN
-    {
-      urls: 'turn:numb.viagenie.ca',
-      username: 'webrtc@live.com',
-      credential: 'muazkh'
-    },
-
-    // Xirsys public demo (unauthenticated, best-effort)
-    {
-      urls: 'turn:global.turn.twilio.com:3478?transport=udp',
       username: 'openrelayproject',
       credential: 'openrelayproject'
     },
   ]
 
-  // Self-hosted TURN server overrides the free public one above.
+  // Self-hosted TURN server overrides the public one.
   // Set TURN_URL, TURN_USER, TURN_PASS env vars or voice config keys.
   const turnUrl  = process.env.TURN_URL  || config.config?.voice?.turnUrl  || null
   const turnUser = process.env.TURN_USER || config.config?.voice?.turnUser || null
   const turnPass = process.env.TURN_PASS || config.config?.voice?.turnPass || null
 
   if (turnUrl && turnUser && turnPass) {
+    // Replace with self-hosted TURN
+    servers.length = 2 // Keep only STUN servers
     servers.push({ urls: turnUrl,  username: turnUser, credential: turnPass })
     const turnsUrl = turnUrl.replace(/^turn:/, 'turns:')
     if (turnsUrl !== turnUrl) {
@@ -954,26 +941,40 @@ export const setupSocketHandlers = (io) => {
       
       const channelUsers = voiceChannelUsers.get(channelId)
       const existingIndex = channelUsers.findIndex(u => u.id === userId)
-      if (existingIndex >= 0) {
-        // User already exists, update their info
+      const isReconnection = existingIndex >= 0
+      
+      if (isReconnection) {
+        // User is reconnecting - update their info but don't treat as new join
+        const existingUser = channelUsers[existingIndex]
+        userInfo.muted = existingUser.muted || false
+        userInfo.deafened = existingUser.deafened || false
         channelUsers[existingIndex] = userInfo
-        console.log(`[Voice] Updated existing user ${userId} in channel`)
+        console.log(`[Voice] User ${userId} reconnected to channel ${channelId}`)
+        
+        // Notify others that this user reconnected (not a new join)
+        socket.to(`voice:${channelId}`).emit('voice:user-reconnected', {
+          ...userInfo,
+          isReconnection: true
+        })
       } else {
         channelUsers.push(userInfo)
         console.log(`[Voice] Added new user ${userId} to channel`)
+        
+        // Notify others of new user
+        io.to(`voice:${channelId}`).emit('voice:user-joined', userInfo)
       }
       
       markVoiceHeartbeat(userId, channelId)
       
       socket.currentVoiceChannel = channelId
       socket.join(`voice:${channelId}`)
-      
-      io.to(`voice:${channelId}`).emit('voice:user-joined', userInfo)
 
+      // Send current participants list to the joining/reconnecting user
       socket.emit('voice:participants', { 
         channelId, 
         participants: voiceChannelUsers.get(channelId),
-        iceServers: getIceServers()
+        iceServers: getIceServers(),
+        isReconnection // Let the client know if this is a reconnection
       })
     })
 
@@ -1210,6 +1211,467 @@ export const setupSocketHandlers = (io) => {
         username: socket.user.username || socket.user.email,
         conversationId: data.conversationId
       })
+    })
+
+    // -------------------------------------------------------------------------
+    // DM CALL handlers
+    // 1-on-1 calls using the same WebRTC infrastructure as voice channels
+    // (activeDMCalls, pendingIncomingCalls, CALL_TIMEOUT_MS are at module scope)
+    // -------------------------------------------------------------------------
+
+    // Helper: get all socket IDs for a user (multi-device support)
+    const getUserSocketIds = (userId) => {
+      const socketIds = []
+      for (const [uid, sid] of userSockets.entries()) {
+        if (uid === userId) socketIds.push(sid)
+      }
+      return socketIds
+    }
+
+    // Helper: emit to all devices of a user
+    const emitToAllUserDevices = (io, userId, event, data) => {
+      // Use the personal room which all sockets join
+      io.to(`user:${userId}`).emit(event, data)
+    }
+
+    // Helper: clean up pending call
+    const cleanupPendingCall = (recipientId, callId) => {
+      const pending = pendingIncomingCalls.get(recipientId)
+      if (pending) {
+        const idx = pending.findIndex(c => c.callId === callId)
+        if (idx >= 0) pending.splice(idx, 1)
+        if (pending.length === 0) pendingIncomingCalls.delete(recipientId)
+      }
+    }
+
+    // Helper: end active call and notify both parties
+    const endActiveCall = (io, callId, endedBy, reason = 'ended') => {
+      const call = activeDMCalls.get(callId)
+      if (!call) return null
+
+      const now = new Date().toISOString()
+      const duration = Math.floor((Date.now() - new Date(call.startTime).getTime()) / 1000)
+
+      // Determine call status
+      const callStatus = reason === 'declined' ? 'declined' : reason === 'missed' ? 'missed' : reason === 'cancelled' ? 'cancelled' : 'ended'
+
+      // Update call log
+      callLogService.logCall({
+        callId,
+        conversationId: call.conversationId,
+        callerId: call.callerId,
+        recipientId: call.recipientId,
+        type: call.type,
+        status: callStatus,
+        duration,
+        endedBy,
+        endedAt: now
+      })
+
+      // Create a call message in the DM conversation
+      const callerInfo = userService.getUser(call.callerId)
+      const recipientInfo = userService.getUser(call.recipientId)
+      
+      // Build call message content based on status
+      let callMessageContent = ''
+      let callIcon = '📞'
+      
+      if (callStatus === 'missed') {
+        // Missed call - show as missed for caller
+        callMessageContent = '📞 Missed call'
+        callIcon = '📞'
+      } else if (callStatus === 'declined') {
+        callMessageContent = '📞 Call declined'
+        callIcon = '📞'
+      } else if (callStatus === 'cancelled') {
+        callMessageContent = '📞 Call cancelled'
+        callIcon = '📞'
+      } else {
+        // Completed call - show duration
+        const mins = Math.floor(duration / 60)
+        const secs = duration % 60
+        const durationStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`
+        callMessageContent = `📞 Call ended • ${durationStr}`
+        callIcon = call.type === 'video' ? '📹' : '📞'
+      }
+
+      const callMessage = {
+        id: uuidv4(),
+        conversationId: call.conversationId,
+        userId: call.callerId,
+        username: callerInfo?.username || 'Unknown',
+        avatar: callerInfo?.avatar || null,
+        content: callMessageContent,
+        timestamp: now,
+        attachments: [],
+        system: true,
+        callLog: {
+          callId,
+          type: call.type,
+          status: callStatus,
+          duration,
+          callerId: call.callerId,
+          recipientId: call.recipientId,
+          endedBy
+        }
+      }
+
+      // Save call message to DM messages
+      dmMessageService.addMessage(call.conversationId, callMessage)
+      dmService.updateLastMessage(call.conversationId, call.callerId, call.recipientId)
+
+      // Broadcast call message to DM room
+      io.to(`dm:${call.conversationId}`).emit('dm:new', callMessage)
+
+      // Notify both parties
+      emitToAllUserDevices(io, call.callerId, 'call:ended', {
+        callId,
+        endedBy,
+        reason,
+        duration
+      })
+      emitToAllUserDevices(io, call.recipientId, 'call:ended', {
+        callId,
+        endedBy,
+        reason,
+        duration
+      })
+
+      activeDMCalls.delete(callId)
+      return call
+    }
+
+    // Initiate a call
+    socket.on('call:initiate', (data) => {
+      const { recipientId, conversationId, type = 'audio' } = data
+
+      // Check if blocked
+      if (blockService.isBlocked(userId, recipientId)) {
+        socket.emit('call:error', { error: 'Cannot call blocked user' })
+        return
+      }
+
+      // Check if recipient is online
+      if (!isUserOnline(recipientId)) {
+        socket.emit('call:error', { error: 'User is offline', code: 'USER_OFFLINE' })
+        return
+      }
+
+      // Check if there's already an active call between these users
+      for (const [callId, call] of activeDMCalls.entries()) {
+        if ((call.callerId === userId && call.recipientId === recipientId) ||
+            (call.callerId === recipientId && call.recipientId === userId)) {
+          socket.emit('call:error', { error: 'Call already in progress', code: 'CALL_IN_PROGRESS' })
+          return
+        }
+      }
+
+      const callId = `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      const callerInfo = {
+        id: userId,
+        username: socket.user.username || socket.user.email,
+        avatar: socket.user.avatar
+      }
+
+      // Create call record
+      activeDMCalls.set(callId, {
+        callerId: userId,
+        recipientId,
+        conversationId,
+        status: 'ringing',
+        startTime: new Date().toISOString(),
+        type
+      })
+
+      // Add to pending calls for recipient
+      if (!pendingIncomingCalls.has(recipientId)) {
+        pendingIncomingCalls.set(recipientId, [])
+      }
+      pendingIncomingCalls.get(recipientId).push({
+        callId,
+        callerId: userId,
+        callerInfo,
+        conversationId,
+        type,
+        timestamp: Date.now()
+      })
+
+      // Log call start
+      callLogService.logCall({
+        callId,
+        conversationId,
+        callerId: userId,
+        recipientId,
+        type,
+        status: 'started'
+      })
+
+      // Notify caller that call is ringing
+      socket.emit('call:ringing', {
+        callId,
+        recipientId,
+        conversationId,
+        type
+      })
+
+      // Ring all devices of recipient
+      emitToAllUserDevices(io, recipientId, 'call:incoming', {
+        callId,
+        caller: callerInfo,
+        conversationId,
+        type,
+        iceServers: getIceServers()
+      })
+
+      console.log(`[Call] ${userId} -> ${recipientId}: ${type} call initiated (${callId})`)
+
+      // Set timeout for missed call
+      setTimeout(() => {
+        const call = activeDMCalls.get(callId)
+        if (call && call.status === 'ringing') {
+          // Call still ringing after timeout = missed
+          cleanupPendingCall(recipientId, callId)
+          endActiveCall(io, callId, recipientId, 'missed')
+          
+          // Notify caller of missed call
+          emitToAllUserDevices(io, userId, 'call:missed', {
+            callId,
+            recipientId
+          })
+          
+          console.log(`[Call] ${callId} missed (timeout)`)
+        }
+      }, CALL_TIMEOUT_MS)
+    })
+
+    // Accept incoming call
+    socket.on('call:accept', (data) => {
+      const { callId } = data
+      const call = activeDMCalls.get(callId)
+
+      if (!call) {
+        socket.emit('call:error', { error: 'Call not found', code: 'CALL_NOT_FOUND' })
+        return
+      }
+
+      if (call.recipientId !== userId) {
+        socket.emit('call:error', { error: 'Not authorized to accept this call', code: 'UNAUTHORIZED' })
+        return
+      }
+
+      // Update call status
+      call.status = 'active'
+      call.acceptedAt = new Date().toISOString()
+
+      // Remove from pending
+      cleanupPendingCall(userId, callId)
+
+      // Update call log
+      callLogService.logCall({
+        callId,
+        conversationId: call.conversationId,
+        callerId: call.callerId,
+        recipientId: call.recipientId,
+        type: call.type,
+        status: 'accepted'
+      })
+
+      // Notify caller that call was accepted
+      emitToAllUserDevices(io, call.callerId, 'call:accepted', {
+        callId,
+        recipientId: userId,
+        iceServers: getIceServers()
+      })
+
+      // Confirm to acceptor
+      socket.emit('call:connected', {
+        callId,
+        callerId: call.callerId,
+        iceServers: getIceServers()
+      })
+
+      console.log(`[Call] ${callId} accepted by ${userId}`)
+    })
+
+    // Decline incoming call
+    socket.on('call:decline', (data) => {
+      const { callId } = data
+      const call = activeDMCalls.get(callId)
+
+      if (!call) {
+        socket.emit('call:error', { error: 'Call not found' })
+        return
+      }
+
+      if (call.recipientId !== userId) {
+        socket.emit('call:error', { error: 'Not authorized' })
+        return
+      }
+
+      cleanupPendingCall(userId, callId)
+      endActiveCall(io, callId, userId, 'declined')
+
+      console.log(`[Call] ${callId} declined by ${userId}`)
+    })
+
+    // End active call
+    socket.on('call:end', (data) => {
+      const { callId } = data
+      const call = activeDMCalls.get(callId)
+
+      if (!call) {
+        socket.emit('call:error', { error: 'Call not found' })
+        return
+      }
+
+      if (call.callerId !== userId && call.recipientId !== userId) {
+        socket.emit('call:error', { error: 'Not authorized' })
+        return
+      }
+
+      cleanupPendingCall(call.recipientId, callId)
+      endActiveCall(io, callId, userId, 'ended')
+
+      console.log(`[Call] ${callId} ended by ${userId}`)
+    })
+
+    // Cancel outgoing call (caller hangs up before answer)
+    socket.on('call:cancel', (data) => {
+      const { callId } = data
+      const call = activeDMCalls.get(callId)
+
+      if (!call) {
+        socket.emit('call:error', { error: 'Call not found' })
+        return
+      }
+
+      if (call.callerId !== userId) {
+        socket.emit('call:error', { error: 'Only caller can cancel' })
+        return
+      }
+
+      cleanupPendingCall(call.recipientId, callId)
+      endActiveCall(io, callId, userId, 'cancelled')
+
+      console.log(`[Call] ${callId} cancelled by caller ${userId}`)
+    })
+
+    // WebRTC signaling for DM calls
+    socket.on('call:offer', (data) => {
+      const { callId, to, offer } = data
+      const call = activeDMCalls.get(callId)
+
+      if (!call) return
+      if (call.callerId !== userId && call.recipientId !== userId) return
+
+      const targetSocket = userSockets.get(to)
+      if (targetSocket) {
+        io.to(targetSocket).emit('call:offer', {
+          from: userId,
+          fromUsername: socket.user.username,
+          offer,
+          callId
+        })
+      }
+    })
+
+    socket.on('call:answer', (data) => {
+      const { callId, to, answer } = data
+      const call = activeDMCalls.get(callId)
+
+      if (!call) return
+      if (call.callerId !== userId && call.recipientId !== userId) return
+
+      const targetSocket = userSockets.get(to)
+      if (targetSocket) {
+        io.to(targetSocket).emit('call:answer', {
+          from: userId,
+          answer,
+          callId
+        })
+      }
+    })
+
+    socket.on('call:ice-candidate', (data) => {
+      const { callId, to, candidate } = data
+      const call = activeDMCalls.get(callId)
+
+      if (!call) return
+      if (call.callerId !== userId && call.recipientId !== userId) return
+
+      const targetSocket = userSockets.get(to)
+      if (targetSocket) {
+        io.to(targetSocket).emit('call:ice-candidate', {
+          from: userId,
+          candidate,
+          callId
+        })
+      }
+    })
+
+    // Mute/Deafen during call
+    socket.on('call:mute', (data) => {
+      const { callId, muted } = data
+      const call = activeDMCalls.get(callId)
+      if (!call) return
+      if (call.callerId !== userId && call.recipientId !== userId) return
+
+      const otherId = call.callerId === userId ? call.recipientId : call.callerId
+      emitToAllUserDevices(io, otherId, 'call:user-muted', {
+        callId,
+        userId,
+        muted
+      })
+    })
+
+    socket.on('call:deafen', (data) => {
+      const { callId, deafened } = data
+      const call = activeDMCalls.get(callId)
+      if (!call) return
+      if (call.callerId !== userId && call.recipientId !== userId) return
+
+      const otherId = call.callerId === userId ? call.recipientId : call.callerId
+      emitToAllUserDevices(io, otherId, 'call:user-deafened', {
+        callId,
+        userId,
+        deafened
+      })
+    })
+
+    // Video toggle during call
+    socket.on('call:video-toggle', (data) => {
+      const { callId, enabled } = data
+      const call = activeDMCalls.get(callId)
+      if (!call) return
+      if (call.callerId !== userId && call.recipientId !== userId) return
+
+      const otherId = call.callerId === userId ? call.recipientId : call.callerId
+      emitToAllUserDevices(io, otherId, 'call:video-toggled', {
+        callId,
+        userId,
+        enabled
+      })
+    })
+
+    // Get call history for a conversation
+    socket.on('call:get-history', async (data) => {
+      const { conversationId, limit = 20 } = data
+      const logs = callLogService.getCallLogs(conversationId, limit)
+      socket.emit('call:history', { conversationId, logs })
+    })
+
+    // Clean up calls on disconnect
+    socket.on('disconnect', () => {
+      // End any active calls this user is in
+      for (const [callId, call] of activeDMCalls.entries()) {
+        if (call.callerId === userId || call.recipientId === userId) {
+          cleanupPendingCall(call.recipientId, callId)
+          endActiveCall(io, callId, userId, 'disconnected')
+        }
+      }
+
+      // Remove any pending incoming calls for this user
+      pendingIncomingCalls.delete(userId)
     })
 
     // Reaction handlers
@@ -1478,9 +1940,13 @@ export const setupSocketHandlers = (io) => {
     socket.on('disconnect', (reason) => {
       console.log(`User disconnected: ${userId}, reason: ${reason}`)
 
-      // Do not force immediate leave; rely on heartbeat timeout to clean stale voice users
+      // Immediately clean up voice channel presence on disconnect
+      // This ensures other users don't have to wait for heartbeat timeout
+      // when someone's browser crashes or network drops
       if (socket.currentVoiceChannel) {
-        markVoiceHeartbeat(userId, socket.currentVoiceChannel)
+        const channelId = socket.currentVoiceChannel
+        console.log(`[Voice] User ${userId} disconnected from channel ${channelId}, cleaning up immediately`)
+        cleanupVoiceUser(io, channelId, userId, 'disconnect')
       }
       
       // Leave all rooms

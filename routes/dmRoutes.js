@@ -19,7 +19,8 @@ const router = express.Router()
 
 // Get all DM conversations
 router.get('/', authenticateToken, (req, res) => {
-  const conversations = dmService.getConversations(req.user.id)
+  const { search } = req.query
+  let conversations = dmService.getConversations(req.user.id)
   
   const enrichedConversations = conversations.map(conv => {
     const recipientProfile = userService.getUser(conv.recipientId)
@@ -31,14 +32,82 @@ router.get('/', authenticateToken, (req, res) => {
         id: conv.recipientId,
         username: recipientProfile?.username || 'Unknown',
         displayName: recipientProfile?.displayName,
+        customUsername: recipientProfile?.customUsername,
         avatar: getImageUrl(conv.recipientId),
         status
       }
     }
-  }).sort((a, b) => new Date(b.lastMessageAt) - new Date(a.lastMessageAt))
+  })
   
-  console.log(`[API] Get DMs for ${req.user.username} - ${enrichedConversations.length} conversations`)
+  // Filter by search query if provided
+  if (search && search.trim()) {
+    const searchLower = search.toLowerCase().trim()
+    enrichedConversations = enrichedConversations.filter(conv => {
+      const username = conv.recipient?.username?.toLowerCase() || ''
+      const displayName = conv.recipient?.displayName?.toLowerCase() || ''
+      const customUsername = conv.recipient?.customUsername?.toLowerCase() || ''
+      return username.includes(searchLower) || 
+             displayName.includes(searchLower) || 
+             customUsername.includes(searchLower)
+    })
+  }
+  
+  // Sort by last message time
+  enrichedConversations.sort((a, b) => new Date(b.lastMessageAt) - new Date(a.lastMessageAt))
+  
+  console.log(`[API] Get DMs for ${req.user.username} - ${enrichedConversations.length} conversations${search ? ` (search: ${search})` : ''}`)
   res.json(enrichedConversations)
+})
+
+// Search for users to start a new DM
+router.get('/search', authenticateToken, (req, res) => {
+  const { q } = req.query
+  
+  if (!q || q.trim().length < 2) {
+    return res.json([])
+  }
+  
+  const searchLower = q.toLowerCase().trim()
+  const allUsers = userService.getAllUsers() || {}
+  const currentUserId = req.user.id
+  
+  // Get existing DM recipients to mark them
+  const existingConversations = dmService.getConversations(currentUserId)
+  const existingRecipientIds = new Set(existingConversations.map(c => c.recipientId))
+  
+  // Filter users by search query, exclude self and blocked users
+  const results = Object.values(allUsers)
+    .filter(user => {
+      if (user.id === currentUserId) return false
+      if (blockService.isBlocked(currentUserId, user.id)) return false
+      
+      const username = user.username?.toLowerCase() || ''
+      const displayName = user.displayName?.toLowerCase() || ''
+      const customUsername = user.customUsername?.toLowerCase() || ''
+      const email = user.email?.toLowerCase() || ''
+      
+      return username.includes(searchLower) || 
+             displayName.includes(searchLower) || 
+             customUsername.includes(searchLower) ||
+             email.includes(searchLower)
+    })
+    .slice(0, 20) // Limit results
+    .map(user => {
+      const online = isUserOnline(user.id)
+      const status = online ? (user.status === 'invisible' ? 'invisible' : (user.status || 'online')) : 'offline'
+      return {
+        id: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        customUsername: user.customUsername,
+        avatar: getImageUrl(user.id),
+        status,
+        hasExistingDM: existingRecipientIds.has(user.id)
+      }
+    })
+  
+  console.log(`[API] DM user search for "${q}" - ${results.length} results`)
+  res.json(results)
 })
 
 // Create or get DM conversation
@@ -81,11 +150,63 @@ router.post('/', authenticateToken, (req, res) => {
 
 // Get messages for a DM conversation
 router.get('/:conversationId/messages', authenticateToken, (req, res) => {
-  const { limit = 50 } = req.query
-  const messages = dmMessageService.getMessages(req.params.conversationId, parseInt(limit))
+  const { limit = 50, search } = req.query
+  let messages = dmMessageService.getMessages(req.params.conversationId, parseInt(limit))
   
-  console.log(`[API] Get DM messages for ${req.params.conversationId} - ${messages.length} messages`)
+  // Filter by search query if provided
+  if (search && search.trim()) {
+    const searchLower = search.toLowerCase().trim()
+    messages = messages.filter(msg => 
+      msg.content?.toLowerCase().includes(searchLower) ||
+      msg.username?.toLowerCase().includes(searchLower)
+    )
+  }
+  
+  console.log(`[API] Get DM messages for ${req.params.conversationId} - ${messages.length} messages${search ? ` (search: ${search})` : ''}`)
   res.json(messages)
+})
+
+// Search messages in all DM conversations
+router.get('/search/messages', authenticateToken, (req, res) => {
+  const { q } = req.query
+  
+  if (!q || q.trim().length < 2) {
+    return res.json([])
+  }
+  
+  const searchLower = q.toLowerCase().trim()
+  const conversations = dmService.getConversations(req.user.id)
+  const results = []
+  
+  for (const conv of conversations) {
+    const messages = dmMessageService.getMessages(conv.id, 100)
+    const matchingMessages = messages.filter(msg => 
+      msg.content?.toLowerCase().includes(searchLower)
+    ).slice(0, 10) // Limit per conversation
+    
+    if (matchingMessages.length > 0) {
+      const recipientProfile = userService.getUser(conv.recipientId)
+      results.push({
+        conversationId: conv.id,
+        recipient: {
+          id: conv.recipientId,
+          username: recipientProfile?.username || 'Unknown',
+          displayName: recipientProfile?.displayName,
+          avatar: getImageUrl(conv.recipientId)
+        },
+        messages: matchingMessages.map(msg => ({
+          id: msg.id,
+          content: msg.content,
+          timestamp: msg.timestamp,
+          userId: msg.userId,
+          username: msg.username
+        }))
+      })
+    }
+  }
+  
+  console.log(`[API] DM message search for "${q}" - ${results.length} conversations with matches`)
+  res.json(results.slice(0, 20)) // Limit total results
 })
 
 // Send message in DM

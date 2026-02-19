@@ -57,6 +57,47 @@ router.get('/admin/pending', authenticateToken, (req, res) => {
   res.json(submissions)
 })
 
+// Get detailed server info for discovery profile
+router.get('/server/:serverId', async (req, res) => {
+  const { serverService } = await import('../services/dataService.js')
+  const discoveryEntry = discoveryService.getDiscoveryEntry(req.params.serverId)
+  
+  if (!discoveryEntry) {
+    return res.status(404).json({ error: 'Server not found in discovery' })
+  }
+  
+  // Get full server data
+  const server = serverService.getServerById(req.params.serverId)
+  
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  
+  // Return public info only
+  const publicInfo = {
+    id: server.id,
+    name: server.name,
+    icon: server.icon,
+    bannerUrl: server.bannerUrl,
+    description: discoveryEntry.description || server.description || '',
+    category: discoveryEntry.category || 'community',
+    memberCount: server.members?.length || 0,
+    onlineCount: server.members?.filter(m => m.status === 'online').length || 0,
+    createdAt: server.createdAt,
+    ownerId: server.ownerId,
+    // Channel count (public channels only)
+    channelCount: server.channels?.length || 0,
+    // Roles info (just names, not permissions)
+    roleCount: server.roles?.length || 0,
+    // Is verification required
+    verificationRequired: server.verificationRequired || false,
+    // Theme color
+    themeColor: server.themeColor
+  }
+  
+  res.json(publicInfo)
+})
+
 router.post('/admin/approve/:submissionId', authenticateToken, (req, res) => {
   const result = discoveryService.approveSubmission(req.params.submissionId)
   
