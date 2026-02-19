@@ -3,6 +3,7 @@ import { authenticateToken } from '../middleware/authMiddleware.js'
 import { botService } from '../services/botService.js'
 import { io } from '../server.js'
 import { channelService, messageService } from '../services/dataService.js'
+import { addMessage } from './channelRoutes.js'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -209,6 +210,7 @@ router.post('/api/channels/:channelId/messages', authenticateBot, (req, res) => 
     timestamp: new Date().toISOString()
   }
 
+  addMessage(req.params.channelId, message)
   io.to(`channel:${req.params.channelId}`).emit('message:new', message)
   res.json(message)
 })
@@ -224,10 +226,20 @@ router.put('/api/commands', authenticateBot, (req, res) => {
   res.json({ success: true, count: commands.length })
 })
 
-// Bot: update status
+// Bot: update status + optional customStatus
 router.put('/api/status', authenticateBot, (req, res) => {
-  const { status } = req.body
-  botService.setBotStatus(req.bot.id, status || 'online')
+  const { status, customStatus } = req.body
+  const newStatus = status || 'online'
+  botService.setBotStatus(req.bot.id, newStatus, customStatus)
+
+  // Broadcast to every connected client so the members bar updates in real-time
+  io.emit('user:status', {
+    userId:       req.bot.id,
+    status:       newStatus,
+    customStatus: customStatus ?? null,
+    isBot:        true
+  })
+
   res.json({ success: true })
 })
 

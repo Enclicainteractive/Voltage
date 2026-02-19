@@ -62,7 +62,8 @@ const ensureUserProfile = (req, res, next) => {
     username: req.user.username,
     displayName: req.user.displayName || req.user.username,
     email: req.user.email,
-    host: req.user.host || config.getHost()
+    host: req.user.host || config.getHost(),
+    avatarHost: config.getImageServerUrl()
   })
   next()
 }
@@ -81,6 +82,8 @@ router.get('/me', async (req, res) => {
       ...req.user,
       ...profile,
       id: req.user.id,
+      host: profile?.host || req.user.host || config.getHost(),
+      avatarHost: profile?.avatarHost || config.getImageServerUrl(),
       avatar: avatarUrl,
       banner: bannerUrl
     })
@@ -293,6 +296,8 @@ router.get('/:userId', async (req, res) => {
   
   res.json({
     ...profile,
+    host: profile.host || config.getHost(),
+    avatarHost: profile.avatarHost || config.getImageServerUrl(),
     avatar: avatarUrl,
     banner: bannerUrl,
     status: liveStatus,

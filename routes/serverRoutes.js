@@ -5,7 +5,7 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { io } from '../server.js'
-import { discoveryService } from '../services/dataService.js'
+import { discoveryService, userService } from '../services/dataService.js'
 import config from '../config/config.js'
 import { botService } from '../services/botService.js'
 
@@ -158,18 +158,33 @@ router.get('/:serverId/members', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Server not found' })
   }
 
+  // Enrich member objects with host/avatarHost from user profile if not already stored
+  const localHost = config.getHost()
+  const localImageServerUrl = config.getImageServerUrl()
+  const enrichedMembers = (server.members || []).map(member => {
+    // If both fields are present, no lookup needed
+    if (member.host && member.avatarHost) return member
+    const profile = userService.getUser(member.id)
+    const host = member.host || profile?.host || localHost
+    // avatarHost is the image server URL for where this user's images are stored
+    const avatarHost = member.avatarHost || profile?.avatarHost || localImageServerUrl
+    return { ...member, host, avatarHost }
+  })
+
   const bots = botService.getServerBots(req.params.serverId)
   const botMembers = bots.map(bot => ({
-    id: bot.id,
-    username: bot.name,
-    avatar: bot.avatar || null,
-    status: bot.status || 'offline',
+    id:           bot.id,
+    username:     bot.name,
+    avatar:       bot.avatar || null,
+    status:       bot.status || 'offline',
+    customStatus: bot.customStatus || null,
     roles: [],
     role: null,
     isBot: true
+    // bots deliberately have no host field
   }))
 
-  res.json([...(server.members || []), ...botMembers])
+  res.json([...enrichedMembers, ...botMembers])
 })
 
 router.get('/:serverId', authenticateToken, (req, res) => {
@@ -201,10 +216,11 @@ router.get('/:serverId', authenticateToken, (req, res) => {
   // Merge bots as members with isBot flag
   const bots = botService.getServerBots(server.id)
   const botMembers = bots.map(bot => ({
-    id: bot.id,
-    username: bot.name,
-    avatar: bot.avatar || null,
-    status: bot.status || 'offline',
+    id:           bot.id,
+    username:     bot.name,
+    avatar:       bot.avatar || null,
+    status:       bot.status || 'offline',
+    customStatus: bot.customStatus || null,
     roles: [],
     role: null,
     isBot: true
@@ -482,6 +498,8 @@ router.post('/invites/:code/join', authenticateToken, (req, res) => {
     id: req.user.id,
     username: req.user.username,
     avatar: getAvatarUrl(req.user.id),
+    host: req.user.host || config.getHost(),
+    avatarHost: config.getImageServerUrl(),
     roles: ['member'],
     role: 'member',
     status: 'online',
@@ -515,6 +533,8 @@ router.post('/:serverId/join', authenticateToken, (req, res) => {
     id: req.user.id,
     username: req.user.username,
     avatar: getAvatarUrl(req.user.id),
+    host: req.user.host || config.getHost(),
+    avatarHost: config.getImageServerUrl(),
     roles: ['member'],
     role: 'member',
     status: 'online',

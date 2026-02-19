@@ -163,10 +163,14 @@ export const botService = {
       .map(({ token, ...safe }) => safe)
   },
 
-  setBotStatus(botId, status) {
+  setBotStatus(botId, status, customStatus) {
     const data = loadData()
     if (!data.bots?.[botId]) return false
     data.bots[botId].status = status
+    // customStatus: null clears it, undefined leaves it unchanged
+    if (customStatus !== undefined) {
+      data.bots[botId].customStatus = customStatus || null
+    }
     data.bots[botId].lastActive = new Date().toISOString()
     saveData(data)
     return true

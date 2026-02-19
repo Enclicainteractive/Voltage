@@ -25,7 +25,8 @@ export const FILES = {
   attachments: path.join(DATA_DIR, 'attachments.json'),
   discovery: path.join(DATA_DIR, 'discovery.json'),
   globalBans: path.join(DATA_DIR, 'global-bans.json'),
-  adminLogs: path.join(DATA_DIR, 'admin-logs.json')
+  adminLogs: path.join(DATA_DIR, 'admin-logs.json'),
+  systemMessages: path.join(DATA_DIR, 'system-messages.json')
 }
 
 let storageService = null
@@ -1214,6 +1215,108 @@ export const adminService = {
     }
     
     return { success: true }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// System Message Service
+// System messages are sent by Voltage itself to users/admins.
+// Categories: 'update' | 'account' | 'discovery' | 'announcement'
+// Audience targeting: per-user id, role ('admin'|'owner'|'all'), or server-specific
+// ---------------------------------------------------------------------------
+export const systemMessageService = {
+  /**
+   * Deliver a system message to one or more users.
+   * @param {object} opts
+   * @param {string}   opts.category   'update'|'account'|'discovery'|'announcement'
+   * @param {string}   opts.title
+   * @param {string}   opts.body       Markdown supported
+   * @param {string}   [opts.icon]     Lucide icon name hint for the client
+   * @param {string}   [opts.severity] 'info'|'warning'|'error'|'success'
+   * @param {string[]} opts.recipients Array of user IDs to receive this message
+   * @param {string}   [opts.dedupeKey] If set, skip users who already have a message with this key
+   * @param {object}   [opts.meta]     Extra data (e.g. version, releaseUrl)
+   * @returns {object[]} Array of created message objects
+   */
+  send(opts) {
+    const { category, title, body, icon, severity = 'info', recipients, dedupeKey, meta } = opts
+    const data = loadData(FILES.systemMessages, {})
+    const created = []
+    const now = new Date().toISOString()
+
+    for (const userId of (recipients || [])) {
+      if (!data[userId]) data[userId] = []
+
+      // Deduplicate: skip if a message with this dedupeKey was already sent
+      if (dedupeKey && data[userId].some(m => m.dedupeKey === dedupeKey)) continue
+
+      const msg = {
+        id: `sys_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        category,
+        title,
+        body,
+        icon: icon || null,
+        severity,
+        dedupeKey: dedupeKey || null,
+        meta: meta || null,
+        read: false,
+        createdAt: now
+      }
+      data[userId].push(msg)
+      created.push({ userId, ...msg })
+    }
+
+    saveData(FILES.systemMessages, data)
+    return created
+  },
+
+  /** Get all system messages for a user, newest first */
+  getForUser(userId) {
+    const data = loadData(FILES.systemMessages, {})
+    const msgs = data[userId] || []
+    return [...msgs].reverse()
+  },
+
+  /** Count unread system messages for a user */
+  unreadCount(userId) {
+    const data = loadData(FILES.systemMessages, {})
+    return (data[userId] || []).filter(m => !m.read).length
+  },
+
+  /** Mark one message as read */
+  markRead(userId, messageId) {
+    const data = loadData(FILES.systemMessages, {})
+    if (!data[userId]) return false
+    const msg = data[userId].find(m => m.id === messageId)
+    if (!msg) return false
+    msg.read = true
+    saveData(FILES.systemMessages, data)
+    return true
+  },
+
+  /** Mark all messages for a user as read */
+  markAllRead(userId) {
+    const data = loadData(FILES.systemMessages, {})
+    if (!data[userId]) return
+    data[userId].forEach(m => { m.read = true })
+    saveData(FILES.systemMessages, data)
+  },
+
+  /** Delete a system message */
+  delete(userId, messageId) {
+    const data = loadData(FILES.systemMessages, {})
+    if (!data[userId]) return false
+    const before = data[userId].length
+    data[userId] = data[userId].filter(m => m.id !== messageId)
+    saveData(FILES.systemMessages, data)
+    return data[userId].length < before
+  },
+
+  /** Delete all system messages for a user */
+  clearAll(userId) {
+    const data = loadData(FILES.systemMessages, {})
+    data[userId] = []
+    saveData(FILES.systemMessages, data)
   }
 }
 

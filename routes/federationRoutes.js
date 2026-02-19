@@ -1,10 +1,15 @@
 import express from 'express'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { federationService } from '../services/federationService.js'
+import { userService } from '../services/dataService.js'
 import config from '../config/config.js'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+
+// Will be set by setupFederationRoutes so we can emit to sockets
+let _io = null
+export const setupFederationRoutes = (io) => { _io = io }
 
 const __fedDir = path.dirname(fileURLToPath(import.meta.url))
 const FED_DATA_DIR = path.join(__fedDir, '..', '..', 'data')
@@ -235,7 +240,13 @@ router.get('/info', (req, res) => {
     mode: config.config.server.mode,
     federationEnabled: config.config.federation?.enabled || false,
     features: config.config.features,
-    peerCount: federationService.getPeers().filter(p => p.status === 'connected').length
+    peerCount: federationService.getPeers().filter(p => p.status === 'connected').length,
+    // URL fields — clients use these to correctly route API calls and image fetches
+    // for users whose home server differs from the server being viewed
+    apiUrl: config.getServerUrl(),
+    imageServerUrl: config.getImageServerUrl(),
+    cdnEnabled: config.isCdnEnabled(),
+    cdnUrl: config.isCdnEnabled() ? config.getCdnConfig()?.url || null : null
   })
 })
 
@@ -279,6 +290,54 @@ router.post('/member-joined', (req, res) => {
   console.log(`[Federation] Remote user ${user?.username || 'unknown'} from ${host} joined server ${serverId}`)
   res.json({ success: true })
 })
+
+// Receive a relay push from a peer (peer pushes directly instead of us polling)
+// Authenticated via HMAC token in Authorization header
+router.post('/relay/push', (req, res) => {
+  const token = req.headers['x-federation-token']
+  const fromHost = req.headers['x-federation-host']
+
+  if (!token || !fromHost) {
+    return res.status(401).json({ error: 'Missing federation credentials' })
+  }
+
+  const verified = federationService.verifyHandshakeToken(token, fromHost)
+  if (!verified) return res.status(401).json({ error: 'Invalid token' })
+
+  const { type, payload } = req.body
+  if (!type || !payload) return res.status(400).json({ error: 'type and payload required' })
+
+  processRelayEvent(type, payload, fromHost)
+  res.json({ success: true })
+})
+
+// Process an incoming federated relay event
+const processRelayEvent = (type, payload, fromHost) => {
+  if (type === 'mention:relay') {
+    const { targetUsername, channelId, messageId, senderId, senderName, senderHost, content, timestamp } = payload
+    if (!targetUsername) return
+
+    // Find local user by username
+    const users = Object.values(userService.getAllUsers() || {})
+    const localUser = users.find(u => u.username?.toLowerCase() === targetUsername.toLowerCase())
+    if (!localUser) return
+
+    // Emit mention notification to that user's personal socket room
+    if (_io) {
+      _io.to(`user:${localUser.id}`).emit('notification:mention', {
+        type: 'federated',
+        channelId,
+        messageId,
+        senderId: `${senderId}@${senderHost || fromHost}`,
+        senderName,
+        senderHost: senderHost || fromHost,
+        content,
+        timestamp,
+        federated: true
+      })
+    }
+  }
+}
 
 // List all servers available for federation discovery (public)
 router.get('/servers', (req, res) => {

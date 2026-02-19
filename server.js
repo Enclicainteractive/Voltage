@@ -21,11 +21,13 @@ import authRoutes from './routes/authRoutes.js'
 import pushRoutes from './routes/pushRoutes.js'
 import adminConfigRoutes from './routes/adminConfigRoutes.js'
 import migrationRoutes from './routes/migrationRoutes.js'
-import federationRoutes from './routes/federationRoutes.js'
+import federationRoutes, { setupFederationRoutes } from './routes/federationRoutes.js'
 import botRoutes from './routes/botRoutes.js'
 import e2eTrueRoutes from './routes/e2eTrueRoutes.js'
+import systemRoutes from './routes/systemRoutes.js'
 import { authenticateSocket } from './middleware/authMiddleware.js'
 import { setupSocketHandlers } from './services/socketService.js'
+import { startSystemScheduler } from './services/systemMessageScheduler.js'
 import config from './config/config.js'
 import { initStorage } from './services/storageService.js'
 
@@ -86,6 +88,7 @@ app.use('/api/migration', migrationRoutes)
 app.use('/api/federation', federationRoutes)
 app.use('/api/bots', botRoutes)
 app.use('/api/e2e-true', e2eTrueRoutes)
+app.use('/api/system', systemRoutes)
 
 app.get('/api/health', (req, res) => {
   res.json({ 
@@ -107,6 +110,8 @@ app.get('/api/health', (req, res) => {
 io.use(authenticateSocket)
 
 setupSocketHandlers(io)
+setupFederationRoutes(io)
+startSystemScheduler(io)
 
 export { io }
 
