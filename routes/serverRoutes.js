@@ -9,6 +9,14 @@ import { discoveryService, userService } from '../services/dataService.js'
 import config from '../config/config.js'
 import { botService } from '../services/botService.js'
 
+const getServerHost = () => {
+  try {
+    return config.getServerHost()
+  } catch {
+    return 'localhost'
+  }
+}
+
 const getAvatarUrl = (userId) => {
   const imageServerUrl = config.getImageServerUrl()
   return `${imageServerUrl}/api/images/users/${userId}/profile`
@@ -844,7 +852,15 @@ router.get('/:serverId/emojis', (req, res) => {
     return res.status(404).json({ error: 'Server not found' })
   }
   
-  res.json(server.emojis || [])
+  // Add host info to each emoji for global format
+  const emojisWithHost = (server.emojis || []).map(emoji => ({
+    ...emoji,
+    host: getServerHost(),
+    serverId: server.id,
+    serverName: server.name
+  }))
+  
+  res.json(emojisWithHost)
 })
 
 router.post('/:serverId/emojis', authenticateToken, (req, res) => {
@@ -879,7 +895,17 @@ router.post('/:serverId/emojis', authenticateToken, (req, res) => {
   servers[serverIndex] = server
   saveData(SERVERS_FILE, servers)
   
-  io.to(`server:${req.params.serverId}`).emit('emoji:created', emoji)
+  const emojiData = { 
+    ...emoji, 
+    serverId: req.params.serverId, 
+    serverName: server.name,
+    host: getServerHost()
+  }
+  
+  // Emit to server room
+  io.to(`server:${req.params.serverId}`).emit('emoji:created', emojiData)
+  // Also emit globally so all connected clients can update their global emoji cache
+  io.emit('emoji:created', emojiData)
   
   console.log(`[API] Added emoji ${name} to server ${req.params.serverId}`)
   res.json(emoji)
@@ -898,10 +924,42 @@ router.delete('/:serverId/emojis/:emojiId', authenticateToken, (req, res) => {
   servers[serverIndex] = server
   saveData(SERVERS_FILE, servers)
   
+  // Emit to server room
   io.to(`server:${req.params.serverId}`).emit('emoji:deleted', { emojiId: req.params.emojiId, serverId: req.params.serverId })
+  // Also emit globally so all connected clients can update their global emoji cache
+  io.emit('emoji:deleted', { emojiId: req.params.emojiId, serverId: req.params.serverId })
   
   console.log(`[API] Deleted emoji ${req.params.emojiId} from server ${req.params.serverId}`)
   res.json({ success: true })
+})
+
+// Global emojis - get all emojis from all servers the user is in
+router.get('/emojis/global', authenticateToken, (req, res) => {
+  const userId = req.user.id
+  const allServers = loadData(SERVERS_FILE, [])
+  
+  // Get servers user is a member of
+  const userServers = allServers.filter(s => 
+    s.members?.includes(userId) || s.ownerId === userId
+  )
+  
+  // Collect all emojis with server info
+  const allEmojis = []
+  userServers.forEach(server => {
+    if (server.emojis && server.emojis.length > 0) {
+      server.emojis.forEach(emoji => {
+        allEmojis.push({
+          ...emoji,
+          serverId: server.id,
+          serverName: server.name,
+          host: getServerHost()
+        })
+      })
+    }
+  })
+  
+  console.log(`[API] Global emojis for user ${userId}: ${allEmojis.length} emojis from ${userServers.length} servers`)
+  res.json(allEmojis)
 })
 
 // Category routes

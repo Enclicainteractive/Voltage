@@ -7,7 +7,6 @@ import { addMessage } from './channelRoutes.js'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { v4 as uuidv4 } from 'uuid'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, '..', '..', 'data')
@@ -319,7 +318,7 @@ router.get('/api/servers/:serverId', authenticateBot, (req, res) => {
   const server = servers.find(s => s.id === req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
   // Strip sensitive internal fields before returning
-  const { bans, ...safe } = server
+  const { bans: _bans, ...safe } = server
   res.json(safe)
 })
 

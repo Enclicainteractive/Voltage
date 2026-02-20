@@ -12,14 +12,29 @@
     "start": "node server.js",
     "migrate": "node scripts/migrate.js",
     "scale": "node scripts/scale.js",
-    "setup": "node scripts/scale.js setup"
+    "setup": "node scripts/scale.js setup",
+    "audit": "npm audit",
+    "audit:fix": "npm audit fix",
+    "retire": "retire --path . --exitlevel=critical",
+    "snyk:test": "snyk test",
+    "snyk:monitor": "snyk monitor",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "security": "npm audit --omit=dev && eslint ."
   },
-  "keywords": ["chat", "messaging", "federation", "decentralized", "voltage", "volt"],
+  "keywords": [
+    "chat",
+    "messaging",
+    "federation",
+    "decentralized",
+    "voltage",
+    "volt"
+  ],
   "author": "Volt Team",
   "license": "MIT",
   "dependencies": {
     "axios": "^1.6.7",
-    "bcrypt": "^5.1.1",
+    "bcrypt": "^6.0.0",
     "better-sqlite3": "^11.7.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.1",
@@ -29,5 +44,14 @@
     "node-cache": "^5.1.2",
     "socket.io": "^4.7.4",
     "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.0.1",
+    "eslint-plugin-node": "^0.0.0",
+    "eslint-plugin-security": "^4.0.0",
+    "globals": "^17.3.0",
+    "retire": "^5.4.2",
+    "snyk": "^1.1302.1"
   }
 }

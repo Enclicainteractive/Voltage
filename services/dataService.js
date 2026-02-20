@@ -782,6 +782,10 @@ export const inviteService = {
 export const serverService = {
   getServer(serverId) {
     const servers = loadData(FILES.servers, {})
+    // Handle both object format { serverId: serverData } and array format
+    if (Array.isArray(servers)) {
+      return servers.find(s => s.id === serverId) || null
+    }
     return servers[serverId] || null
   },
 

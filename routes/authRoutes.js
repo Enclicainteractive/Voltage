@@ -16,11 +16,6 @@ const generateUserId = () => {
   return `u_${crypto.randomBytes(16).toString('hex')}`
 }
 
-const generateUsername = (email) => {
-  const base = email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '')
-  return `${base}_${crypto.randomBytes(4).toString('hex')}`
-}
-
 const normalizeUsername = (username) => {
   const config_host = config.getHost()
   
@@ -335,7 +330,7 @@ router.get('/me', async (req, res) => {
       email: user.email,
       avatar: getAvatarUrl(user.id)
     })
-  } catch (error) {
+  } catch (_error) {
     res.status(500).json({ error: 'Failed to get user info' })
   }
 })

@@ -31,7 +31,7 @@ export const optionalAuth = async (req, res, next) => {
           host: host
         }
       }
-    } catch (error) {
+    } catch (_error) {
       // Ignore auth errors for optional auth
     }
   }

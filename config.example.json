@@ -3,8 +3,8 @@
     "name": "Volt",
     "version": "1.0.0",
     "mode": "mainline",
-    "url": "https://volt.chat",
-    "imageServerUrl": "https://api.enclicainteractive.com"
+    "url": "https://volt.voltagechat.app",
+    "imageServerUrl": "https://volt.voltagechat.app"
   },
   "branding": {
     "logo": null,

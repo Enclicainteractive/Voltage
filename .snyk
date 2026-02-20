@@ -1,0 +1,12 @@
+# Snyk (https://snyk.io) policy file
+# patch policy for fixing vulnerabilities
+patch:
+  'snyk:patch:npm:tar:20151103':
+    - node_modules > tar:
+        patched: '2019-07-03T12:20:30.000Z'
+  'snyk:patch:npm:minimatch:20160615':
+    - node_modules > glob > minimatch:
+        patched: '2019-07-03T12:20:32.000Z'
+  'snyk:patch:npm:ajv:20180927':
+    - node_modules > eslint > table > ajv:
+        patched: '2019-07-03T12:20:34.000Z'

@@ -22,7 +22,7 @@ router.get('/', authenticateToken, (req, res) => {
   const { search } = req.query
   let conversations = dmService.getConversations(req.user.id)
   
-  const enrichedConversations = conversations.map(conv => {
+  let enrichedConversations = conversations.map(conv => {
     const recipientProfile = userService.getUser(conv.recipientId)
     const online = isUserOnline(conv.recipientId)
     const status = online ? (recipientProfile?.status === 'invisible' ? 'invisible' : (recipientProfile?.status || 'online')) : 'offline'

@@ -90,6 +90,93 @@ app.use('/api/bots', botRoutes)
 app.use('/api/e2e-true', e2eTrueRoutes)
 app.use('/api/system', systemRoutes)
 
+// Category routes at /api/categories
+import fs from 'fs'
+const DATA_DIR = path.join(__dirname, 'data')
+const CATEGORIES_FILE = path.join(DATA_DIR, 'categories.json')
+
+const loadData = (file, defaultValue = []) => {
+  try {
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf8'))
+    }
+  } catch (err) {
+    console.error(`[Data] Error loading ${file}:`, err.message)
+  }
+  return defaultValue
+}
+
+const saveData = (file, data) => {
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2))
+  } catch (err) {
+    console.error(`[Data] Error saving ${file}:`, err.message)
+  }
+}
+
+const getAllCategories = () => loadData(CATEGORIES_FILE, {})
+const setAllCategories = (categories) => saveData(CATEGORIES_FILE, categories)
+
+app.put('/api/categories/:categoryId', (req, res) => {
+  const allCategories = getAllCategories()
+  let foundCategory = null
+  let serverId = null
+  
+  for (const [sid, categories] of Object.entries(allCategories)) {
+    const idx = categories.findIndex(c => c.id === req.params.categoryId)
+    if (idx !== -1) {
+      foundCategory = categories[idx]
+      serverId = sid
+      break
+    }
+  }
+  
+  if (!foundCategory) {
+    return res.status(404).json({ error: 'Category not found' })
+  }
+  
+  for (const categories of Object.values(allCategories)) {
+    const idx = categories.findIndex(c => c.id === req.params.categoryId)
+    if (idx !== -1) {
+      categories[idx] = { ...categories[idx], ...req.body, updatedAt: new Date().toISOString() }
+      setAllCategories(allCategories)
+      
+      io.to(`server:${serverId}`).emit('category:updated', categories[idx])
+      console.log(`[API] Updated category ${req.params.categoryId}`)
+      return res.json(categories[idx])
+    }
+  }
+})
+
+app.delete('/api/categories/:categoryId', (req, res) => {
+  if (req.params.categoryId === 'uncategorized') {
+    return res.status(400).json({ error: 'Cannot delete uncategorized pseudo-category' })
+  }
+  
+  const allCategories = getAllCategories()
+  let serverId = null
+  
+  for (const [sid, categories] of Object.entries(allCategories)) {
+    const idx = categories.findIndex(c => c.id === req.params.categoryId)
+    if (idx !== -1) {
+      serverId = sid
+      break
+    }
+  }
+  
+  if (!serverId) {
+    return res.status(404).json({ error: 'Category not found' })
+  }
+  
+  allCategories[serverId] = allCategories[serverId].filter(c => c.id !== req.params.categoryId)
+  setAllCategories(allCategories)
+  
+  io.to(`server:${serverId}`).emit('category:deleted', { categoryId: req.params.categoryId, serverId })
+  
+  console.log(`[API] Deleted category ${req.params.categoryId}`)
+  res.json({ success: true })
+})
+
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 

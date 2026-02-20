@@ -7,6 +7,25 @@ import { botService } from './botService.js'
 import { federationService } from './federationService.js'
 import * as crypto from './cryptoService.js'
 import config from '../config/config.js'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const DATA_DIR = path.join(__dirname, '..', '..', 'data')
+const SERVERS_FILE = path.join(DATA_DIR, 'servers.json')
+
+const loadData = (file, defaultValue = []) => {
+  try {
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf8'))
+    }
+  } catch (err) {
+    console.error(`[Data] Error loading ${file}:`, err.message)
+  }
+  return defaultValue
+}
 
 const onlineUsers = new Map()
 const userSockets = new Map()
@@ -46,6 +65,34 @@ const markVoiceHeartbeat = (userId, channelId) => {
 }
 
 // ---------------------------------------------------------------------------
+// Emoji format conversion for cross-server emoji usage
+// Converts :emojiName: to :host|serverId|emojiId|name: for global rendering
+// ---------------------------------------------------------------------------
+const convertEmojiFormat = (content, serverId) => {
+  if (!content || !serverId) return content
+  
+  // Load server emojis
+  const servers = loadData(SERVERS_FILE, [])
+  const server = servers.find(s => s.id === serverId)
+  if (!server?.emojis?.length) return content
+  
+  const serverHost = config.getServerHost()
+  
+  // Match :emojiName: patterns and convert to global format
+  // Format: :host|serverId|emojiId|emojiName:
+  const emojiPattern = /:([a-zA-Z0-9_]+):/g
+  
+  return content.replace(emojiPattern, (match, emojiName) => {
+    const emoji = server.emojis.find(e => e.name === emojiName)
+    if (emoji) {
+      // Return global format: :host|serverId|emojiId|name:
+      return `:${serverHost}|${serverId}|${emoji.id}|${emojiName}:`
+    }
+    return match // Return original if not found
+  })
+}
+
+// ---------------------------------------------------------------------------
 // ICE server configuration
 // Build the list of STUN/TURN servers to send to clients on voice:join.
 // Clients should use these for RTCPeerConnection iceServers.
@@ -55,13 +102,40 @@ const markVoiceHeartbeat = (userId, channelId) => {
 //   TURN_PASS  credential
 // ---------------------------------------------------------------------------
 const getIceServers = () => {
-  // Use openrelayproject TURN servers for relay when STUN fails
-  const servers = [
-    // STUN — direct P2P when peers are on open networks
+  // Priority order: self-hosted STUN/TURN first, then reliable public servers
+  // 1. volt.voltagechat.app:32768 - self-hosted (if available)
+  // 2. Google's STUN servers - reliable and fast
+  // 3. Open Relay Project - only reliable free TURN service
+  
+  const servers = []
+
+  // First: Self-hosted STUN/TURN server (volt.voltagechat.app)
+  // This is the primary server for this deployment
+  try {
+    servers.push({ urls: 'stun:volt.voltagechat.app:32768' })
+  } catch (e) {
+    // If self-hosted STUN fails, continue with public servers
+  }
+
+  // Google's STUN servers - most reliable public STUN
+  servers.push(
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    
-    // Open Relay Project (metered.ca) — free public TURN
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' }
+  )
+
+  // Additional reliable public STUN servers
+  servers.push(
+    { urls: 'stun:stun.ekiga.net' },
+    { urls: 'stun:stun.xten.com' },
+    { urls: 'stun:stun.schlund.de' }
+  )
+
+  // Open Relay Project - ONLY reliable free TURN service
+  // Supports TURNS + SSL for firewall traversal
+  servers.push(
     {
       urls: 'turn:openrelay.metered.ca:80',
       username: 'openrelayproject',
@@ -73,21 +147,24 @@ const getIceServers = () => {
       credential: 'openrelayproject'
     },
     {
-      urls: 'turns:openrelay.metered.ca:443',
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
       username: 'openrelayproject',
       credential: 'openrelayproject'
     },
-  ]
+    {
+      urls: 'turns:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  )
 
-  // Self-hosted TURN server overrides the public one.
+  // Self-hosted TURN server overrides the public ones.
   // Set TURN_URL, TURN_USER, TURN_PASS env vars or voice config keys.
   const turnUrl  = process.env.TURN_URL  || config.config?.voice?.turnUrl  || null
   const turnUser = process.env.TURN_USER || config.config?.voice?.turnUser || null
   const turnPass = process.env.TURN_PASS || config.config?.voice?.turnPass || null
 
   if (turnUrl && turnUser && turnPass) {
-    // Replace with self-hosted TURN
-    servers.length = 2 // Keep only STUN servers
     servers.push({ urls: turnUrl,  username: turnUser, credential: turnPass })
     const turnsUrl = turnUrl.replace(/^turn:/, 'turns:')
     if (turnsUrl !== turnUrl) {
@@ -95,6 +172,7 @@ const getIceServers = () => {
     }
   }
 
+  console.log(`[Voice/ICE] Configured ${servers.length} ICE servers (${servers.filter(s => s.urls.startsWith('turn')).length} TURN, ${servers.filter(s => s.urls.startsWith('stun')).length} STUN)`)
   return servers
 }
 
@@ -299,38 +377,39 @@ const isChannelAgeRestricted = (channelId) => {
 // Supports: @everyone, @here, @username, @username:host (federated)
 const parseMentions = (content) => {
   const mentions = { users: [], usernames: [], federated: [], everyone: false, here: false }
-  // Match @username or @username:host — colon separates username from host in federated format
-  const mentionRegex = /@([a-zA-Z0-9_\-\.]+)(?::([a-zA-Z0-9_\-\.]+))?/g
+  const mentionRegex = /@([a-zA-Z0-9_]+)/g
   let match
+  let count = 0
+  const maxMentions = 100
 
   while ((match = mentionRegex.exec(content)) !== null) {
+    if (++count > maxMentions) break
     const username = match[1]
-    const host = match[2] || null  // host part after colon, null for local mentions
     const nameLower = username.toLowerCase()
 
     if (nameLower === 'everyone') {
       mentions.everyone = true
     } else if (nameLower === 'here') {
       mentions.here = true
-    } else if (host) {
-      // Federated mention: @username:host
-      // Record for federation relay; try to find a local shadow user too
-      const federatedId = `@${username}:${host}`
-      if (!mentions.federated.includes(federatedId)) {
-        mentions.federated.push(federatedId)
-      }
-      // Also try to resolve locally (remote user may be cached)
-      const users = Object.values(userService.getAllUsers() || {})
-      const mentionedUser = users.find(u =>
-        u.username?.toLowerCase() === nameLower &&
-        (u.host === host || u.federatedHost === host)
-      )
-      if (mentionedUser) {
-        if (!mentions.users.includes(mentionedUser.id)) {
-          mentions.users.push(mentionedUser.id)
+    } else if (username.includes(':')) {
+      const [user, host] = username.split(':')
+      if (user && host) {
+        const federatedId = `@${user}:${host}`
+        if (!mentions.federated.includes(federatedId)) {
+          mentions.federated.push(federatedId)
         }
-        if (!mentions.usernames.includes(mentionedUser.username || username)) {
-          mentions.usernames.push(mentionedUser.username || username)
+        const users = Object.values(userService.getAllUsers() || {})
+        const mentionedUser = users.find(u =>
+          u.username?.toLowerCase() === user.toLowerCase() &&
+          (u.host === host || u.federatedHost === host)
+        )
+        if (mentionedUser) {
+          if (!mentions.users.includes(mentionedUser.id)) {
+            mentions.users.push(mentionedUser.id)
+          }
+          if (!mentions.usernames.includes(mentionedUser.username || username)) {
+            mentions.usernames.push(mentionedUser.username || username)
+          }
         }
       }
     } else {
@@ -858,10 +937,16 @@ export const setupSocketHandlers = (io) => {
         mentions: mentions,
         timestamp: new Date().toISOString(),
         attachments: data.attachments || [],
-        storage: storageInfo,
+        storage:         storageInfo,
         encrypted: data.encrypted || false,
         iv: data.iv || null,
         epoch: data.epoch || null
+      }
+
+      // Convert local emoji references to global format for cross-server compatibility
+      const channelServerId = channel?.serverId
+      if (channelServerId) {
+        message.content = convertEmojiFormat(data.content, channelServerId)
       }
 
       addMessage(data.channelId, message)
@@ -869,9 +954,6 @@ export const setupSocketHandlers = (io) => {
 
       // Send notifications for mentions
       sendMentionNotifications(io, socket, data.channelId, message, mentions)
-
-      // Get the actual server for this channel from the existing channel variable
-      const channelServerId = channel?.serverId
 
       // Only deliver message to bots that are in THIS specific server
       if (channelServerId) {
@@ -1043,11 +1125,40 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('voice:screen-share', (data) => {
       const { channelId, enabled } = data
+      // Update the user's state in the channel
+      const users = voiceChannelUsers.get(channelId)
+      if (users) {
+        const user = users.find(u => u.id === userId)
+        if (user) {
+          user.isScreenSharing = enabled
+        }
+      }
+      // Broadcast to everyone in the voice channel
       io.to(`voice:${channelId}`).emit('voice:screen-share-update', {
         userId,
         username: socket.user.username,
         enabled
       })
+      console.log(`[Voice] User ${userId} ${enabled ? 'started' : 'stopped'} screen sharing in ${channelId}`)
+    })
+
+    socket.on('voice:video', (data) => {
+      const { channelId, enabled } = data
+      // Update the user's state in the channel
+      const users = voiceChannelUsers.get(channelId)
+      if (users) {
+        const user = users.find(u => u.id === userId)
+        if (user) {
+          user.hasVideo = enabled
+        }
+      }
+      // Broadcast to everyone in the voice channel
+      io.to(`voice:${channelId}`).emit('voice:video-update', {
+        userId,
+        username: socket.user.username,
+        enabled
+      })
+      console.log(`[Voice] User ${userId} ${enabled ? 'enabled' : 'disabled'} video in ${channelId}`)
     })
 
     socket.on('voice:mute', (data) => {

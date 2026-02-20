@@ -398,6 +398,10 @@ class Config {
     }
   }
 
+  getServerHost() {
+    return this.getHost()
+  }
+
   getStorageConfig() {
     return this.config.storage
   }

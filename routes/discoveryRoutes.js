@@ -60,18 +60,16 @@ router.get('/admin/pending', authenticateToken, (req, res) => {
 // Get detailed server info for discovery profile
 router.get('/server/:serverId', async (req, res) => {
   const { serverService } = await import('../services/dataService.js')
-  const discoveryEntry = discoveryService.getDiscoveryEntry(req.params.serverId)
   
-  if (!discoveryEntry) {
-    return res.status(404).json({ error: 'Server not found in discovery' })
-  }
-  
-  // Get full server data
-  const server = serverService.getServerById(req.params.serverId)
+  // Get full server data first
+  const server = serverService.getServer(req.params.serverId)
   
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
   }
+  
+  // Get discovery entry (may not exist if server not in discovery)
+  const discoveryEntry = discoveryService.getDiscoveryEntry(req.params.serverId)
   
   // Return public info only
   const publicInfo = {
