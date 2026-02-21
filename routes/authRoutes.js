@@ -336,10 +336,21 @@ router.get('/me', async (req, res) => {
 })
 
 router.get('/config', (req, res) => {
+  const localAuthEnabled = config.isLocalAuthEnabled()
+  const allowRegistration = config.isRegistrationAllowed()
+  const oauthEnabled = config.isOAuthEnabled()
+  const authType = config.config.auth?.type || 'all'
+  const oauthProvider = config.config.auth?.oauth?.provider || null
+  const minPasswordLength = config.config.auth?.local?.minPasswordLength || 8
+
   res.json({
-    allowRegistration: config.isRegistrationAllowed(),
-    localAuthEnabled: config.isLocalAuthEnabled(),
-    oauthEnabled: config.isOAuthEnabled(),
+    allowRegistration,
+    canRegister: localAuthEnabled && allowRegistration,
+    localAuthEnabled,
+    oauthEnabled,
+    authType,
+    oauthProvider,
+    minPasswordLength,
     serverName: config.config.server.name,
     serverMode: config.config.server.mode
   })

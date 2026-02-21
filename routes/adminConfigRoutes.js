@@ -2,12 +2,43 @@ import express from 'express'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { authenticateToken, requireOwner } from '../middleware/authMiddleware.js'
 import config from '../config/config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const execFileAsync = promisify(execFile)
+const SERVER_ROOT = path.join(__dirname, '..')
+const LOGS_DIR = path.join(SERVER_ROOT, 'logs')
+const DATA_DIR = path.join(SERVER_ROOT, 'data')
+const DRIVER_PACKAGE_BY_STORAGE = {
+  sqlite: 'better-sqlite3',
+  mysql: 'mysql2',
+  mariadb: 'mariadb',
+  postgres: 'pg',
+  cockroachdb: 'pg',
+  mssql: 'mssql',
+  mongodb: 'mongodb',
+  redis: 'redis'
+}
+const INSTALL_ALLOWLIST = new Set(Object.values(DRIVER_PACKAGE_BY_STORAGE))
 
 const router = express.Router()
+
+const tailLines = (content, lines = 200) => {
+  const chunks = String(content || '').split(/\r?\n/)
+  return chunks.slice(Math.max(0, chunks.length - lines)).join('\n')
+}
+
+const checkPackageInstalled = async (packageName) => {
+  try {
+    await import(packageName)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // Get full config (with sensitive data filtered)
 router.get('/', authenticateToken, requireOwner, (req, res) => {
@@ -403,6 +434,166 @@ router.post('/validate', authenticateToken, requireOwner, (req, res) => {
     errors,
     warnings
   })
+})
+
+router.get('/issues', authenticateToken, requireOwner, async (req, res) => {
+  try {
+    const warnings = []
+    const errors = []
+    const info = []
+    const deps = {}
+    const cfg = config.config
+    const storageType = cfg?.storage?.type
+
+    if (!cfg?.security?.jwtSecret || cfg.security.jwtSecret === 'CHANGE_ME' || cfg.security.jwtSecret === 'volt_super_secret_key_change_in_production') {
+      warnings.push('JWT secret is using a default or missing value.')
+    }
+    if (!cfg?.server?.url) {
+      errors.push('server.url is missing.')
+    }
+    if (!cfg?.storage?.type) {
+      errors.push('storage.type is missing.')
+    }
+    if (!fs.existsSync(config.configFilePath)) {
+      errors.push('Config file is missing on disk.')
+    }
+    if (!fs.existsSync(DATA_DIR)) {
+      warnings.push('Data directory is missing.')
+    }
+
+    for (const [driverStorage, pkg] of Object.entries(DRIVER_PACKAGE_BY_STORAGE)) {
+      const installed = await checkPackageInstalled(pkg)
+      deps[driverStorage] = { package: pkg, installed }
+      if (storageType === driverStorage && !installed) {
+        errors.push(`Configured storage "${driverStorage}" requires package "${pkg}" which is not installed.`)
+      }
+    }
+
+    info.push(`Node ${process.version} on ${process.platform}/${process.arch}`)
+    info.push(`Uptime: ${Math.floor(process.uptime())}s`)
+
+    res.json({
+      success: true,
+      issues: { errors, warnings, info },
+      dependencies: deps
+    })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+router.get('/logs', authenticateToken, requireOwner, async (req, res) => {
+  try {
+    const lines = Number.parseInt(req.query.lines, 10) || 200
+    const maxFiles = Number.parseInt(req.query.maxFiles, 10) || 6
+    const files = []
+
+    if (fs.existsSync(LOGS_DIR)) {
+      const entries = fs.readdirSync(LOGS_DIR)
+        .map((name) => {
+          const fullPath = path.join(LOGS_DIR, name)
+          const stat = fs.statSync(fullPath)
+          return { name, fullPath, stat }
+        })
+        .filter((entry) => entry.stat.isFile())
+        .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
+        .slice(0, maxFiles)
+
+      for (const entry of entries) {
+        const content = fs.readFileSync(entry.fullPath, 'utf8')
+        files.push({
+          file: entry.name,
+          updatedAt: entry.stat.mtime.toISOString(),
+          content: tailLines(content, lines)
+        })
+      }
+    }
+
+    let adminLogs = {}
+    const adminLogPath = path.join(DATA_DIR, 'admin-logs.json')
+    if (fs.existsSync(adminLogPath)) {
+      try {
+        adminLogs = JSON.parse(fs.readFileSync(adminLogPath, 'utf8'))
+      } catch {
+        adminLogs = {}
+      }
+    }
+
+    const recentAdminActions = Object.values(adminLogs)
+      .sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
+      .slice(0, lines)
+
+    res.json({
+      success: true,
+      logs: files,
+      recentAdminActions,
+      runtime: {
+        pid: process.pid,
+        nodeVersion: process.version,
+        uptime: process.uptime(),
+        memory: process.memoryUsage()
+      }
+    })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+router.post('/install-driver', authenticateToken, requireOwner, async (req, res) => {
+  try {
+    const storageType = req.body?.storageType
+    const requestedPackage = req.body?.packageName
+    const packageName = requestedPackage || DRIVER_PACKAGE_BY_STORAGE[storageType]
+
+    if (!packageName || !INSTALL_ALLOWLIST.has(packageName)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported package requested for installation.'
+      })
+    }
+
+    const alreadyInstalled = await checkPackageInstalled(packageName)
+    if (alreadyInstalled) {
+      return res.json({
+        success: true,
+        packageName,
+        installed: true,
+        alreadyInstalled: true,
+        output: `${packageName} is already installed`
+      })
+    }
+
+    const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const { stdout, stderr } = await execFileAsync(
+      npmCommand,
+      ['install', packageName, '--no-audit', '--no-fund', '--save'],
+      { cwd: SERVER_ROOT, maxBuffer: 1024 * 1024 * 8 }
+    )
+
+    res.json({
+      success: true,
+      packageName,
+      installed: true,
+      output: stdout || '',
+      errorOutput: stderr || ''
+    })
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+router.post('/restart', authenticateToken, requireOwner, (req, res) => {
+  res.json({
+    success: true,
+    message: 'Restart signal accepted. Process exiting now.'
+  })
+
+  setTimeout(() => {
+    process.exit(0)
+  }, 250)
 })
 
 export default router

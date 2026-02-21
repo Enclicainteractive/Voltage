@@ -40,11 +40,43 @@ let useStorage = false
 let storageCache = {}
 let cacheDirty = {}
 
-const initStorage = async () => {
+const FILE_TO_TABLE = {
+  [FILES.users]: 'users',
+  [FILES.friends]: 'friends',
+  [FILES.friendRequests]: 'friend_requests',
+  [FILES.servers]: 'servers',
+  [FILES.channels]: 'channels',
+  [FILES.messages]: 'messages',
+  [FILES.serverInvites]: 'invites',
+  [FILES.dms]: 'dms',
+  [FILES.dmMessages]: 'dm_messages',
+  [FILES.reactions]: 'reactions',
+  [FILES.blocked]: 'blocked',
+  [FILES.files]: 'files',
+  [FILES.attachments]: 'attachments',
+  [FILES.discovery]: 'discovery',
+  [FILES.globalBans]: 'global_bans',
+  [FILES.serverBans]: 'server_bans',
+  [FILES.adminLogs]: 'admin_logs',
+  [FILES.systemMessages]: 'system_messages',
+  [FILES.e2eTrue]: 'e2e_true',
+  [FILES.pinnedMessages]: 'pinned_messages',
+  [FILES.selfVolts]: 'self_volts',
+  [FILES.serverStart]: 'server_start',
+  [FILES.callLogs]: 'call_logs'
+}
+
+const STORAGE_TABLES = Object.values(FILE_TO_TABLE)
+
+const initStorage = async ({ forceReinit = false } = {}) => {
   try {
     const storageModule = await import('./storageService.js')
+    if (forceReinit && storageModule.resetStorage) {
+      await storageModule.resetStorage()
+    }
     storageService = storageModule.initStorage()
     useStorage = storageService && storageService.type !== 'json'
+    storageCache = {}
     
     if (useStorage) {
       console.log('[DataService] Using storage layer:', storageService.type)
@@ -61,14 +93,7 @@ const initStorage = async () => {
 const loadAllData = async () => {
   if (!useStorage || !storageService) return
   
-  const tables = [
-    'users', 'friends', 'friend_requests', 'servers', 'channels',
-    'messages', 'server_members', 'invites', 'dms', 'dm_messages',
-    'reactions', 'blocked', 'files', 'attachments', 'discovery',
-    'global_bans', 'admin_logs'
-  ]
-  
-  for (const table of tables) {
+  for (const table of STORAGE_TABLES) {
     try {
       if (storageService.load) {
         if (storageService.type === 'mongodb' || storageService.type === 'redis' || 
@@ -104,7 +129,8 @@ const saveToStorage = async (table, data) => {
 
 const loadData = (file, defaultValue = {}) => {
   if (useStorage) {
-    return storageCache[file] || defaultValue
+    const table = getTableName(file)
+    return storageCache[table] || defaultValue
   }
   
   try {
@@ -119,9 +145,9 @@ const loadData = (file, defaultValue = {}) => {
 
 const saveData = (file, data) => {
   if (useStorage) {
-    storageCache[file] = data
-    saveToStorage(file, data)
-    return true
+    const table = getTableName(file)
+    storageCache[table] = data
+    return saveToStorage(table, data)
   }
   
   try {
@@ -134,26 +160,7 @@ const saveData = (file, data) => {
 }
 
 const getTableName = (file) => {
-  const fileMap = {
-    [FILES.users]: 'users',
-    [FILES.friends]: 'friends',
-    [FILES.friendRequests]: 'friend_requests',
-    [FILES.servers]: 'servers',
-    [FILES.channels]: 'channels',
-    [FILES.messages]: 'messages',
-    [FILES.serverInvites]: 'invites',
-    [FILES.dms]: 'dms',
-    [FILES.dmMessages]: 'dm_messages',
-    [FILES.reactions]: 'reactions',
-    [FILES.blocked]: 'blocked',
-    [FILES.files]: 'files',
-    [FILES.attachments]: 'attachments',
-    [FILES.discovery]: 'discovery',
-    [FILES.globalBans]: 'global_bans',
-    [FILES.serverBans]: 'server_bans',
-    [FILES.adminLogs]: 'admin_logs'
-  }
-  return fileMap[file] || file
+  return FILE_TO_TABLE[file] || file
 }
 
 export const migrateData = async (sourceType, targetConfig) => {
@@ -208,32 +215,13 @@ export const reloadData = async () => {
   }
 }
 
+export const reinitializeStorage = async () => {
+  await initStorage({ forceReinit: true })
+}
+
 export const exportAllData = () => {
   const data = {}
-  const fileToTable = {
-    [FILES.users]: 'users',
-    [FILES.friends]: 'friends',
-    [FILES.friendRequests]: 'friend_requests',
-    [FILES.servers]: 'servers',
-    [FILES.channels]: 'channels',
-    [FILES.messages]: 'messages',
-    [FILES.serverInvites]: 'invites',
-    [FILES.dms]: 'dms',
-    [FILES.dmMessages]: 'dm_messages',
-    [FILES.reactions]: 'reactions',
-    [FILES.blocked]: 'blocked',
-    [FILES.files]: 'files',
-    [FILES.attachments]: 'attachments',
-    [FILES.discovery]: 'discovery',
-    [FILES.globalBans]: 'global_bans',
-    [FILES.serverBans]: 'server_bans',
-    [FILES.adminLogs]: 'admin_logs',
-    [FILES.systemMessages]: 'system_messages',
-    [FILES.e2eTrue]: 'e2e_true',
-    [FILES.pinnedMessages]: 'pinned_messages',
-    [FILES.selfVolts]: 'self_volts',
-    [FILES.serverStart]: 'server_start'
-  }
+  const fileToTable = FILE_TO_TABLE
   
   for (const [file, table] of Object.entries(fileToTable)) {
     try {
@@ -247,7 +235,7 @@ export const exportAllData = () => {
   return data
 }
 
-export const importAllData = (data) => {
+export const importAllData = async (data) => {
   const results = { success: true, tables: {}, errors: [] }
   const tableToFile = {
     users: FILES.users,
@@ -271,13 +259,14 @@ export const importAllData = (data) => {
     e2e_true: FILES.e2eTrue,
     pinned_messages: FILES.pinnedMessages,
     self_volts: FILES.selfVolts,
-    server_start: FILES.serverStart
+    server_start: FILES.serverStart,
+    call_logs: FILES.callLogs
   }
   
   for (const [table, file] of Object.entries(tableToFile)) {
     try {
       if (data[table]) {
-        saveData(file, data[table])
+        await saveData(file, data[table])
         results.tables[table] = Object.keys(data[table]).length
       } else {
         results.tables[table] = 0
@@ -565,6 +554,41 @@ export const dmService = {
     return dms[userId] || []
   },
 
+  getConversationForUser(userId, conversationId) {
+    const dms = loadData(FILES.dms, {})
+    return (dms[userId] || []).find(c => c.id === conversationId) || null
+  },
+
+  createGroupConversation(ownerId, participantIds = [], groupName = '') {
+    const dms = loadData(FILES.dms, {})
+    const uniqueParticipants = Array.from(new Set([ownerId, ...(participantIds || [])].filter(Boolean)))
+    if (uniqueParticipants.length < 3) {
+      throw new Error('Group DM requires at least 3 participants')
+    }
+
+    const conversationId = `dm_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    const now = new Date().toISOString()
+    const participantKey = uniqueParticipants.slice().sort().join(':')
+    const baseConversation = {
+      id: conversationId,
+      participantKey,
+      participants: uniqueParticipants,
+      isGroup: true,
+      groupName: String(groupName || '').trim() || null,
+      ownerId,
+      createdAt: now,
+      lastMessageAt: now
+    }
+
+    for (const uid of uniqueParticipants) {
+      if (!dms[uid]) dms[uid] = []
+      dms[uid].push({ ...baseConversation })
+    }
+
+    saveData(FILES.dms, dms)
+    return baseConversation
+  },
+
   getOrCreateConversation(userId1, userId2) {
     const dms = loadData(FILES.dms, {})
     
@@ -605,16 +629,28 @@ export const dmService = {
   updateLastMessage(conversationId, userId1, userId2) {
     const dms = loadData(FILES.dms, {})
     const now = new Date().toISOString()
-    
-    if (dms[userId1]) {
-      const conv = dms[userId1].find(c => c.id === conversationId)
+
+    const touchedUsers = new Set()
+    if (userId1) touchedUsers.add(userId1)
+    if (userId2) touchedUsers.add(userId2)
+
+    // For group DMs (or when user ids are missing), update every member copy.
+    if (touchedUsers.size === 0) {
+      Object.keys(dms).forEach(uid => touchedUsers.add(uid))
+    }
+
+    for (const uid of touchedUsers) {
+      if (!dms[uid]) continue
+      const conv = dms[uid].find(c => c.id === conversationId)
       if (conv) conv.lastMessageAt = now
     }
-    if (dms[userId2]) {
-      const conv = dms[userId2].find(c => c.id === conversationId)
+
+    // Final safety pass for any remaining participant copies.
+    Object.keys(dms).forEach(uid => {
+      const conv = dms[uid]?.find(c => c.id === conversationId)
       if (conv) conv.lastMessageAt = now
-    }
-    
+    })
+
     saveData(FILES.dms, dms)
   },
   
@@ -1635,6 +1671,7 @@ export default {
   migrateData,
   getStorageInfo,
   reloadData,
+  reinitializeStorage,
   exportAllData,
   importAllData,
   userService,

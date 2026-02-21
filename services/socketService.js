@@ -102,47 +102,12 @@ const convertEmojiFormat = (content, serverId) => {
 //   TURN_PASS  credential
 // ---------------------------------------------------------------------------
 const getIceServers = () => {
-  // Priority order: self-hosted STUN/TURN first, then reliable public servers
-  // 1. volt.voltagechat.app:32768 - self-hosted (if available)
-  // 2. Google's STUN servers - reliable and fast
-  // 3. Open Relay Project - only reliable free TURN service
-  
-  const servers = []
-
-  // First: Self-hosted STUN/TURN server (volt.voltagechat.app)
-  // This is the primary server for this deployment
-  try {
-    servers.push({ urls: 'stun:volt.voltagechat.app:32768' })
-  } catch (e) {
-    // If self-hosted STUN fails, continue with public servers
-  }
-
-  // Google's STUN servers - most reliable public STUN
-  servers.push(
+  // Keep ICE list intentionally small to improve discovery speed/reliability.
+  const servers = [
+    { urls: 'stun:volt.voltagechat.app:32768' },
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' }
-  )
-
-  // Additional reliable public STUN servers
-  servers.push(
-    { urls: 'stun:stun.ekiga.net' },
-    { urls: 'stun:stun.xten.com' },
-    { urls: 'stun:stun.schlund.de' }
-  )
-
-  // Open Relay Project - ONLY reliable free TURN service
-  // Supports TURNS + SSL for firewall traversal
-  servers.push(
     {
       urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
       username: 'openrelayproject',
       credential: 'openrelayproject'
     },
@@ -156,7 +121,7 @@ const getIceServers = () => {
       username: 'openrelayproject',
       credential: 'openrelayproject'
     }
-  )
+  ]
 
   // Self-hosted TURN server overrides the public ones.
   // Set TURN_URL, TURN_USER, TURN_PASS env vars or voice config keys.
@@ -210,6 +175,44 @@ const cleanupVoiceUser = (io, channelId, userId, reason = 'leave') => {
   io.to(`voice:${channelId}`).emit('voice:user-left', { userId, channelId })
   console.log(`[Voice] Cleaned user ${userId} from channel ${channelId} (${reason})`)
   return true
+}
+
+const handleVoiceMediaStateUpdate = (
+  io,
+  {
+    actorId,
+    actorUsername,
+    channelId,
+    enabled,
+    stateField,
+    updateEvent,
+    actionEnabledLabel,
+    actionDisabledLabel,
+    isBot = false
+  } = {}
+) => {
+  if (!actorId || !channelId || typeof enabled !== 'boolean') return
+
+  const users = voiceChannelUsers.get(channelId)
+  if (users) {
+    const user = users.find(u => u.id === actorId)
+    if (user) {
+      if (stateField === 'hasVideo') {
+        user.hasVideo = enabled
+      } else if (stateField === 'isScreenSharing') {
+        user.isScreenSharing = enabled
+      }
+    }
+  }
+
+  io.to(`voice:${channelId}`).emit(updateEvent, {
+    userId: actorId,
+    username: actorUsername,
+    enabled,
+    bot: isBot
+  })
+
+  console.log(`[Voice] ${isBot ? 'Bot' : 'User'} ${actorId} ${enabled ? actionEnabledLabel : actionDisabledLabel} in ${channelId}`)
 }
 
 const startHeartbeatMonitor = (io) => {
@@ -655,12 +658,19 @@ export const setupSocketHandlers = (io) => {
           channelId,
           bot: true,
           muted: false,
-          deafened: false
+          deafened: false,
+          hasVideo: false,
+          isScreenSharing: false
         }
 
         const channelUsers = voiceChannelUsers.get(channelId)
         const existingIndex = channelUsers.findIndex(u => u.id === botUserId)
         if (existingIndex >= 0) {
+          const existing = channelUsers[existingIndex]
+          botInfo.muted = existing.muted || false
+          botInfo.deafened = existing.deafened || false
+          botInfo.hasVideo = existing.hasVideo || false
+          botInfo.isScreenSharing = existing.isScreenSharing || false
           channelUsers[existingIndex] = botInfo
           console.log(`[Voice] Updated existing bot ${botUserId} in channel`)
         } else {
@@ -755,6 +765,36 @@ export const setupSocketHandlers = (io) => {
         if (targetSocket) {
           io.to(targetSocket).emit('voice:ice-candidate', { from: botUserId, candidate, channelId })
         }
+      })
+
+      socket.on('voice:video', (data) => {
+        const { channelId, enabled } = data || {}
+        handleVoiceMediaStateUpdate(io, {
+          actorId: botUserId,
+          actorUsername: bot.name,
+          channelId,
+          enabled,
+          stateField: 'hasVideo',
+          updateEvent: 'voice:video-update',
+          actionEnabledLabel: 'enabled video',
+          actionDisabledLabel: 'disabled video',
+          isBot: true
+        })
+      })
+
+      socket.on('voice:screen-share', (data) => {
+        const { channelId, enabled } = data || {}
+        handleVoiceMediaStateUpdate(io, {
+          actorId: botUserId,
+          actorUsername: bot.name,
+          channelId,
+          enabled,
+          stateField: 'isScreenSharing',
+          updateEvent: 'voice:screen-share-update',
+          actionEnabledLabel: 'started screen sharing',
+          actionDisabledLabel: 'stopped screen sharing',
+          isBot: true
+        })
       })
 
       // Wire can emit this to update status + customStatus instantly via the
@@ -1016,9 +1056,11 @@ export const setupSocketHandlers = (io) => {
         username: socket.user.username || socket.user.email,
         avatar: socket.user.avatar,
         peerId,
-        channelId,   // include channelId so clients know which channel this join is for
+        channelId,
         muted: false,
-        deafened: false
+        deafened: false,
+        hasVideo: false,
+        isScreenSharing: false
       }
       
       const channelUsers = voiceChannelUsers.get(channelId)
@@ -1030,6 +1072,8 @@ export const setupSocketHandlers = (io) => {
         const existingUser = channelUsers[existingIndex]
         userInfo.muted = existingUser.muted || false
         userInfo.deafened = existingUser.deafened || false
+        userInfo.hasVideo = existingUser.hasVideo || false
+        userInfo.isScreenSharing = existingUser.isScreenSharing || false
         channelUsers[existingIndex] = userInfo
         console.log(`[Voice] User ${userId} reconnected to channel ${channelId}`)
         
@@ -1124,41 +1168,33 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('voice:screen-share', (data) => {
-      const { channelId, enabled } = data
-      // Update the user's state in the channel
-      const users = voiceChannelUsers.get(channelId)
-      if (users) {
-        const user = users.find(u => u.id === userId)
-        if (user) {
-          user.isScreenSharing = enabled
-        }
-      }
-      // Broadcast to everyone in the voice channel
-      io.to(`voice:${channelId}`).emit('voice:screen-share-update', {
-        userId,
-        username: socket.user.username,
-        enabled
+      const { channelId, enabled } = data || {}
+      handleVoiceMediaStateUpdate(io, {
+        actorId: userId,
+        actorUsername: socket.user.username,
+        channelId,
+        enabled,
+        stateField: 'isScreenSharing',
+        updateEvent: 'voice:screen-share-update',
+        actionEnabledLabel: 'started screen sharing',
+        actionDisabledLabel: 'stopped screen sharing',
+        isBot: false
       })
-      console.log(`[Voice] User ${userId} ${enabled ? 'started' : 'stopped'} screen sharing in ${channelId}`)
     })
 
     socket.on('voice:video', (data) => {
-      const { channelId, enabled } = data
-      // Update the user's state in the channel
-      const users = voiceChannelUsers.get(channelId)
-      if (users) {
-        const user = users.find(u => u.id === userId)
-        if (user) {
-          user.hasVideo = enabled
-        }
-      }
-      // Broadcast to everyone in the voice channel
-      io.to(`voice:${channelId}`).emit('voice:video-update', {
-        userId,
-        username: socket.user.username,
-        enabled
+      const { channelId, enabled } = data || {}
+      handleVoiceMediaStateUpdate(io, {
+        actorId: userId,
+        actorUsername: socket.user.username,
+        channelId,
+        enabled,
+        stateField: 'hasVideo',
+        updateEvent: 'voice:video-update',
+        actionEnabledLabel: 'enabled video',
+        actionDisabledLabel: 'disabled video',
+        isBot: false
       })
-      console.log(`[Voice] User ${userId} ${enabled ? 'enabled' : 'disabled'} video in ${channelId}`)
     })
 
     socket.on('voice:mute', (data) => {
@@ -1274,7 +1310,9 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('dm:send', (data) => {
       const { conversationId, content, recipientId } = data
-      
+      const conversation = dmService.getConversationForUser(userId, conversationId)
+      if (!conversation) return
+
       const cdnConfig = config.getCdnConfig()
       const storageInfo = {
         cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
@@ -1301,10 +1339,12 @@ export const setupSocketHandlers = (io) => {
       dmService.updateLastMessage(conversationId, userId, recipientId)
       
       io.to(`dm:${conversationId}`).emit('dm:new', message)
-      
-      const recipientSocket = userSockets.get(recipientId)
-      if (recipientSocket) {
-        io.to(recipientSocket).emit('dm:notification', {
+
+      const participantIds = Array.isArray(conversation.participants)
+        ? conversation.participants.filter(id => id !== userId)
+        : (recipientId ? [recipientId] : [])
+      participantIds.forEach(targetId => {
+        emitToAllUserDevices(io, targetId, 'dm:notification', {
           conversationId,
           message,
           from: {
@@ -1313,7 +1353,7 @@ export const setupSocketHandlers = (io) => {
             avatar: socket.user.avatar
           }
         })
-      }
+      })
     })
 
     socket.on('dm:typing', (data) => {
@@ -1345,6 +1385,14 @@ export const setupSocketHandlers = (io) => {
       io.to(`user:${userId}`).emit(event, data)
     }
 
+    const getCallParticipants = (call) => {
+      if (!call) return []
+      const recipients = Array.isArray(call.recipientIds)
+        ? call.recipientIds
+        : (call.recipientId ? [call.recipientId] : [])
+      return Array.from(new Set([call.callerId, ...recipients].filter(Boolean)))
+    }
+
     // Helper: clean up pending call
     const cleanupPendingCall = (recipientId, callId) => {
       const pending = pendingIncomingCalls.get(recipientId)
@@ -1363,6 +1411,11 @@ export const setupSocketHandlers = (io) => {
       const now = new Date().toISOString()
       const duration = Math.floor((Date.now() - new Date(call.startTime).getTime()) / 1000)
 
+      const recipients = Array.isArray(call.recipientIds) && call.recipientIds.length > 0
+        ? call.recipientIds
+        : [call.recipientId].filter(Boolean)
+      const primaryRecipientId = recipients[0] || null
+
       // Determine call status
       const callStatus = reason === 'declined' ? 'declined' : reason === 'missed' ? 'missed' : reason === 'cancelled' ? 'cancelled' : 'ended'
 
@@ -1371,7 +1424,7 @@ export const setupSocketHandlers = (io) => {
         callId,
         conversationId: call.conversationId,
         callerId: call.callerId,
-        recipientId: call.recipientId,
+        recipientId: primaryRecipientId,
         type: call.type,
         status: callStatus,
         duration,
@@ -1381,7 +1434,7 @@ export const setupSocketHandlers = (io) => {
 
       // Create a call message in the DM conversation
       const callerInfo = userService.getUser(call.callerId)
-      const recipientInfo = userService.getUser(call.recipientId)
+      const recipientInfo = userService.getUser(primaryRecipientId)
       
       // Build call message content based on status
       let callMessageContent = ''
@@ -1422,14 +1475,14 @@ export const setupSocketHandlers = (io) => {
           status: callStatus,
           duration,
           callerId: call.callerId,
-          recipientId: call.recipientId,
+          recipientId: primaryRecipientId,
           endedBy
         }
       }
 
       // Save call message to DM messages
       dmMessageService.addMessage(call.conversationId, callMessage)
-      dmService.updateLastMessage(call.conversationId, call.callerId, call.recipientId)
+      dmService.updateLastMessage(call.conversationId, call.callerId, primaryRecipientId)
 
       // Broadcast call message to DM room
       io.to(`dm:${call.conversationId}`).emit('dm:new', callMessage)
@@ -1441,37 +1494,87 @@ export const setupSocketHandlers = (io) => {
         reason,
         duration
       })
-      emitToAllUserDevices(io, call.recipientId, 'call:ended', {
+      recipients.forEach(recipientId => emitToAllUserDevices(io, recipientId, 'call:ended', {
         callId,
         endedBy,
         reason,
         duration
-      })
+      }))
 
       activeDMCalls.delete(callId)
       return call
     }
 
+    // Helper: a single participant leaves an active group call without ending it for everyone.
+    const leaveParticipantFromActiveCall = (io, callId, leavingUserId) => {
+      const call = activeDMCalls.get(callId)
+      if (!call) return false
+
+      const participants = getCallParticipants(call)
+      if (!participants.includes(leavingUserId)) return false
+      if (participants.length <= 2) return false
+
+      const remaining = participants.filter(id => id !== leavingUserId)
+      if (remaining.length < 2) return false
+
+      // Preserve an active caller; if original caller leaves, promote first remaining user.
+      const nextCallerId = remaining.includes(call.callerId) ? call.callerId : remaining[0]
+      const nextRecipientIds = remaining.filter(id => id !== nextCallerId)
+
+      call.callerId = nextCallerId
+      call.recipientId = nextRecipientIds[0] || null
+      call.recipientIds = nextRecipientIds
+      call.status = 'active'
+
+      cleanupPendingCall(leavingUserId, callId)
+
+      emitToAllUserDevices(io, leavingUserId, 'call:ended', {
+        callId,
+        endedBy: leavingUserId,
+        reason: 'left',
+        duration: Math.floor((Date.now() - new Date(call.startTime).getTime()) / 1000)
+      })
+
+      remaining.forEach(uid => {
+        emitToAllUserDevices(io, uid, 'call:participant-left', {
+          callId,
+          userId: leavingUserId,
+          participantIds: remaining
+        })
+      })
+
+      return true
+    }
+
     // Initiate a call
     socket.on('call:initiate', (data) => {
-      const { recipientId, conversationId, type = 'audio' } = data
+      const { recipientId, participantIds, conversationId, type = 'audio' } = data
+      const recipients = Array.from(new Set([
+        ...(Array.isArray(participantIds) ? participantIds : []),
+        ...(recipientId ? [recipientId] : [])
+      ].filter(id => id && id !== userId)))
+      if (recipients.length === 0) {
+        socket.emit('call:error', { error: 'No recipients provided', code: 'NO_RECIPIENTS' })
+        return
+      }
 
       // Check if blocked
-      if (blockService.isBlocked(userId, recipientId)) {
+      if (recipients.some(id => blockService.isBlocked(userId, id))) {
         socket.emit('call:error', { error: 'Cannot call blocked user' })
         return
       }
 
-      // Check if recipient is online
-      if (!isUserOnline(recipientId)) {
+      // Check if all recipients are online
+      const offlineRecipients = recipients.filter(id => !isUserOnline(id))
+      if (offlineRecipients.length > 0) {
         socket.emit('call:error', { error: 'User is offline', code: 'USER_OFFLINE' })
         return
       }
 
       // Check if there's already an active call between these users
       for (const [callId, call] of activeDMCalls.entries()) {
-        if ((call.callerId === userId && call.recipientId === recipientId) ||
-            (call.callerId === recipientId && call.recipientId === userId)) {
+        const participants = getCallParticipants(call)
+        if (participants.includes(userId) && recipients.some(id => participants.includes(id))) {
           socket.emit('call:error', { error: 'Call already in progress', code: 'CALL_IN_PROGRESS' })
           return
         }
@@ -1487,24 +1590,27 @@ export const setupSocketHandlers = (io) => {
       // Create call record
       activeDMCalls.set(callId, {
         callerId: userId,
-        recipientId,
+        recipientId: recipients[0],
+        recipientIds: recipients,
         conversationId,
         status: 'ringing',
         startTime: new Date().toISOString(),
         type
       })
 
-      // Add to pending calls for recipient
-      if (!pendingIncomingCalls.has(recipientId)) {
-        pendingIncomingCalls.set(recipientId, [])
-      }
-      pendingIncomingCalls.get(recipientId).push({
-        callId,
-        callerId: userId,
-        callerInfo,
-        conversationId,
-        type,
-        timestamp: Date.now()
+      // Add to pending calls for recipients
+      recipients.forEach(rid => {
+        if (!pendingIncomingCalls.has(rid)) {
+          pendingIncomingCalls.set(rid, [])
+        }
+        pendingIncomingCalls.get(rid).push({
+          callId,
+          callerId: userId,
+          callerInfo,
+          conversationId,
+          type,
+          timestamp: Date.now()
+        })
       })
 
       // Log call start
@@ -1512,7 +1618,7 @@ export const setupSocketHandlers = (io) => {
         callId,
         conversationId,
         callerId: userId,
-        recipientId,
+        recipientId: recipients[0],
         type,
         status: 'started'
       })
@@ -1520,34 +1626,37 @@ export const setupSocketHandlers = (io) => {
       // Notify caller that call is ringing
       socket.emit('call:ringing', {
         callId,
-        recipientId,
+        recipientId: recipients[0],
+        recipient: userService.getUser(recipients[0]) || null,
+        participantIds: recipients,
         conversationId,
         type
       })
 
-      // Ring all devices of recipient
-      emitToAllUserDevices(io, recipientId, 'call:incoming', {
+      // Ring all recipients
+      recipients.forEach(rid => emitToAllUserDevices(io, rid, 'call:incoming', {
         callId,
         caller: callerInfo,
         conversationId,
         type,
+        participantIds: recipients,
         iceServers: getIceServers()
-      })
+      }))
 
-      console.log(`[Call] ${userId} -> ${recipientId}: ${type} call initiated (${callId})`)
+      console.log(`[Call] ${userId} -> [${recipients.join(',')}]: ${type} call initiated (${callId})`)
 
       // Set timeout for missed call
       setTimeout(() => {
         const call = activeDMCalls.get(callId)
         if (call && call.status === 'ringing') {
           // Call still ringing after timeout = missed
-          cleanupPendingCall(recipientId, callId)
-          endActiveCall(io, callId, recipientId, 'missed')
+          recipients.forEach(rid => cleanupPendingCall(rid, callId))
+          endActiveCall(io, callId, recipients[0], 'missed')
           
           // Notify caller of missed call
           emitToAllUserDevices(io, userId, 'call:missed', {
             callId,
-            recipientId
+            recipientId: recipients[0]
           })
           
           console.log(`[Call] ${callId} missed (timeout)`)
@@ -1565,7 +1674,8 @@ export const setupSocketHandlers = (io) => {
         return
       }
 
-      if (call.recipientId !== userId) {
+      const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
+      if (!recipients.includes(userId)) {
         socket.emit('call:error', { error: 'Not authorized to accept this call', code: 'UNAUTHORIZED' })
         return
       }
@@ -1575,14 +1685,14 @@ export const setupSocketHandlers = (io) => {
       call.acceptedAt = new Date().toISOString()
 
       // Remove from pending
-      cleanupPendingCall(userId, callId)
+      recipients.forEach(rid => cleanupPendingCall(rid, callId))
 
       // Update call log
       callLogService.logCall({
         callId,
         conversationId: call.conversationId,
         callerId: call.callerId,
-        recipientId: call.recipientId,
+        recipientId: recipients[0],
         type: call.type,
         status: 'accepted'
       })
@@ -1591,6 +1701,8 @@ export const setupSocketHandlers = (io) => {
       emitToAllUserDevices(io, call.callerId, 'call:accepted', {
         callId,
         recipientId: userId,
+        recipient: userService.getUser(userId) || null,
+        participantIds: recipients,
         iceServers: getIceServers()
       })
 
@@ -1598,8 +1710,17 @@ export const setupSocketHandlers = (io) => {
       socket.emit('call:connected', {
         callId,
         callerId: call.callerId,
+        participantIds: recipients,
         iceServers: getIceServers()
       })
+
+      // Notify other accepted participants for UI sync in group calls.
+      recipients
+        .filter(id => id !== userId)
+        .forEach(id => emitToAllUserDevices(io, id, 'call:participant-joined', {
+          callId,
+          userId
+        }))
 
       console.log(`[Call] ${callId} accepted by ${userId}`)
     })
@@ -1614,12 +1735,13 @@ export const setupSocketHandlers = (io) => {
         return
       }
 
-      if (call.recipientId !== userId) {
+      const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
+      if (!recipients.includes(userId)) {
         socket.emit('call:error', { error: 'Not authorized' })
         return
       }
 
-      cleanupPendingCall(userId, callId)
+      recipients.forEach(rid => cleanupPendingCall(rid, callId))
       endActiveCall(io, callId, userId, 'declined')
 
       console.log(`[Call] ${callId} declined by ${userId}`)
@@ -1635,12 +1757,18 @@ export const setupSocketHandlers = (io) => {
         return
       }
 
-      if (call.callerId !== userId && call.recipientId !== userId) {
+      if (!getCallParticipants(call).includes(userId)) {
         socket.emit('call:error', { error: 'Not authorized' })
         return
       }
 
-      cleanupPendingCall(call.recipientId, callId)
+      if (call.status === 'active' && leaveParticipantFromActiveCall(io, callId, userId)) {
+        console.log(`[Call] ${callId} participant left: ${userId}`)
+        return
+      }
+
+      const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
+      recipients.forEach(rid => cleanupPendingCall(rid, callId))
       endActiveCall(io, callId, userId, 'ended')
 
       console.log(`[Call] ${callId} ended by ${userId}`)
@@ -1661,7 +1789,8 @@ export const setupSocketHandlers = (io) => {
         return
       }
 
-      cleanupPendingCall(call.recipientId, callId)
+      const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
+      recipients.forEach(rid => cleanupPendingCall(rid, callId))
       endActiveCall(io, callId, userId, 'cancelled')
 
       console.log(`[Call] ${callId} cancelled by caller ${userId}`)
@@ -1673,17 +1802,14 @@ export const setupSocketHandlers = (io) => {
       const call = activeDMCalls.get(callId)
 
       if (!call) return
-      if (call.callerId !== userId && call.recipientId !== userId) return
+      if (!getCallParticipants(call).includes(userId)) return
 
-      const targetSocket = userSockets.get(to)
-      if (targetSocket) {
-        io.to(targetSocket).emit('call:offer', {
-          from: userId,
-          fromUsername: socket.user.username,
-          offer,
-          callId
-        })
-      }
+      emitToAllUserDevices(io, to, 'call:offer', {
+        from: userId,
+        fromUsername: socket.user.username,
+        offer,
+        callId
+      })
     })
 
     socket.on('call:answer', (data) => {
@@ -1691,16 +1817,13 @@ export const setupSocketHandlers = (io) => {
       const call = activeDMCalls.get(callId)
 
       if (!call) return
-      if (call.callerId !== userId && call.recipientId !== userId) return
+      if (!getCallParticipants(call).includes(userId)) return
 
-      const targetSocket = userSockets.get(to)
-      if (targetSocket) {
-        io.to(targetSocket).emit('call:answer', {
-          from: userId,
-          answer,
-          callId
-        })
-      }
+      emitToAllUserDevices(io, to, 'call:answer', {
+        from: userId,
+        answer,
+        callId
+      })
     })
 
     socket.on('call:ice-candidate', (data) => {
@@ -1708,16 +1831,13 @@ export const setupSocketHandlers = (io) => {
       const call = activeDMCalls.get(callId)
 
       if (!call) return
-      if (call.callerId !== userId && call.recipientId !== userId) return
+      if (!getCallParticipants(call).includes(userId)) return
 
-      const targetSocket = userSockets.get(to)
-      if (targetSocket) {
-        io.to(targetSocket).emit('call:ice-candidate', {
-          from: userId,
-          candidate,
-          callId
-        })
-      }
+      emitToAllUserDevices(io, to, 'call:ice-candidate', {
+        from: userId,
+        candidate,
+        callId
+      })
     })
 
     // Mute/Deafen during call
@@ -1725,28 +1845,26 @@ export const setupSocketHandlers = (io) => {
       const { callId, muted } = data
       const call = activeDMCalls.get(callId)
       if (!call) return
-      if (call.callerId !== userId && call.recipientId !== userId) return
+      if (!getCallParticipants(call).includes(userId)) return
 
-      const otherId = call.callerId === userId ? call.recipientId : call.callerId
-      emitToAllUserDevices(io, otherId, 'call:user-muted', {
+      getCallParticipants(call).filter(id => id !== userId).forEach(otherId => emitToAllUserDevices(io, otherId, 'call:user-muted', {
         callId,
         userId,
         muted
-      })
+      }))
     })
 
     socket.on('call:deafen', (data) => {
       const { callId, deafened } = data
       const call = activeDMCalls.get(callId)
       if (!call) return
-      if (call.callerId !== userId && call.recipientId !== userId) return
+      if (!getCallParticipants(call).includes(userId)) return
 
-      const otherId = call.callerId === userId ? call.recipientId : call.callerId
-      emitToAllUserDevices(io, otherId, 'call:user-deafened', {
+      getCallParticipants(call).filter(id => id !== userId).forEach(otherId => emitToAllUserDevices(io, otherId, 'call:user-deafened', {
         callId,
         userId,
         deafened
-      })
+      }))
     })
 
     // Video toggle during call
@@ -1754,14 +1872,13 @@ export const setupSocketHandlers = (io) => {
       const { callId, enabled } = data
       const call = activeDMCalls.get(callId)
       if (!call) return
-      if (call.callerId !== userId && call.recipientId !== userId) return
+      if (!getCallParticipants(call).includes(userId)) return
 
-      const otherId = call.callerId === userId ? call.recipientId : call.callerId
-      emitToAllUserDevices(io, otherId, 'call:video-toggled', {
+      getCallParticipants(call).filter(id => id !== userId).forEach(otherId => emitToAllUserDevices(io, otherId, 'call:video-toggled', {
         callId,
         userId,
         enabled
-      })
+      }))
     })
 
     // Get call history for a conversation
@@ -1775,8 +1892,12 @@ export const setupSocketHandlers = (io) => {
     socket.on('disconnect', () => {
       // End any active calls this user is in
       for (const [callId, call] of activeDMCalls.entries()) {
-        if (call.callerId === userId || call.recipientId === userId) {
-          cleanupPendingCall(call.recipientId, callId)
+        if (getCallParticipants(call).includes(userId)) {
+          if (call.status === 'active' && leaveParticipantFromActiveCall(io, callId, userId)) {
+            continue
+          }
+          const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
+          recipients.forEach(rid => cleanupPendingCall(rid, callId))
           endActiveCall(io, callId, userId, 'disconnected')
         }
       }

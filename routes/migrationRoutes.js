@@ -8,6 +8,11 @@ import { fileURLToPath } from 'url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const router = express.Router()
 
+const loadOptionalModule = async (moduleName) => {
+  const mod = await import(moduleName)
+  return mod.default || mod
+}
+
 const STORAGE_TYPES = {
   json: { name: 'JSON Files', requires: [] },
   sqlite: { name: 'SQLite', requires: ['better-sqlite3'] },
@@ -76,6 +81,7 @@ router.post('/migrate', async (req, res) => {
       steps: [],
       errors: []
     }
+    let previousStorageConfig
     
     try {
       results.steps.push({ step: 'backup', status: 'pending' })
@@ -100,7 +106,7 @@ router.post('/migrate', async (req, res) => {
         results.steps[results.steps.length - 1].status = 'completed'
         results.steps[results.steps.length - 1].backupPath = backupDir
       } else {
-        results.steps.push({ step: 'backup', status: 'skipped' })
+        results.steps[results.steps.length - 1].status = 'skipped'
       }
       
       results.steps.push({ step: 'export', status: 'pending' })
@@ -115,20 +121,27 @@ router.post('/migrate', async (req, res) => {
       
       results.steps.push({ step: 'configure', status: 'pending' })
       
+      previousStorageConfig = JSON.parse(JSON.stringify(config.config.storage))
       const newStorageConfig = {
         type: targetType,
         [targetType]: targetConfig || {}
       }
       
       config.config.storage = { ...config.config.storage, ...newStorageConfig }
+      await dataService.reinitializeStorage()
       
       results.steps[results.steps.length - 1].status = 'completed'
       
       results.steps.push({ step: 'import', status: 'pending' })
       
-      const importResults = dataService.importAllData(exportData)
+      const importResults = await dataService.importAllData(exportData)
       results.steps[results.steps.length - 1].status = 'completed'
       results.steps[results.steps.length - 1].imported = importResults.tables
+
+      const activeStorage = dataService.getStorageInfo()
+      if (activeStorage.type !== targetType) {
+        throw new Error(`Backend switch failed: expected "${targetType}" but active backend is "${activeStorage.type}"`)
+      }
       
       config.save()
       
@@ -137,6 +150,14 @@ router.post('/migrate', async (req, res) => {
     } catch (err) {
       results.success = false
       results.errors.push(err.message)
+      try {
+        if (typeof previousStorageConfig !== 'undefined') {
+          config.config.storage = previousStorageConfig
+          await dataService.reinitializeStorage()
+        }
+      } catch (rollbackErr) {
+        results.errors.push(`Rollback failed: ${rollbackErr.message}`)
+      }
     }
     
     res.json(results)
@@ -164,13 +185,17 @@ router.post('/test-connection', async (req, res) => {
     }
     
     // Helper to detect missing driver errors
-    const isDriverMissing = (err) => err.code === 'MODULE_NOT_FOUND' || err.message?.includes('Cannot find module')
+    const isDriverMissing = (err) => (
+      err?.code === 'MODULE_NOT_FOUND' ||
+      err?.code === 'ERR_MODULE_NOT_FOUND' ||
+      err?.message?.includes('Cannot find module')
+    )
     const driverMissingMsg = (pkg) => `Node.js driver "${pkg}" is not installed. Run: npm install ${pkg}`
     
     switch (type) {
       case 'mysql':
         try {
-          const mysql = require('mysql2/promise')
+          const mysql = await loadOptionalModule('mysql2/promise')
           const conn = await mysql.createConnection({
             host: testConfig.host || 'localhost',
             port: testConfig.port || 3306,
@@ -189,7 +214,7 @@ router.post('/test-connection', async (req, res) => {
         
       case 'mariadb':
         try {
-          const mariadb = require('mariadb')
+          const mariadb = await loadOptionalModule('mariadb')
           const conn = await mariadb.createConnection({
             host: testConfig.host || 'localhost',
             port: testConfig.port || 3306,
@@ -209,7 +234,7 @@ router.post('/test-connection', async (req, res) => {
       case 'postgres':
       case 'cockroachdb':
         try {
-          const { Client } = require('pg')
+          const { Client } = await loadOptionalModule('pg')
           const client = new Client({
             host: testConfig.host || 'localhost',
             port: testConfig.port || (type === 'cockroachdb' ? 26257 : 5432),
@@ -229,7 +254,7 @@ router.post('/test-connection', async (req, res) => {
         
       case 'mssql':
         try {
-          const mssql = require('mssql')
+          const mssql = await loadOptionalModule('mssql')
           await mssql.connect({
             server: testConfig.host || 'localhost',
             port: testConfig.port || 1433,
@@ -252,7 +277,7 @@ router.post('/test-connection', async (req, res) => {
         
       case 'mongodb':
         try {
-          const { MongoClient } = require('mongodb')
+          const { MongoClient } = await loadOptionalModule('mongodb')
           const uri = testConfig.connectionString || 
             `mongodb://${testConfig.host || 'localhost'}:${testConfig.port || 27017}/${testConfig.database || 'voltchat'}`
           const client = new MongoClient(uri)
@@ -268,7 +293,7 @@ router.post('/test-connection', async (req, res) => {
         
       case 'redis':
         try {
-          const redis = require('redis')
+          const redis = await loadOptionalModule('redis')
           const client = redis.createClient({
             host: testConfig.host || 'localhost',
             port: testConfig.port || 6379,
@@ -306,7 +331,7 @@ router.post('/test-connection', async (req, res) => {
   }
 })
 
-router.get('/check-dependencies', (req, res) => {
+router.get('/check-dependencies', async (req, res) => {
   const dependencies = {}
   
   const requiredDeps = {
@@ -322,18 +347,22 @@ router.get('/check-dependencies', (req, res) => {
   // JSON is always available (no driver needed)
   dependencies['json'] = { available: true, package: null, note: 'Built-in, no driver required' }
   
-  for (const [dep, storageType] of Object.entries(requiredDeps)) {
-    try {
-      require(dep)
-      dependencies[storageType] = { available: true, package: dep }
-    } catch (err) {
-      dependencies[storageType] = { 
-        available: false, 
-        package: dep,
-        installCommand: `npm install ${dep}`,
-        note: `Driver not installed locally. Install with: npm install ${dep}. The database itself can be on a remote server.`
+  try {
+    for (const [dep, storageType] of Object.entries(requiredDeps)) {
+      try {
+        await loadOptionalModule(dep)
+        dependencies[storageType] = { available: true, package: dep }
+      } catch (err) {
+        dependencies[storageType] = { 
+          available: false, 
+          package: dep,
+          installCommand: `npm install ${dep}`,
+          note: `Driver not installed locally. Install with: npm install ${dep}. The database itself can be on a remote server.`
+        }
       }
     }
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message })
   }
   
   // CockroachDB uses the same driver as postgres

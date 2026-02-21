@@ -23,19 +23,35 @@ router.get('/', authenticateToken, (req, res) => {
   let conversations = dmService.getConversations(req.user.id)
   
   let enrichedConversations = conversations.map(conv => {
-    const recipientProfile = userService.getUser(conv.recipientId)
-    const online = isUserOnline(conv.recipientId)
-    const status = online ? (recipientProfile?.status === 'invisible' ? 'invisible' : (recipientProfile?.status || 'online')) : 'offline'
-    return {
-      ...conv,
-      recipient: {
-        id: conv.recipientId,
-        username: recipientProfile?.username || 'Unknown',
-        displayName: recipientProfile?.displayName,
-        customUsername: recipientProfile?.customUsername,
-        avatar: getImageUrl(conv.recipientId),
+    const participantIds = Array.isArray(conv.participants)
+      ? conv.participants
+      : [req.user.id, conv.recipientId].filter(Boolean)
+    const otherIds = participantIds.filter(id => id !== req.user.id)
+    const isGroup = !!conv.isGroup || otherIds.length > 1
+
+    const recipients = otherIds.map(id => {
+      const profile = userService.getUser(id)
+      const online = isUserOnline(id)
+      const status = online ? (profile?.status === 'invisible' ? 'invisible' : (profile?.status || 'online')) : 'offline'
+      return {
+        id,
+        username: profile?.username || 'Unknown',
+        displayName: profile?.displayName,
+        customUsername: profile?.customUsername,
+        avatar: getImageUrl(id),
         status
       }
+    })
+    const primaryRecipient = recipients[0] || null
+
+    return {
+      ...conv,
+      isGroup,
+      recipient: primaryRecipient,
+      recipients,
+      title: isGroup
+        ? (conv.groupName || recipients.map(r => r.displayName || r.customUsername || r.username).slice(0, 3).join(', ') || 'Group DM')
+        : (primaryRecipient?.displayName || primaryRecipient?.customUsername || primaryRecipient?.username || 'Unknown')
     }
   })
   
@@ -43,12 +59,20 @@ router.get('/', authenticateToken, (req, res) => {
   if (search && search.trim()) {
     const searchLower = search.toLowerCase().trim()
     enrichedConversations = enrichedConversations.filter(conv => {
+      if (conv.isGroup) {
+        const groupName = conv.groupName?.toLowerCase() || ''
+        const title = conv.title?.toLowerCase() || ''
+        const memberMatch = (conv.recipients || []).some(r =>
+          (r.username || '').toLowerCase().includes(searchLower) ||
+          (r.displayName || '').toLowerCase().includes(searchLower) ||
+          (r.customUsername || '').toLowerCase().includes(searchLower)
+        )
+        return groupName.includes(searchLower) || title.includes(searchLower) || memberMatch
+      }
       const username = conv.recipient?.username?.toLowerCase() || ''
       const displayName = conv.recipient?.displayName?.toLowerCase() || ''
       const customUsername = conv.recipient?.customUsername?.toLowerCase() || ''
-      return username.includes(searchLower) || 
-             displayName.includes(searchLower) || 
-             customUsername.includes(searchLower)
+      return username.includes(searchLower) || displayName.includes(searchLower) || customUsername.includes(searchLower)
     })
   }
   
@@ -112,7 +136,47 @@ router.get('/search', authenticateToken, (req, res) => {
 
 // Create or get DM conversation
 router.post('/', authenticateToken, (req, res) => {
-  const { userId } = req.body
+  const { userId, participantIds, groupName } = req.body
+
+  // Group DM flow
+  if (Array.isArray(participantIds) && participantIds.length > 0) {
+    const ids = Array.from(new Set(participantIds.filter(Boolean)))
+    if (ids.includes(req.user.id)) {
+      return res.status(400).json({ error: 'Do not include yourself in participantIds' })
+    }
+    if (ids.some(id => blockService.isBlocked(req.user.id, id))) {
+      return res.status(400).json({ error: 'One or more selected users are blocked' })
+    }
+
+    try {
+      const conversation = dmService.createGroupConversation(req.user.id, ids, groupName)
+      const recipients = conversation.participants
+        .filter(id => id !== req.user.id)
+        .map(id => {
+          const profile = userService.getUser(id)
+          const online = isUserOnline(id)
+          const status = online ? (profile?.status === 'invisible' ? 'invisible' : (profile?.status || 'online')) : 'offline'
+          return {
+            id,
+            username: profile?.username || 'Unknown',
+            displayName: profile?.displayName,
+            customUsername: profile?.customUsername,
+            avatar: getImageUrl(id),
+            status
+          }
+        })
+
+      return res.json({
+        ...conversation,
+        isGroup: true,
+        recipients,
+        recipient: recipients[0] || null,
+        title: conversation.groupName || recipients.map(r => r.displayName || r.customUsername || r.username).slice(0, 3).join(', ')
+      })
+    } catch (err) {
+      return res.status(400).json({ error: err.message || 'Failed to create group DM' })
+    }
+  }
   
   if (!userId) {
     return res.status(400).json({ error: 'userId required' })
@@ -185,15 +249,23 @@ router.get('/search/messages', authenticateToken, (req, res) => {
     ).slice(0, 10) // Limit per conversation
     
     if (matchingMessages.length > 0) {
-      const recipientProfile = userService.getUser(conv.recipientId)
+      const others = (Array.isArray(conv.participants) ? conv.participants : [req.user.id, conv.recipientId].filter(Boolean))
+        .filter(id => id !== req.user.id)
+      const recipients = others.map(id => {
+        const p = userService.getUser(id)
+        return {
+          id,
+          username: p?.username || 'Unknown',
+          displayName: p?.displayName,
+          avatar: getImageUrl(id)
+        }
+      })
       results.push({
         conversationId: conv.id,
-        recipient: {
-          id: conv.recipientId,
-          username: recipientProfile?.username || 'Unknown',
-          displayName: recipientProfile?.displayName,
-          avatar: getImageUrl(conv.recipientId)
-        },
+        isGroup: !!conv.isGroup || others.length > 1,
+        recipient: recipients[0] || null,
+        recipients,
+        title: conv.groupName || recipients.map(r => r.displayName || r.username).slice(0, 3).join(', '),
         messages: matchingMessages.map(msg => ({
           id: msg.id,
           content: msg.content,
@@ -225,8 +297,14 @@ router.post('/:conversationId/messages', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Conversation not found' })
   }
   
-  if (blockService.isBlocked(req.user.id, conversation.recipientId)) {
+  if (!conversation.isGroup && blockService.isBlocked(req.user.id, conversation.recipientId)) {
     return res.status(400).json({ error: 'Cannot send message to blocked user' })
+  }
+  if (conversation.isGroup) {
+    const others = (conversation.participants || []).filter(id => id !== req.user.id)
+    if (others.some(id => blockService.isBlocked(req.user.id, id))) {
+      return res.status(400).json({ error: 'Cannot send message to one or more blocked users in this group' })
+    }
   }
   
   const message = {

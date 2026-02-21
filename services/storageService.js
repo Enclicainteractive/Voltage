@@ -1,9 +1,11 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { createRequire } from 'module'
 import config from '../config/config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const require = createRequire(import.meta.url)
 
 let db = null
 let storage = null
@@ -1470,6 +1472,26 @@ export const initStorage = () => {
   return storage
 }
 
+export const resetStorage = async () => {
+  if (!storage) {
+    db = null
+    return
+  }
+
+  try {
+    if (typeof storage.close === 'function') {
+      await storage.close()
+    } else if (db && typeof db.close === 'function') {
+      db.close()
+    }
+  } catch (err) {
+    console.error('[Storage] Error closing active storage:', err.message)
+  } finally {
+    storage = null
+    db = null
+  }
+}
+
 export const getStorage = () => {
   if (!storage) {
     initStorage()
@@ -1500,6 +1522,7 @@ export const FILES = {
 
 export default {
   initStorage,
+  resetStorage,
   getStorage,
   FILES
 }
