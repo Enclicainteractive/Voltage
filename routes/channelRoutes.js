@@ -195,6 +195,22 @@ export const addMessage = (channelId, message) => {
   if (!allMessages[channelId]) {
     allMessages[channelId] = []
   }
+  const channelMessages = allMessages[channelId]
+  if (typeof message.replyTo === 'string') {
+    const target = channelMessages.find(m => m.id === message.replyTo)
+    message.replyTo = target
+      ? {
+          id: target.id,
+          userId: target.userId,
+          username: target.username,
+          content: target.content,
+          timestamp: target.timestamp
+        }
+      : {
+          id: message.replyTo,
+          deleted: true
+        }
+  }
   allMessages[channelId].push(message)
   saveMessages(allMessages)
   return message
@@ -285,12 +301,33 @@ router.get('/:channelId/messages', authenticateToken, (req, res) => {
     filtered = messages.slice(-parseInt(limit))
   }
   
-  console.log(`[API] Get messages for channel ${req.params.channelId} - returned ${filtered.length} messages`)
-  res.json(filtered)
+  const byId = new Map(messages.map(m => [m.id, m]))
+  const hydrated = filtered.map(msg => {
+    if (!msg.replyTo || typeof msg.replyTo !== 'string') return msg
+    const target = byId.get(msg.replyTo)
+    return {
+      ...msg,
+      replyTo: target
+        ? {
+            id: target.id,
+            userId: target.userId,
+            username: target.username,
+            content: target.content,
+            timestamp: target.timestamp
+          }
+        : {
+            id: msg.replyTo,
+            deleted: true
+          }
+    }
+  })
+
+  console.log(`[API] Get messages for channel ${req.params.channelId} - returned ${hydrated.length} messages`)
+  res.json(hydrated)
 })
 
 router.post('/:channelId/messages', authenticateToken, (req, res) => {
-  const { content, attachments } = req.body
+  const { content, attachments, replyTo } = req.body
   const channelId = req.params.channelId
 
   const channelInfo = findChannelById(channelId)
@@ -306,6 +343,7 @@ router.post('/:channelId/messages', authenticateToken, (req, res) => {
     avatar: getAvatarUrl(req.user.id),
     content,
     attachments: attachments || [],
+    replyTo: typeof replyTo === 'string' ? replyTo : null,
     timestamp: new Date().toISOString()
   }
   

@@ -106,7 +106,10 @@ const normalizeServer = (server) => {
   return server
 }
 
-const getServers = () => loadData(SERVERS_FILE, []).map(normalizeServer)
+const getServers = () => {
+  const data = loadData(SERVERS_FILE, [])
+  return Array.isArray(data) ? data.map(normalizeServer) : []
+}
 const setServers = (servers) => saveData(SERVERS_FILE, servers)
 
 const getAllChannels = () => loadData(CHANNELS_FILE, {})
@@ -936,12 +939,17 @@ router.delete('/:serverId/emojis/:emojiId', authenticateToken, (req, res) => {
 // Global emojis - get all emojis from all servers the user is in
 router.get('/emojis/global', authenticateToken, (req, res) => {
   const userId = req.user.id
-  const allServers = loadData(SERVERS_FILE, [])
+  const allServers = getServers()
   
   // Get servers user is a member of
-  const userServers = allServers.filter(s => 
-    s.members?.includes(userId) || s.ownerId === userId
-  )
+  const userServers = allServers.filter(s => {
+    if (s.ownerId === userId) return true
+    if (!Array.isArray(s.members)) return false
+    return s.members.some(member => {
+      if (typeof member === 'string') return member === userId
+      return member?.id === userId
+    })
+  })
   
   // Collect all emojis with server info
   const allEmojis = []

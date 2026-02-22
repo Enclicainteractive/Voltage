@@ -57,6 +57,28 @@ const HEARTBEAT_TIMEOUT_MS = 20000
 const HEARTBEAT_CHECK_INTERVAL_MS = 5000
 let heartbeatMonitorStarted = false
 
+const buildDMReplyReference = (conversationId, replyTo) => {
+  if (!replyTo) return null
+  if (typeof replyTo === 'object' && replyTo.id) return replyTo
+  if (typeof replyTo !== 'string') return null
+
+  const all = dmMessageService.getAllMessages()
+  const conversationMessages = Array.isArray(all?.[conversationId]) ? all[conversationId] : []
+  const target = conversationMessages.find(m => m.id === replyTo)
+  return target
+    ? {
+        id: target.id,
+        userId: target.userId,
+        username: target.username,
+        content: target.content,
+        timestamp: target.timestamp
+      }
+    : {
+        id: replyTo,
+        deleted: true
+      }
+}
+
 const markVoiceHeartbeat = (userId, channelId) => {
   voiceHeartbeats.set(userId, {
     channelId,
@@ -977,6 +999,7 @@ export const setupSocketHandlers = (io) => {
         mentions: mentions,
         timestamp: new Date().toISOString(),
         attachments: data.attachments || [],
+        replyTo: typeof data.replyTo === 'string' ? data.replyTo : null,
         storage:         storageInfo,
         encrypted: data.encrypted || false,
         iv: data.iv || null,
@@ -1329,6 +1352,7 @@ export const setupSocketHandlers = (io) => {
         content,
         timestamp: new Date().toISOString(),
         attachments: data.attachments || [],
+        replyTo: buildDMReplyReference(conversationId, data.replyTo),
         storage: storageInfo,
         encrypted: data.encrypted || false,
         iv: data.iv || null,

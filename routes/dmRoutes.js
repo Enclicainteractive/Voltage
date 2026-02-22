@@ -17,6 +17,25 @@ const getImageUrl = (userId) => {
 
 const router = express.Router()
 
+const buildDMReplyReference = (conversationMessages, replyTo) => {
+  if (!replyTo) return null
+  if (typeof replyTo === 'object' && replyTo.id) return replyTo
+  if (typeof replyTo !== 'string') return null
+  const target = conversationMessages.find(m => m.id === replyTo)
+  return target
+    ? {
+        id: target.id,
+        userId: target.userId,
+        username: target.username,
+        content: target.content,
+        timestamp: target.timestamp
+      }
+    : {
+        id: replyTo,
+        deleted: true
+      }
+}
+
 // Get all DM conversations
 router.get('/', authenticateToken, (req, res) => {
   const { search } = req.query
@@ -226,8 +245,15 @@ router.get('/:conversationId/messages', authenticateToken, (req, res) => {
     )
   }
   
-  console.log(`[API] Get DM messages for ${req.params.conversationId} - ${messages.length} messages${search ? ` (search: ${search})` : ''}`)
-  res.json(messages)
+  const all = dmMessageService.getAllMessages()
+  const conversationMessages = Array.isArray(all?.[req.params.conversationId]) ? all[req.params.conversationId] : []
+  const hydrated = messages.map(msg => ({
+    ...msg,
+    replyTo: buildDMReplyReference(conversationMessages, msg.replyTo)
+  }))
+
+  console.log(`[API] Get DM messages for ${req.params.conversationId} - ${hydrated.length} messages${search ? ` (search: ${search})` : ''}`)
+  res.json(hydrated)
 })
 
 // Search messages in all DM conversations
@@ -283,7 +309,7 @@ router.get('/search/messages', authenticateToken, (req, res) => {
 
 // Send message in DM
 router.post('/:conversationId/messages', authenticateToken, (req, res) => {
-  const { content, attachments } = req.body
+  const { content, attachments, replyTo } = req.body
   const conversationId = req.params.conversationId
   
   if (!content?.trim()) {
@@ -315,6 +341,7 @@ router.post('/:conversationId/messages', authenticateToken, (req, res) => {
     avatar: getImageUrl(req.user.id),
     content: content.trim(),
     attachments: attachments || [],
+    replyTo: buildDMReplyReference(dmMessageService.getAllMessages()?.[conversationId] || [], replyTo),
     timestamp: new Date().toISOString()
   }
   

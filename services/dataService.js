@@ -1,88 +1,285 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import config from '../config/config.js'
+import { getStorage, resetStorage as resetStorageLayer } from './storageService.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
+// Use configured data directory, not hardcoded path
+// IMPORTANT: This must be called AFTER config.load() to get correct path
+let _dataDir = null
+let _filesCache = null
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true })
+const getDataDir = () => {
+  if (_dataDir) return _dataDir
+  config.load()
+  _dataDir = config.config.storage?.json?.dataDir || path.join(__dirname, '..', '..', 'data')
+  return _dataDir
 }
 
-export const FILES = {
-  users: path.join(DATA_DIR, 'users.json'),
-  friends: path.join(DATA_DIR, 'friends.json'),
-  friendRequests: path.join(DATA_DIR, 'friend-requests.json'),
-  dms: path.join(DATA_DIR, 'dms.json'),
-  dmMessages: path.join(DATA_DIR, 'dm-messages.json'),
-  servers: path.join(DATA_DIR, 'servers.json'),
-  channels: path.join(DATA_DIR, 'channels.json'),
-  messages: path.join(DATA_DIR, 'messages.json'),
-  reactions: path.join(DATA_DIR, 'reactions.json'),
-  serverInvites: path.join(DATA_DIR, 'server-invites.json'),
-  blocked: path.join(DATA_DIR, 'blocked.json'),
-  files: path.join(DATA_DIR, 'files.json'),
-  attachments: path.join(DATA_DIR, 'attachments.json'),
-  discovery: path.join(DATA_DIR, 'discovery.json'),
-  globalBans: path.join(DATA_DIR, 'global-bans.json'),
-  serverBans: path.join(DATA_DIR, 'server-bans.json'),
-  adminLogs: path.join(DATA_DIR, 'admin-logs.json'),
-  systemMessages: path.join(DATA_DIR, 'system-messages.json'),
-  e2eTrue: path.join(DATA_DIR, 'e2e-true.json'),
-  pinnedMessages: path.join(DATA_DIR, 'pinned-messages.json'),
-  selfVolts: path.join(DATA_DIR, 'self-volts.json'),
-  serverStart: path.join(DATA_DIR, 'server-start.json'),
-  callLogs: path.join(DATA_DIR, 'call-logs.json')
+// Only create directory if using JSON storage
+const ensureDataDir = () => {
+  config.load()
+  if (config.config.storage?.type === 'json') {
+    const dataDir = getDataDir()
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true })
+    }
+  }
 }
+
+// Build the FILES object with correct paths
+const buildFiles = () => {
+  ensureDataDir()
+  const dataDir = getDataDir()
+  return {
+    users: path.join(dataDir, 'users.json'),
+    friends: path.join(dataDir, 'friends.json'),
+    friendRequests: path.join(dataDir, 'friend-requests.json'),
+    bots: path.join(dataDir, 'bots.json'),
+    categories: path.join(dataDir, 'categories.json'),
+    e2eKeys: path.join(dataDir, 'e2e-keys.json'),
+    dms: path.join(dataDir, 'dms.json'),
+    dmMessages: path.join(dataDir, 'dm-messages.json'),
+    servers: path.join(dataDir, 'servers.json'),
+    channels: path.join(dataDir, 'channels.json'),
+    messages: path.join(dataDir, 'messages.json'),
+    reactions: path.join(dataDir, 'reactions.json'),
+    serverInvites: path.join(dataDir, 'server-invites.json'),
+    blocked: path.join(dataDir, 'blocked.json'),
+    files: path.join(dataDir, 'files.json'),
+    attachments: path.join(dataDir, 'attachments.json'),
+    discovery: path.join(dataDir, 'discovery.json'),
+    globalBans: path.join(dataDir, 'global-bans.json'),
+    serverBans: path.join(dataDir, 'server-bans.json'),
+    adminLogs: path.join(dataDir, 'admin-logs.json'),
+    systemMessages: path.join(dataDir, 'system-messages.json'),
+    e2eTrue: path.join(dataDir, 'e2e-true.json'),
+    pinnedMessages: path.join(dataDir, 'pinned-messages.json'),
+    selfVolts: path.join(dataDir, 'self-volts.json'),
+    federation: path.join(dataDir, 'federation.json'),
+    serverStart: path.join(dataDir, 'server-start.json'),
+    callLogs: path.join(dataDir, 'call-logs.json')
+  }
+}
+
+// Get FILES, building lazily on first access
+const getFILES = () => {
+  if (!_filesCache) {
+    _filesCache = buildFiles()
+  }
+  return _filesCache
+}
+
+// Export FILES as a getter-based object for backward compatibility
+export const FILES = new Proxy({}, {
+  get(target, prop) {
+    const files = getFILES()
+    return files[prop]
+  },
+  ownKeys(target) {
+    const files = getFILES()
+    return Object.keys(files)
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const files = getFILES()
+    if (prop in files) {
+      return { enumerable: true, configurable: true, value: files[prop] }
+    }
+    return undefined
+  }
+})
+
+// For backward compatibility, also export getDataDir
+export { getDataDir }
 
 let storageService = null
 let useStorage = false
 let storageCache = {}
 let cacheDirty = {}
 
-const FILE_TO_TABLE = {
-  [FILES.users]: 'users',
-  [FILES.friends]: 'friends',
-  [FILES.friendRequests]: 'friend_requests',
-  [FILES.servers]: 'servers',
-  [FILES.channels]: 'channels',
-  [FILES.messages]: 'messages',
-  [FILES.serverInvites]: 'invites',
-  [FILES.dms]: 'dms',
-  [FILES.dmMessages]: 'dm_messages',
-  [FILES.reactions]: 'reactions',
-  [FILES.blocked]: 'blocked',
-  [FILES.files]: 'files',
-  [FILES.attachments]: 'attachments',
-  [FILES.discovery]: 'discovery',
-  [FILES.globalBans]: 'global_bans',
-  [FILES.serverBans]: 'server_bans',
-  [FILES.adminLogs]: 'admin_logs',
-  [FILES.systemMessages]: 'system_messages',
-  [FILES.e2eTrue]: 'e2e_true',
-  [FILES.pinnedMessages]: 'pinned_messages',
-  [FILES.selfVolts]: 'self_volts',
-  [FILES.serverStart]: 'server_start',
-  [FILES.callLogs]: 'call_logs'
+// Lazy-built lookup maps
+let _fileToTableCache = null
+let _managedDataFilesCache = null
+let _storageTablesCache = null
+
+const getFileToTable = () => {
+  if (!_fileToTableCache) {
+    const files = getFILES()
+    _fileToTableCache = {
+      [files.users]: 'users',
+      [files.friends]: 'friends',
+      [files.friendRequests]: 'friend_requests',
+      [files.bots]: 'bots',
+      [files.categories]: 'categories',
+      [files.e2eKeys]: 'e2e_keys',
+      [files.servers]: 'servers',
+      [files.channels]: 'channels',
+      [files.messages]: 'messages',
+      [files.serverInvites]: 'invites',
+      [files.dms]: 'dms',
+      [files.dmMessages]: 'dm_messages',
+      [files.reactions]: 'reactions',
+      [files.blocked]: 'blocked',
+      [files.files]: 'files',
+      [files.attachments]: 'attachments',
+      [files.discovery]: 'discovery',
+      [files.globalBans]: 'global_bans',
+      [files.serverBans]: 'server_bans',
+      [files.adminLogs]: 'admin_logs',
+      [files.systemMessages]: 'system_messages',
+      [files.e2eTrue]: 'e2e_true',
+      [files.pinnedMessages]: 'pinned_messages',
+      [files.selfVolts]: 'self_volts',
+      [files.federation]: 'federation',
+      [files.serverStart]: 'server_start',
+      [files.callLogs]: 'call_logs'
+    }
+  }
+  return _fileToTableCache
 }
 
-const STORAGE_TABLES = Object.values(FILE_TO_TABLE)
+const getManagedDataFiles = () => {
+  if (!_managedDataFilesCache) {
+    const fileToTable = getFileToTable()
+    _managedDataFilesCache = new Set(
+      Object.keys(fileToTable).map(filePath => path.resolve(filePath))
+    )
+  }
+  return _managedDataFilesCache
+}
+
+const getStorageTables = () => {
+  if (!_storageTablesCache) {
+    _storageTablesCache = Object.values(getFileToTable())
+  }
+  return _storageTablesCache
+}
+
+// For backward compatibility with code that uses these as constants
+const FILE_TO_TABLE = new Proxy({}, {
+  get(target, prop) {
+    return getFileToTable()[prop]
+  },
+  ownKeys() {
+    return Object.keys(getFileToTable())
+  }
+})
+
+const MANAGED_DATA_FILES = new Set() // Placeholder, use getManagedDataFiles() function
+const STORAGE_TABLES = [] // Placeholder, use getStorageTables() function
+
+const isObjectLike = (value) => value && typeof value === 'object' && !Array.isArray(value)
+
+const hasAnyData = (value) => {
+  if (Array.isArray(value)) return value.length > 0
+  if (isObjectLike(value)) return Object.keys(value).length > 0
+  return Boolean(value)
+}
+
+const countDataEntries = (value) => {
+  if (Array.isArray(value)) return value.length
+  if (isObjectLike(value)) return Object.keys(value).length
+  return value ? 1 : 0
+}
+
+const normalizeLegacyKeys = (value) => {
+  if (Array.isArray(value)) {
+    return value.map(normalizeLegacyKeys)
+  }
+  if (!isObjectLike(value)) return value
+
+  const normalized = {}
+  for (const [key, child] of Object.entries(value)) {
+    const nextKey = key === 'Host' ? 'host' : key
+    const nextVal = normalizeLegacyKeys(child)
+    if (nextKey === 'host' && typeof normalized.host !== 'undefined') continue
+    normalized[nextKey] = nextVal
+  }
+  return normalized
+}
+
+const loadJsonFileDirect = (file, defaultValue = {}) => {
+  try {
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf8'))
+    }
+  } catch (err) {
+    console.error(`[DataService] Auto-migrate read error (${path.basename(file)}):`, err.message)
+  }
+  return defaultValue
+}
+
+const mergeMissingEntries = (currentValue, incomingValue) => {
+  if (Array.isArray(currentValue) && Array.isArray(incomingValue)) {
+    if (currentValue.length > 0) return { merged: currentValue, changed: false }
+    return { merged: incomingValue, changed: incomingValue.length > 0 }
+  }
+
+  const current = isObjectLike(currentValue) ? currentValue : {}
+  const incoming = isObjectLike(incomingValue) ? incomingValue : {}
+  let changed = false
+  const merged = { ...current }
+  for (const [key, value] of Object.entries(incoming)) {
+    if (typeof merged[key] === 'undefined') {
+      merged[key] = value
+      changed = true
+    }
+  }
+  return { merged, changed }
+}
+
+const autoMigrateJsonToStorage = async () => {
+  if (!useStorage || !storageService) return
+
+  let migratedTables = 0
+  let migratedEntries = 0
+
+  for (const [file, table] of Object.entries(getFileToTable())) {
+    const jsonData = loadJsonFileDirect(file, {})
+    if (!hasAnyData(jsonData)) continue
+
+    const storageData = storageCache[table] ?? {}
+    const { merged, changed } = mergeMissingEntries(storageData, jsonData)
+    if (!changed) continue
+
+    storageCache[table] = merged
+    await saveToStorage(table, merged)
+    migratedTables += 1
+    migratedEntries += Array.isArray(merged) ? merged.length : Object.keys(merged || {}).length
+  }
+
+  if (migratedTables > 0) {
+    console.log(`[DataService] Auto-migrated JSON -> ${storageService.type}: ${migratedTables} tables, ${migratedEntries} entries`)
+  } else {
+    console.log('[DataService] Auto-migrate: no JSON data changes detected')
+  }
+}
+
+// Get storage reference from storageService (initialized by server.js)
+const refreshStorageRef = () => {
+  storageService = getStorage()
+  useStorage = storageService && storageService.type !== 'json'
+  return storageService
+}
 
 const initStorage = async ({ forceReinit = false } = {}) => {
   try {
-    const storageModule = await import('./storageService.js')
-    if (forceReinit && storageModule.resetStorage) {
-      await storageModule.resetStorage()
+    config.load()
+    if (forceReinit && resetStorageLayer) {
+      await resetStorageLayer()
     }
-    storageService = storageModule.initStorage()
+    // Get storage from storageService (already initialized by server.js)
+    storageService = getStorage()
     useStorage = storageService && storageService.type !== 'json'
     storageCache = {}
     
     if (useStorage) {
       console.log('[DataService] Using storage layer:', storageService.type)
       await loadAllData()
+      await autoMigrateJsonToStorage()
     } else {
-      console.log('[DataService] Using file-based storage')
+      console.log('[DataService] Using file-based storage (deprecated - migrate to a database)')
     }
   } catch (err) {
     console.error('[DataService] Storage initialization error:', err.message)
@@ -90,15 +287,23 @@ const initStorage = async ({ forceReinit = false } = {}) => {
   }
 }
 
+const isAsyncStorageBackend = (type = '') => {
+  return type === 'mongodb' ||
+    type === 'redis' ||
+    type === 'mariadb' ||
+    type === 'cockroachdb' ||
+    type === 'mssql' ||
+    type?.startsWith('mysql') ||
+    type?.startsWith('postgres')
+}
+
 const loadAllData = async () => {
   if (!useStorage || !storageService) return
   
-  for (const table of STORAGE_TABLES) {
+  for (const table of getStorageTables()) {
     try {
       if (storageService.load) {
-        if (storageService.type === 'mongodb' || storageService.type === 'redis' || 
-            storageService.type?.startsWith('mysql') || storageService.type?.startsWith('postgres') ||
-            storageService.type === 'cockroachdb' || storageService.type === 'mssql') {
+        if (isAsyncStorageBackend(storageService.type)) {
           storageCache[table] = await storageService.load(table, {})
         } else {
           storageCache[table] = storageService.load(table, {})
@@ -115,9 +320,7 @@ const saveToStorage = async (table, data) => {
   if (!useStorage || !storageService) return
   
   try {
-    if (storageService.type === 'mongodb' || storageService.type === 'redis' || 
-        storageService.type?.startsWith('mysql') || storageService.type?.startsWith('postgres') ||
-        storageService.type === 'cockroachdb' || storageService.type === 'mssql') {
+    if (isAsyncStorageBackend(storageService.type)) {
       await storageService.save(table, data)
     } else {
       storageService.save(table, data)
@@ -130,7 +333,17 @@ const saveToStorage = async (table, data) => {
 const loadData = (file, defaultValue = {}) => {
   if (useStorage) {
     const table = getTableName(file)
-    return storageCache[table] || defaultValue
+    
+    // Check cache first
+    if (storageCache[table] !== undefined) {
+      return storageCache[table]
+    }
+    
+    // Try to load from individual table first (after distribution)
+    // Fall back to storage_kv if individual table doesn't exist
+    const result = loadFromIndividualTable(table, defaultValue)
+    storageCache[table] = result
+    return result
   }
   
   try {
@@ -141,6 +354,73 @@ const loadData = (file, defaultValue = {}) => {
     console.error(`[Data] Error loading ${file}:`, err.message)
   }
   return defaultValue
+}
+
+// Load from individual table (after distribution) or fall back to storage_kv
+const loadFromIndividualTable = (table, defaultValue = {}) => {
+  if (!storageService) {
+    return defaultValue
+  }
+  
+  try {
+    // For SQLite, try individual table first
+    if (storageService.type === 'sqlite' && storageService.db) {
+      const db = storageService.db
+      // Check if individual table exists
+      const tableCheck = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table)
+      if (tableCheck) {
+        // Load from individual table
+        const rows = db.prepare(`SELECT * FROM ${table}`).all()
+        const result = {}
+        for (const row of rows) {
+          const id = row.id || row.code || row.serverId || Object.keys(row)[0]
+          if (id) {
+            // Parse JSON fields back
+            const parsed = {}
+            for (const [key, value] of Object.entries(row)) {
+              if (key === 'id' || key === 'code' || key === 'serverId') continue
+              try {
+                parsed[key] = JSON.parse(value)
+              } catch {
+                parsed[key] = value
+              }
+            }
+            result[id] = Object.keys(parsed).length > 0 ? parsed : row
+          }
+        }
+        if (Object.keys(result).length > 0) {
+          console.log(`[Data] Loaded ${table} from individual table (${Object.keys(result).length} records)`)
+          return result
+        }
+      }
+      
+      // Fall back to storage_kv
+      try {
+        const kvStmt = db.prepare('SELECT data FROM storage_kv WHERE id = ?')
+        const kvRow = kvStmt.get(table)
+        if (kvRow?.data) {
+          try {
+            return JSON.parse(kvRow.data)
+          } catch {
+            return defaultValue
+          }
+        }
+      } catch {
+        // storage_kv might not exist after distribution
+      }
+    }
+    
+    // For MySQL/MariaDB, use storage service load which handles distribution automatically
+    if ((storageService.type === 'mysql' || storageService.type === 'mariadb') && storageService.pool) {
+      return storageService.load(table, defaultValue)
+    }
+    
+    // Default: use storage service
+    return storageService.load(table, defaultValue)
+  } catch (err) {
+    console.error(`[Data] Error loading ${table}:`, err.message)
+    return defaultValue
+  }
 }
 
 const saveData = (file, data) => {
@@ -163,6 +443,21 @@ const getTableName = (file) => {
   return FILE_TO_TABLE[file] || file
 }
 
+export const isManagedDataFile = (filePath) => {
+  if (!filePath || typeof filePath !== 'string') return false
+  return getManagedDataFiles().has(path.resolve(filePath))
+}
+
+export const loadManagedDataByFile = (filePath, defaultValue = {}) => {
+  const resolved = path.resolve(filePath)
+  return loadData(resolved, defaultValue)
+}
+
+export const saveManagedDataByFile = async (filePath, data) => {
+  const resolved = path.resolve(filePath)
+  return saveData(resolved, data)
+}
+
 export const migrateData = async (sourceType, targetConfig) => {
   const results = { success: true, tables: {}, errors: [] }
   
@@ -171,6 +466,9 @@ export const migrateData = async (sourceType, targetConfig) => {
       [FILES.users]: 'users',
       [FILES.friends]: 'friends',
       [FILES.friendRequests]: 'friend_requests',
+      [FILES.bots]: 'bots',
+      [FILES.categories]: 'categories',
+      [FILES.e2eKeys]: 'e2e_keys',
       [FILES.servers]: 'servers',
       [FILES.channels]: 'channels',
       [FILES.messages]: 'messages',
@@ -184,7 +482,8 @@ export const migrateData = async (sourceType, targetConfig) => {
       [FILES.discovery]: 'discovery',
       [FILES.globalBans]: 'global_bans',
       [FILES.serverBans]: 'server_bans',
-      [FILES.adminLogs]: 'admin_logs'
+      [FILES.adminLogs]: 'admin_logs',
+      [FILES.federation]: 'federation'
     })) {
       try {
         const data = loadData(file, {})
@@ -241,6 +540,9 @@ export const importAllData = async (data) => {
     users: FILES.users,
     friends: FILES.friends,
     friend_requests: FILES.friendRequests,
+    bots: FILES.bots,
+    categories: FILES.categories,
+    e2e_keys: FILES.e2eKeys,
     servers: FILES.servers,
     channels: FILES.channels,
     messages: FILES.messages,
@@ -259,21 +561,49 @@ export const importAllData = async (data) => {
     e2e_true: FILES.e2eTrue,
     pinned_messages: FILES.pinnedMessages,
     self_volts: FILES.selfVolts,
+    federation: FILES.federation,
     server_start: FILES.serverStart,
     call_logs: FILES.callLogs
   }
+  const handledTables = new Set(Object.keys(tableToFile))
   
   for (const [table, file] of Object.entries(tableToFile)) {
     try {
       if (data[table]) {
-        await saveData(file, data[table])
-        results.tables[table] = Object.keys(data[table]).length
+        const normalizedData = normalizeLegacyKeys(data[table])
+        const persisted = await saveData(file, normalizedData)
+        if (persisted === false) {
+          throw new Error('Storage layer reported save failure')
+        }
+        results.tables[table] = Object.keys(normalizedData || {}).length
       } else {
         results.tables[table] = 0
       }
     } catch (err) {
       results.errors.push(`${table}: ${err.message}`)
     }
+  }
+
+  // Preserve any additional JSON-derived tables even when they are not yet
+  // first-class files/routes, so "migrate everything" does not drop data.
+  for (const [table, payload] of Object.entries(data || {})) {
+    if (handledTables.has(table)) continue
+    try {
+      if (!useStorage) {
+        results.tables[table] = countDataEntries(payload)
+        continue
+      }
+      const normalizedData = normalizeLegacyKeys(payload ?? {})
+      storageCache[table] = normalizedData
+      await saveToStorage(table, normalizedData)
+      results.tables[table] = countDataEntries(normalizedData)
+    } catch (err) {
+      results.errors.push(`${table}: ${err.message}`)
+    }
+  }
+
+  if (results.errors.length > 0) {
+    results.success = false
   }
   
   return results
@@ -420,14 +750,18 @@ export const friendService = {
 export const friendRequestService = {
   getRequests(userId) {
     const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+    const incomingMap = requests?.incoming && typeof requests.incoming === 'object' ? requests.incoming : {}
+    const outgoingMap = requests?.outgoing && typeof requests.outgoing === 'object' ? requests.outgoing : {}
     return {
-      incoming: requests.incoming[userId] || [],
-      outgoing: requests.outgoing[userId] || []
+      incoming: incomingMap[userId] || [],
+      outgoing: outgoingMap[userId] || []
     }
   },
 
   sendRequest(fromUserId, toUserId, fromUsername, toUsername) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+    if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
+    if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
     if (!requests.incoming[toUserId]) requests.incoming[toUserId] = []
     if (!requests.outgoing[fromUserId]) requests.outgoing[fromUserId] = []
@@ -452,7 +786,9 @@ export const friendRequestService = {
   },
 
   acceptRequest(userId, requestId) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+    if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
+    if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
     const incoming = requests.incoming[userId] || []
     const request = incoming.find(r => r.id === requestId)
@@ -471,7 +807,9 @@ export const friendRequestService = {
   },
 
   rejectRequest(userId, requestId) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+    if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
+    if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
     const incoming = requests.incoming[userId] || []
     const request = incoming.find(r => r.id === requestId)
@@ -488,7 +826,9 @@ export const friendRequestService = {
   },
 
   cancelRequest(userId, requestId) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+    if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
+    if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
     const outgoing = requests.outgoing[userId] || []
     const request = outgoing.find(r => r.id === requestId)
@@ -1663,7 +2003,8 @@ export const callLogService = {
   }
 }
 
-initStorage()
+// Note: Storage initialization is handled by server.js calling initStorageAndDistribute()
+// Do not initialize here to avoid race conditions
 
 export default {
   initStorage,

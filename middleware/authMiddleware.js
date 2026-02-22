@@ -79,7 +79,7 @@ export const authenticateSocket = async (socket, next) => {
     return next(new Error('Authentication error'))
   }
 
-  // Bot tokens are random hex strings prefixed with 'vbot_', not JWTs.
+  // Bot tokens are random hex strings prefixed with 'vbot_', not JWTs because bots cant use JWTs because THEIR BOTS.
   // Validate them via botService and mark the socket as a bot connection
   // so downstream handlers can distinguish bot sockets from user sockets.
   if (token.startsWith('vbot_')) {
@@ -136,10 +136,19 @@ export const requireOwner = (req, res, next) => {
     if (fs.existsSync(USERS_FILE)) {
       const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'))
       const user = users[userId]
-      if (user?.adminRole === 'owner' || user?.adminRole === 'admin' || user?.role === 'admin') {
-        return next()
+      //if (user?.adminRole === 'owner' || user?.adminRole === 'admin' || user?.role === 'admin') { using switch instead.
+
+      switch(user.adminRole){
+        case "owner":
+        case "admin":
+          return next();
       }
-    }
+      switch(user.role){
+        case "owner":
+        case "admin":
+          return next();
+      }
+      } //there was a pesky little } messing up my pile.
   } catch (err) {
     console.error('[Auth] Error checking user role:', err.message)
   }

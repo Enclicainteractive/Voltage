@@ -7,24 +7,28 @@ import readline from 'readline'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, '..', '..', 'data')
 
-const JSON_FILES = [
-  'users.json',
-  'friends.json',
-  'friend-requests.json',
-  'dms.json',
-  'dm-messages.json',
-  'servers.json',
-  'channels.json',
-  'messages.json',
-  'reactions.json',
-  'server-invites.json',
-  'blocked.json',
-  'files.json',
-  'attachments.json',
-  'discovery.json',
-  'global-bans.json',
-  'admin-logs.json'
-]
+const JSON_FILE_TO_TABLE = {
+  'users.json': 'users',
+  'friends.json': 'friends',
+  'friend-requests.json': 'friend_requests',
+  'dms.json': 'dms',
+  'dm-messages.json': 'dm_messages',
+  'servers.json': 'servers',
+  'channels.json': 'channels',
+  'messages.json': 'messages',
+  'reactions.json': 'reactions',
+  'server-invites.json': 'invites',
+  'blocked.json': 'blocked',
+  'files.json': 'files',
+  'attachments.json': 'attachments',
+  'discovery.json': 'discovery',
+  'global-bans.json': 'global_bans',
+  'admin-logs.json': 'admin_logs'
+}
+const JSON_FILES = Object.keys(JSON_FILE_TO_TABLE)
+const TABLE_TO_JSON_FILE = Object.fromEntries(
+  Object.entries(JSON_FILE_TO_TABLE).map(([file, table]) => [table, file])
+)
 
 const STORAGE_TYPES = {
   json: { name: 'JSON Files', color: '\x1b[34m' },
@@ -73,16 +77,17 @@ class MigrationManager {
   async loadJsonData(dataDir) {
     const data = {}
     for (const file of JSON_FILES) {
+      const table = JSON_FILE_TO_TABLE[file] || file.replace('.json', '')
       const filePath = path.join(dataDir, file)
       try {
         if (fs.existsSync(filePath)) {
-          data[file.replace('.json', '')] = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+          data[table] = JSON.parse(fs.readFileSync(filePath, 'utf8'))
         } else {
-          data[file.replace('.json', '')] = {}
+          data[table] = {}
         }
       } catch (e) {
         console.error(`Error loading ${file}: ${e.message}`)
-        data[file.replace('.json', '')] = {}
+        data[table] = {}
       }
     }
     return data
@@ -90,7 +95,8 @@ class MigrationManager {
 
   async saveJsonData(dataDir, data) {
     for (const [key, value] of Object.entries(data)) {
-      const filePath = path.join(dataDir, `${key}.json`)
+      const fileName = TABLE_TO_JSON_FILE[key] || `${key}.json`
+      const filePath = path.join(dataDir, fileName)
       try {
         fs.writeFileSync(filePath, JSON.stringify(value, null, 2))
       } catch (e) {
@@ -201,7 +207,7 @@ class MigrationManager {
       friends: 'friends',
       friend_requests: 'friend-requests',
       dms: 'dms',
-      dm_messages: 'dmMessages',
+      dm_messages: 'dm-messages',
       servers: 'servers',
       channels: 'channels',
       messages: 'messages',
@@ -726,6 +732,23 @@ async function main() {
       console.log(migration.generateConfigJson('mysql', configObj))
       break
     }
+
+    case 'to-mariadb': {
+      const configObj = {
+        host: args[1] || 'localhost',
+        port: parseInt(args[2]) || 3306,
+        database: args[3] || 'voltchat',
+        user: args[4] || 'root',
+        password: args[5] || '',
+        connectionLimit: 10
+      }
+      await migration.createBackup(path.dirname(DATA_DIR))
+      await migration.getSourceData()
+      await migration.migrateToMysql(configObj)
+      console.log('\nConfig to use:')
+      console.log(migration.generateConfigJson('mariadb', configObj))
+      break
+    }
     
     case 'to-postgres': {
       const configObj = {
@@ -793,6 +816,7 @@ ${BOLD}Quick Migration Commands:${RESET}
   npm run migrate -- to-json [dir]       - Migrate to JSON files
   npm run migrate -- to-sqlite [path]   - Migrate to SQLite
   npm run migrate -- to-mysql            - Migrate to MySQL
+  npm run migrate -- to-mariadb          - Migrate to MariaDB
   npm run migrate -- to-postgres        - Migrate to PostgreSQL
   npm run migrate -- to-mongodb         - Migrate to MongoDB
   npm run migrate -- to-redis           - Migrate to Redis

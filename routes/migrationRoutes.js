@@ -1,12 +1,119 @@
 import express from 'express'
 import config from '../config/config.js'
 import dataService from '../services/dataService.js'
+import { distributeFromStorageKv } from '../services/storageService.js'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const router = express.Router()
+const APP_ROOT = path.join(__dirname, '..', '..')
+const DATA_DIR = path.join(__dirname, '..', '..', 'data')
+
+const JSON_FILE_TO_TABLE = {
+  'users.json': 'users',
+  'friends.json': 'friends',
+  'friend-requests.json': 'friend_requests',
+  'bots.json': 'bots',
+  'categories.json': 'categories',
+  'dms.json': 'dms',
+  'dm-messages.json': 'dm_messages',
+  'e2e-keys.json': 'e2e_keys',
+  'servers.json': 'servers',
+  'channels.json': 'channels',
+  'messages.json': 'messages',
+  'reactions.json': 'reactions',
+  'server-invites.json': 'invites',
+  'blocked.json': 'blocked',
+  'files.json': 'files',
+  'attachments.json': 'attachments',
+  'discovery.json': 'discovery',
+  'global-bans.json': 'global_bans',
+  'server-bans.json': 'server_bans',
+  'admin-logs.json': 'admin_logs',
+  'system-messages.json': 'system_messages',
+  'e2e-true.json': 'e2e_true',
+  'pinned-messages.json': 'pinned_messages',
+  'self-volts.json': 'self_volts',
+  'federation.json': 'federation',
+  'server-start.json': 'server_start',
+  'call-logs.json': 'call_logs'
+}
+
+const isObjectLike = (value) => value && typeof value === 'object' && !Array.isArray(value)
+
+const normalizeLegacyKeys = (value) => {
+  if (Array.isArray(value)) return value.map(normalizeLegacyKeys)
+  if (!isObjectLike(value)) return value
+  const out = {}
+  for (const [key, child] of Object.entries(value)) {
+    const nextKey = key === 'Host' ? 'host' : key
+    if (nextKey === 'host' && typeof out.host !== 'undefined') continue
+    out[nextKey] = normalizeLegacyKeys(child)
+  }
+  return out
+}
+
+const countRecords = (value) => {
+  if (Array.isArray(value)) return value.length
+  if (isObjectLike(value)) return Object.keys(value).length
+  return value ? 1 : 0
+}
+
+const mergeTableData = (primary, secondary) => {
+  if (Array.isArray(primary) && Array.isArray(secondary)) {
+    return primary.length > 0 ? primary : secondary
+  }
+  if (isObjectLike(primary) && isObjectLike(secondary)) {
+    return { ...secondary, ...primary }
+  }
+  return primary || secondary || {}
+}
+
+const readJsonDataDir = (sourceDir) => {
+  const out = {}
+  let files = []
+  try {
+    files = fs.readdirSync(sourceDir).filter(name => name.endsWith('.json'))
+  } catch {
+    files = []
+  }
+
+  for (const fileName of files) {
+    const explicitTable = JSON_FILE_TO_TABLE[fileName]
+    const fallbackTable = fileName.replace(/\.json$/i, '').replace(/-/g, '_')
+    const table = explicitTable || fallbackTable
+    const fullPath = path.join(sourceDir, fileName)
+    try {
+      if (!fs.existsSync(fullPath)) continue
+      const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf8'))
+      out[table] = normalizeLegacyKeys(parsed)
+    } catch (err) {
+      console.error(`[Migration] Failed to read ${fileName}:`, err.message)
+    }
+  }
+  return out
+}
+
+const resolveDataDir = (rawPath) => {
+  if (!rawPath || rawPath === './data' || rawPath === 'data') return DATA_DIR
+  return path.isAbsolute(rawPath) ? rawPath : path.resolve(APP_ROOT, rawPath)
+}
+
+const syncJsonFiles = (sourceDir, targetDir) => {
+  if (!fs.existsSync(sourceDir)) return []
+  if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true })
+  const copied = []
+  const files = fs.readdirSync(sourceDir).filter(name => name.endsWith('.json'))
+  for (const file of files) {
+    const src = path.join(sourceDir, file)
+    const dest = path.join(targetDir, file)
+    fs.copyFileSync(src, dest)
+    copied.push(file)
+  }
+  return copied
+}
 
 const loadOptionalModule = async (moduleName) => {
   const mod = await import(moduleName)
@@ -56,7 +163,7 @@ router.get('/storage-types', (req, res) => {
 
 router.post('/migrate', async (req, res) => {
   try {
-    const { targetType, targetConfig, backup = true } = req.body
+    const { targetType, targetConfig, backup = true, sourceDataDir = './data' } = req.body
     
     if (!targetType || !STORAGE_TYPES[targetType]) {
       return res.status(400).json({
@@ -66,6 +173,13 @@ router.post('/migrate', async (req, res) => {
     }
     
     const currentType = config.config.storage.type
+    const resolvedSourceDataDir = resolveDataDir(sourceDataDir)
+    if (!fs.existsSync(resolvedSourceDataDir)) {
+      return res.status(400).json({
+        success: false,
+        error: `Source data directory does not exist: ${resolvedSourceDataDir}`
+      })
+    }
     
     if (currentType === targetType) {
       return res.status(400).json({
@@ -78,6 +192,7 @@ router.post('/migrate', async (req, res) => {
       success: true,
       source: currentType,
       target: targetType,
+      sourceDataDir: resolvedSourceDataDir,
       steps: [],
       errors: []
     }
@@ -87,18 +202,17 @@ router.post('/migrate', async (req, res) => {
       results.steps.push({ step: 'backup', status: 'pending' })
       
       if (backup) {
-        const backupDir = path.join(__dirname, '..', '..', 'data', 'backup', `backup_${Date.now()}`)
+        const backupDir = path.join(DATA_DIR, 'backup', `backup_${Date.now()}`)
         if (!fs.existsSync(path.dirname(backupDir))) {
           fs.mkdirSync(path.dirname(backupDir), { recursive: true })
         }
         
-        const dataDir = path.join(__dirname, '..', '..', 'data')
-        const files = fs.readdirSync(dataDir).filter(f => f.endsWith('.json'))
+        const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.json'))
         
         fs.mkdirSync(backupDir, { recursive: true })
         
         for (const file of files) {
-          const srcPath = path.join(dataDir, file)
+          const srcPath = path.join(DATA_DIR, file)
           const destPath = path.join(backupDir, file)
           fs.copyFileSync(srcPath, destPath)
         }
@@ -111,13 +225,29 @@ router.post('/migrate', async (req, res) => {
       
       results.steps.push({ step: 'export', status: 'pending' })
       
-      const exportData = dataService.exportAllData()
+      const storageExportData = dataService.exportAllData()
+      const knownTables = new Set(Object.keys(storageExportData || {}))
+      const jsonExportData = readJsonDataDir(resolvedSourceDataDir)
+      const exportData = {}
+
+      const allTables = new Set([
+        ...Object.keys(storageExportData || {}),
+        ...Object.keys(jsonExportData || {})
+      ])
+
+      for (const table of allTables) {
+        exportData[table] = mergeTableData(storageExportData?.[table], jsonExportData?.[table])
+      }
+
       const recordCounts = {}
       for (const [table, data] of Object.entries(exportData)) {
-        recordCounts[table] = Object.keys(data).length
+        recordCounts[table] = countRecords(data)
       }
       results.steps[results.steps.length - 1].status = 'completed'
       results.steps[results.steps.length - 1].recordCounts = recordCounts
+      results.steps[results.steps.length - 1].tables = Object.keys(exportData)
+      results.steps[results.steps.length - 1].knownTables = Array.from(knownTables)
+      results.steps[results.steps.length - 1].jsonOnlyTables = Object.keys(exportData).filter(t => !knownTables.has(t))
       
       results.steps.push({ step: 'configure', status: 'pending' })
       
@@ -135,8 +265,64 @@ router.post('/migrate', async (req, res) => {
       results.steps.push({ step: 'import', status: 'pending' })
       
       const importResults = await dataService.importAllData(exportData)
+      if (!importResults.success) {
+        const importErr = (importResults.errors || []).join('; ') || 'Unknown import failure'
+        throw new Error(`Import failed: ${importErr}`)
+      }
       results.steps[results.steps.length - 1].status = 'completed'
       results.steps[results.steps.length - 1].imported = importResults.tables
+
+      results.steps.push({ step: 'verify', status: 'pending' })
+      const expectedCounts = {}
+      for (const [table, payload] of Object.entries(exportData)) {
+        if (!knownTables.has(table)) continue
+        expectedCounts[table] = countRecords(payload)
+      }
+
+      // Ensure persistence is actually readable after a storage re-init (restart-like check).
+      await dataService.reinitializeStorage()
+      const readBackData = dataService.exportAllData()
+      const readBackCounts = {}
+      const mismatches = []
+      for (const table of Object.keys(expectedCounts)) {
+        const expected = expectedCounts[table]
+        const actual = countRecords(readBackData?.[table] || {})
+        readBackCounts[table] = actual
+        if (actual < expected) {
+          mismatches.push(`${table}: expected >= ${expected}, got ${actual}`)
+        }
+      }
+      if (mismatches.length > 0) {
+        throw new Error(`Verification failed after reinit: ${mismatches.join('; ')}`)
+      }
+      results.steps[results.steps.length - 1].status = 'completed'
+      results.steps[results.steps.length - 1].expected = expectedCounts
+      results.steps[results.steps.length - 1].readBack = readBackCounts
+
+      // Step 5: Distribution - Move data from storage_kv to individual tables
+      results.steps.push({ step: 'distribution', status: 'pending' })
+      try {
+        const distributionResults = await distributeFromStorageKv()
+        results.steps[results.steps.length - 1].status = distributionResults.success ? 'completed' : 'warning'
+        results.steps[results.steps.length - 1].distributed = distributionResults.distributed
+        results.steps[results.steps.length - 1].deleted = distributionResults.deleted
+        results.steps[results.steps.length - 1].message = distributionResults.message
+        if (distributionResults.errors?.length > 0) {
+          results.steps[results.steps.length - 1].errors = distributionResults.errors
+        }
+        console.log('[Migration] Distribution results:', distributionResults)
+      } catch (distErr) {
+        results.steps[results.steps.length - 1].status = 'warning'
+        results.steps[results.steps.length - 1].error = distErr.message
+        console.error('[Migration] Distribution error:', distErr.message)
+        // Don't fail the whole migration if distribution fails - data is still in storage_kv
+      }
+
+      results.steps.push({ step: 'sync-json-runtime', status: 'pending' })
+      const copiedFiles = syncJsonFiles(resolvedSourceDataDir, DATA_DIR)
+      results.steps[results.steps.length - 1].status = 'completed'
+      results.steps[results.steps.length - 1].copiedFiles = copiedFiles
+      results.steps[results.steps.length - 1].targetDir = DATA_DIR
 
       const activeStorage = dataService.getStorageInfo()
       if (activeStorage.type !== targetType) {
@@ -385,6 +571,19 @@ router.post('/export-data', async (req, res) => {
     res.json({
       success: true,
       ...exportData
+    })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// Run distribution manually - moves data from storage_kv to individual tables
+router.post('/distribute', async (req, res) => {
+  try {
+    const results = await distributeFromStorageKv()
+    res.json({
+      success: results.success,
+      ...results
     })
   } catch (err) {
     res.status(500).json({ success: false, error: err.message })

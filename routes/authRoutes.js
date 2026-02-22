@@ -342,6 +342,10 @@ router.get('/config', (req, res) => {
   const authType = config.config.auth?.type || 'all'
   const oauthProvider = config.config.auth?.oauth?.provider || null
   const minPasswordLength = config.config.auth?.local?.minPasswordLength || 8
+  const oauthSettings = config.config.auth?.oauth || {}
+  const enclica = oauthSettings?.enclica || {}
+  const serverUrl = config.getServerUrl()
+  const redirectUri = serverUrl ? `${serverUrl.replace(/\/+$/, '')}/callback` : null
 
   res.json({
     allowRegistration,
@@ -350,6 +354,11 @@ router.get('/config', (req, res) => {
     oauthEnabled,
     authType,
     oauthProvider,
+    clientId: oauthEnabled && oauthProvider === 'enclica' ? (enclica.clientId || null) : null,
+    authUrl: oauthEnabled && oauthProvider === 'enclica' ? (enclica.authUrl || null) : null,
+    tokenUrl: oauthEnabled && oauthProvider === 'enclica' ? (enclica.tokenUrl || null) : null,
+    revokeUrl: oauthEnabled && oauthProvider === 'enclica' ? (enclica.revokeUrl || null) : null,
+    redirectUri: oauthEnabled && oauthProvider === 'enclica' ? redirectUri : null,
     minPasswordLength,
     serverName: config.config.server.name,
     serverMode: config.config.server.mode
