@@ -1,0 +1,16 @@
+[Unit]
+Description=Volt Main API Server
+After=network.target
+
+[Service]
+Type=simple
+User=volt
+WorkingDirectory=/home/bluet/Documents/EIVoltChat/voltchat/Voltage
+ExecStart=/usr/bin/node /home/bluet/Documents/EIVoltChat/voltchat/Voltage/microservices/api.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=VOLT_SERVICE=api
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,192 @@
+version: '3.8'
+
+services:
+  voltage-api:
+    image: voltage:latest
+    container_name: volt-api
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - VOLT_SERVICE=api
+      - PORT=5000
+      - SERVER_URL=${SERVER_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - STORAGE_TYPE=sqlite
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5000/api/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - voltage-network
+
+  voltage-websocket:
+    image: voltage:latest
+    container_name: volt-websocket
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - NODE_ENV=production
+      - VOLT_SERVICE=websocket
+      - PORT=5001
+      - SERVER_URL=${SERVER_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - STORAGE_TYPE=sqlite
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5001/api/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - voltage-network
+
+  voltage-federation:
+    image: voltage:latest
+    container_name: volt-federation
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    environment:
+      - NODE_ENV=production
+      - VOLT_SERVICE=federation
+      - PORT=5002
+      - SERVER_URL=${SERVER_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - STORAGE_TYPE=sqlite
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5002/api/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - voltage-network
+
+  voltage-cdn:
+    image: voltage:latest
+    container_name: volt-cdn
+    restart: unless-stopped
+    ports:
+      - "5003:5003"
+    environment:
+      - NODE_ENV=production
+      - VOLT_SERVICE=cdn
+      - PORT=5003
+      - SERVER_URL=${SERVER_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - STORAGE_TYPE=sqlite
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5003/api/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - voltage-network
+
+  voltage-worker:
+    image: voltage:latest
+    container_name: volt-worker
+    restart: unless-stopped
+    ports:
+      - "5004:5004"
+    environment:
+      - NODE_ENV=production
+      - VOLT_SERVICE=worker
+      - PORT=5004
+      - SERVER_URL=${SERVER_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - STORAGE_TYPE=sqlite
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5004/api/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - voltage-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: volt-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - voltage-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: volt-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx-multi.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - voltage-api
+      - voltage-websocket
+    networks:
+      - voltage-network
+
+networks:
+  voltage-network:
+    driver: bridge
+
+volumes:
+  redis_data:

@@ -4,9 +4,9 @@ import { discoveryService } from '../services/dataService.js'
 
 const router = express.Router()
 
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const { limit = 50, offset = 0, category, search } = req.query
-  const result = discoveryService.getApprovedServers(
+  const result = await discoveryService.getApprovedServers(
     parseInt(limit),
     parseInt(offset),
     category,

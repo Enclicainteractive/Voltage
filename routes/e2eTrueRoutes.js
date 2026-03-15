@@ -8,14 +8,14 @@ const router = express.Router()
 // === Device Key Management ===
 
 // Upload device key bundle (client publishes public keys only)
-router.post('/devices/keys', authenticateToken, (req, res) => {
+router.post('/devices/keys', authenticateToken, async (req, res) => {
   const { deviceId, identityPublicKey, signedPreKey, signedPreKeySignature, oneTimePreKeys } = req.body
 
   if (!deviceId || !identityPublicKey || !signedPreKey) {
     return res.status(400).json({ error: 'deviceId, identityPublicKey, and signedPreKey are required' })
   }
 
-  e2eTrueService.uploadDeviceKeyBundle(req.user.id, deviceId, {
+  await e2eTrueService.uploadDeviceKeyBundle(req.user.id, deviceId, {
     identityPublicKey,
     signedPreKey,
     signedPreKeySignature,
@@ -27,29 +27,29 @@ router.post('/devices/keys', authenticateToken, (req, res) => {
 })
 
 // Get a user's device key bundle (for establishing pairwise sessions)
-router.get('/devices/keys/:userId/:deviceId', authenticateToken, (req, res) => {
-  const bundle = e2eTrueService.getDeviceKeyBundle(req.params.userId, req.params.deviceId)
+router.get('/devices/keys/:userId/:deviceId', authenticateToken, async (req, res) => {
+  const bundle = await e2eTrueService.getDeviceKeyBundle(req.params.userId, req.params.deviceId)
   if (!bundle) return res.status(404).json({ error: 'Device key bundle not found' })
   res.json(bundle)
 })
 
 // List all devices for a user
-router.get('/devices/:userId', authenticateToken, (req, res) => {
-  const devices = e2eTrueService.getUserDevices(req.params.userId)
+router.get('/devices/:userId', authenticateToken, async (req, res) => {
+  const devices = await e2eTrueService.getUserDevices(req.params.userId)
   res.json(devices)
 })
 
 // Remove a device
-router.delete('/devices/:deviceId', authenticateToken, (req, res) => {
-  e2eTrueService.removeDevice(req.user.id, req.params.deviceId)
+router.delete('/devices/:deviceId', authenticateToken, async (req, res) => {
+  await e2eTrueService.removeDevice(req.user.id, req.params.deviceId)
   res.json({ success: true })
 })
 
 // === Group E2EE Epoch Management ===
 
 // Get current epoch for a group/server
-router.get('/groups/:groupId/epoch', authenticateToken, (req, res) => {
-  const epoch = e2eTrueService.getGroupEpoch(req.params.groupId)
+router.get('/groups/:groupId/epoch', authenticateToken, async (req, res) => {
+  const epoch = await e2eTrueService.getGroupEpoch(req.params.groupId)
   if (!epoch) return res.json({ epoch: null })
   // Only return metadata, never key material
   res.json({
@@ -63,22 +63,22 @@ router.get('/groups/:groupId/epoch', authenticateToken, (req, res) => {
 })
 
 // Initialize group E2EE (client creates group and distributes keys)
-router.post('/groups/:groupId/init', authenticateToken, (req, res) => {
+router.post('/groups/:groupId/init', authenticateToken, async (req, res) => {
   const { deviceId } = req.body
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' })
 
-  const existing = e2eTrueService.getGroupEpoch(req.params.groupId)
+  const existing = await e2eTrueService.getGroupEpoch(req.params.groupId)
   if (existing) return res.json(existing)
 
-  const epoch = e2eTrueService.createGroupEpoch(req.params.groupId, req.user.id, deviceId)
+  const epoch = await e2eTrueService.createGroupEpoch(req.params.groupId, req.user.id, deviceId)
   console.log(`[E2E-True] Group initialized: ${req.params.groupId} by ${req.user.id}`)
   res.json(epoch)
 })
 
 // Advance epoch (triggered by client after key rotation)
-router.post('/groups/:groupId/advance-epoch', authenticateToken, (req, res) => {
+router.post('/groups/:groupId/advance-epoch', authenticateToken, async (req, res) => {
   const { reason } = req.body
-  const epoch = e2eTrueService.advanceEpoch(req.params.groupId, reason || 'manual', req.user.id)
+  const epoch = await e2eTrueService.advanceEpoch(req.params.groupId, reason || 'manual', req.user.id)
   if (!epoch) return res.status(404).json({ error: 'Group not found' })
 
   // Notify all group members about the epoch change
@@ -94,12 +94,13 @@ router.post('/groups/:groupId/advance-epoch', authenticateToken, (req, res) => {
 })
 
 // Add member to group (triggers epoch advance on client side)
-router.post('/groups/:groupId/members', authenticateToken, (req, res) => {
+router.post('/groups/:groupId/members', authenticateToken, async (req, res) => {
   const { userId, deviceIds } = req.body
   if (!userId) return res.status(400).json({ error: 'userId required' })
 
-  const devices = deviceIds || e2eTrueService.getUserDevices(userId).map(d => d.deviceId)
-  const group = e2eTrueService.addMemberToGroup(req.params.groupId, userId, devices)
+  const userDevices = await e2eTrueService.getUserDevices(userId)
+  const devices = deviceIds || userDevices.map(d => d.deviceId)
+  const group = await e2eTrueService.addMemberToGroup(req.params.groupId, userId, devices)
   if (!group) return res.status(404).json({ error: 'Group not found' })
 
   // Notify existing members
@@ -113,12 +114,12 @@ router.post('/groups/:groupId/members', authenticateToken, (req, res) => {
 })
 
 // Remove member from group (triggers epoch advance + rekey)
-router.delete('/groups/:groupId/members/:userId', authenticateToken, (req, res) => {
-  const group = e2eTrueService.removeMemberFromGroup(req.params.groupId, req.params.userId)
+router.delete('/groups/:groupId/members/:userId', authenticateToken, async (req, res) => {
+  const group = await e2eTrueService.removeMemberFromGroup(req.params.groupId, req.params.userId)
   if (!group) return res.status(404).json({ error: 'Group not found' })
 
   // Advance epoch since a member left
-  e2eTrueService.advanceEpoch(req.params.groupId, 'member_removed', req.user.id)
+  await e2eTrueService.advanceEpoch(req.params.groupId, 'member_removed', req.user.id)
 
   io.to(`server:${req.params.groupId}`).emit('e2e:member-removed', {
     groupId: req.params.groupId,
@@ -129,21 +130,21 @@ router.delete('/groups/:groupId/members/:userId', authenticateToken, (req, res) 
 })
 
 // Get group members (to know who to distribute keys to)
-router.get('/groups/:groupId/members', authenticateToken, (req, res) => {
-  const members = e2eTrueService.getGroupMembers(req.params.groupId)
+router.get('/groups/:groupId/members', authenticateToken, async (req, res) => {
+  const members = await e2eTrueService.getGroupMembers(req.params.groupId)
   res.json(members)
 })
 
 // === Encrypted Sender Key Distribution ===
 
 // Store encrypted sender key for a specific device (opaque to server)
-router.post('/groups/:groupId/sender-keys', authenticateToken, (req, res) => {
+router.post('/groups/:groupId/sender-keys', authenticateToken, async (req, res) => {
   const { epoch, toUserId, toDeviceId, encryptedKeyBlob, fromDeviceId } = req.body
   if (!epoch || !toUserId || !toDeviceId || !encryptedKeyBlob || !fromDeviceId) {
     return res.status(400).json({ error: 'epoch, toUserId, toDeviceId, fromDeviceId, and encryptedKeyBlob are required' })
   }
 
-  e2eTrueService.storeEncryptedSenderKey(
+  await e2eTrueService.storeEncryptedSenderKey(
     req.params.groupId, epoch,
     req.user.id, fromDeviceId,
     toUserId, toDeviceId,
@@ -162,7 +163,7 @@ router.post('/groups/:groupId/sender-keys', authenticateToken, (req, res) => {
 })
 
 // Batch distribute sender keys to all devices in a group
-router.post('/groups/:groupId/sender-keys/distribute', authenticateToken, (req, res) => {
+router.post('/groups/:groupId/sender-keys/distribute', authenticateToken, async (req, res) => {
   const { epoch, fromDeviceId, keys } = req.body
   // keys = [{ toUserId, toDeviceId, encryptedKeyBlob }, ...]
 
@@ -172,7 +173,7 @@ router.post('/groups/:groupId/sender-keys/distribute', authenticateToken, (req, 
 
   let distributed = 0
   for (const k of keys) {
-    e2eTrueService.storeEncryptedSenderKey(
+    await e2eTrueService.storeEncryptedSenderKey(
       req.params.groupId, epoch,
       req.user.id, fromDeviceId,
       k.toUserId, k.toDeviceId,
@@ -180,7 +181,7 @@ router.post('/groups/:groupId/sender-keys/distribute', authenticateToken, (req, 
     )
 
     // Queue for offline devices
-    e2eTrueService.queueKeyUpdate(k.toUserId, k.toDeviceId, {
+    await e2eTrueService.queueKeyUpdate(k.toUserId, k.toDeviceId, {
       groupId: req.params.groupId,
       epoch,
       encryptedKeyBlob: k.encryptedKeyBlob,
@@ -201,12 +202,32 @@ router.post('/groups/:groupId/sender-keys/distribute', authenticateToken, (req, 
   res.json({ success: true, distributed })
 })
 
+// Request sender keys from group members (relay only - server never sees key content)
+router.post('/groups/:groupId/sender-keys/request', authenticateToken, async (req, res) => {
+  const { deviceId } = req.body
+  if (!deviceId) return res.status(400).json({ error: 'deviceId is required' })
+
+  const members = await e2eTrueService.getGroupMembers(req.params.groupId)
+  if (!members || members.length === 0) {
+    return res.status(404).json({ error: 'Group not found or has no members' })
+  }
+
+  // Relay key request to all other group members via socket
+  io.to(`server:${req.params.groupId}`).emit('e2e:sender-key-request', {
+    groupId: req.params.groupId,
+    requestingUserId: req.user.id,
+    requestingDeviceId: deviceId
+  })
+
+  res.json({ success: true, message: 'Key request relayed to group members' })
+})
+
 // Fetch sender keys for my device
-router.get('/groups/:groupId/sender-keys/:epoch', authenticateToken, (req, res) => {
+router.get('/groups/:groupId/sender-keys/:epoch', authenticateToken, async (req, res) => {
   const { deviceId } = req.query
   if (!deviceId) return res.status(400).json({ error: 'deviceId query param required' })
 
-  const keys = e2eTrueService.getEncryptedSenderKeys(
+  const keys = await e2eTrueService.getEncryptedSenderKeys(
     req.params.groupId,
     parseInt(req.params.epoch),
     req.user.id,
@@ -219,33 +240,33 @@ router.get('/groups/:groupId/sender-keys/:epoch', authenticateToken, (req, res) 
 // === Queued Updates (for when device comes back online) ===
 
 // Fetch all queued key updates for my device
-router.get('/queue/key-updates', authenticateToken, (req, res) => {
+router.get('/queue/key-updates', authenticateToken, async (req, res) => {
   const { deviceId } = req.query
   if (!deviceId) return res.status(400).json({ error: 'deviceId query param required' })
 
-  const updates = e2eTrueService.dequeueKeyUpdates(req.user.id, deviceId)
+  const updates = await e2eTrueService.dequeueKeyUpdates(req.user.id, deviceId)
   res.json(updates)
 })
 
 // Fetch queued encrypted messages for my device
-router.get('/queue/messages', authenticateToken, (req, res) => {
+router.get('/queue/messages', authenticateToken, async (req, res) => {
   const { deviceId, limit } = req.query
   if (!deviceId) return res.status(400).json({ error: 'deviceId query param required' })
 
-  const messages = e2eTrueService.dequeueEncryptedMessages(req.user.id, deviceId, parseInt(limit) || 100)
+  const messages = await e2eTrueService.dequeueEncryptedMessages(req.user.id, deviceId, parseInt(limit) || 100)
   res.json(messages)
 })
 
 // === Safety Numbers ===
 
 // Compute safety number between two identity keys
-router.post('/safety-number', authenticateToken, (req, res) => {
+router.post('/safety-number', authenticateToken, async (req, res) => {
   const { myIdentityKey, theirIdentityKey } = req.body
   if (!myIdentityKey || !theirIdentityKey) {
     return res.status(400).json({ error: 'Both identity keys required' })
   }
 
-  const safetyNumber = e2eTrueService.computeSafetyNumber(myIdentityKey, theirIdentityKey)
+  const safetyNumber = await e2eTrueService.computeSafetyNumber(myIdentityKey, theirIdentityKey)
   res.json({ safetyNumber })
 })
 

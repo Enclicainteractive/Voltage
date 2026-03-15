@@ -1,44 +1,75 @@
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import * as crypto from './cryptoService.js'
+import { supportsDirectQuery, directQuery, FILES } from './dataService.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const E2E_FILE = path.join(DATA_DIR, 'e2e-keys.json')
+const E2E_FILE = FILES.e2eKeys
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true })
+let e2eCache = { servers: {} }
+let cacheLoaded = false
+
+const ensureCacheLoaded = async () => {
+  if (!cacheLoaded) {
+    if (supportsDirectQuery()) {
+      try {
+        const rows = await directQuery('SELECT * FROM e2e_keys')
+        if (rows && rows.length > 0) {
+          const servers = {}
+          for (const row of rows) {
+            servers[row.id] = JSON.parse(row.data || '{}')
+          }
+          e2eCache.servers = servers
+        }
+      } catch (err) {
+        console.error('[E2E] Error loading from DB:', err.message)
+      }
+    }
+    cacheLoaded = true
+  }
 }
 
 const loadData = (defaultValue = {}) => {
-  try {
-    if (fs.existsSync(E2E_FILE)) {
-      return JSON.parse(fs.readFileSync(E2E_FILE, 'utf8'))
-    }
-  } catch (err) {
-    console.error('[E2E] Error loading data:', err.message)
+  if (!cacheLoaded) {
+    ensureCacheLoaded().catch(err => console.error('[E2E] Failed to load cache:', err))
+    return { ...defaultValue, servers: {} }
   }
-  return defaultValue
+  return { ...e2eCache }
 }
 
-const saveData = (data) => {
-  try {
-    fs.writeFileSync(E2E_FILE, JSON.stringify(data, null, 2))
-    return true
-  } catch (err) {
-    console.error('[E2E] Error saving data:', err.message)
-    return false
+const saveData = async (data) => {
+  e2eCache = { ...data }
+  if (supportsDirectQuery()) {
+    try {
+      for (const [serverId, serverData] of Object.entries(data.servers || {})) {
+        await directQuery(
+          'INSERT OR REPLACE INTO e2e_keys (id, data, updatedAt) VALUES (?, ?, ?)',
+          [serverId, JSON.stringify(serverData), new Date().toISOString()]
+        )
+      }
+      console.log('[E2E] Saved to database')
+      return true
+    } catch (err) {
+      console.error('[E2E] Error saving to DB:', err.message)
+      return false
+    }
   }
+  return false
 }
 
 export const e2eService = {
+  async ensureLoaded() {
+    if (!cacheLoaded) {
+      await ensureCacheLoaded()
+    }
+  },
+
   getServerKeys(serverId) {
+    if (!cacheLoaded) {
+      ensureCacheLoaded().catch(err => console.error('[E2E] Failed to load cache:', err))
+    }
     const data = loadData()
     return data.servers?.[serverId] || null
   },
 
-  createServerKeys(serverId) {
+  async createServerKeys(serverId) {
     const data = loadData()
     
     const symmetricKey = crypto.generateSymmetricKey()
@@ -54,7 +85,7 @@ export const e2eService = {
       memberKeys: {}
     }
     
-    saveData(data)
+    await saveData(data)
     return data.servers[serverId]
   },
 
@@ -66,7 +97,7 @@ export const e2eService = {
     return keys
   },
 
-  enableServerEncryption(serverId) {
+  async enableServerEncryption(serverId) {
     const data = loadData()
     if (!data.servers?.[serverId]) {
       return this.createServerKeys(serverId)
@@ -74,11 +105,11 @@ export const e2eService = {
     
     data.servers[serverId].enabled = true
     data.servers[serverId].updatedAt = new Date().toISOString()
-    saveData(data)
+    await saveData(data)
     return data.servers[serverId]
   },
 
-  disableServerEncryption(serverId) {
+  async disableServerEncryption(serverId) {
     const data = loadData()
     if (!data.servers?.[serverId]) {
       return null
@@ -86,7 +117,7 @@ export const e2eService = {
     
     data.servers[serverId].enabled = false
     data.servers[serverId].updatedAt = new Date().toISOString()
-    saveData(data)
+    await saveData(data)
     return data.servers[serverId]
   },
 
@@ -106,11 +137,21 @@ export const e2eService = {
     return keys?.memberKeys || {}
   },
 
-  setMemberEncryptedKey(serverId, userId, encryptedKey) {
+  async setMemberEncryptedKey(serverId, userId, encryptedKey) {
     const data = loadData()
     
     if (!data.servers?.[serverId]) {
-      this.createServerKeys(serverId)
+      const symmetricKey = crypto.generateSymmetricKey()
+      const keyId = crypto.generateKeyIdentifier()
+      if (!data.servers) data.servers = {}
+      data.servers[serverId] = {
+        keyId,
+        symmetricKey: symmetricKey.toString('base64'),
+        enabled: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        memberKeys: {}
+      }
     }
     
     if (!data.servers[serverId].memberKeys) {
@@ -122,20 +163,20 @@ export const e2eService = {
       timestamp: new Date().toISOString()
     }
     
-    saveData(data)
+    await saveData(data)
     return true
   },
 
-  removeMemberKey(serverId, userId) {
+  async removeMemberKey(serverId, userId) {
     const data = loadData()
     if (data.servers?.[serverId]?.memberKeys?.[userId]) {
       delete data.servers[serverId].memberKeys[userId]
-      saveData(data)
+      await saveData(data)
     }
     return true
   },
 
-  rotateServerKey(serverId) {
+  async rotateServerKey(serverId) {
     const data = loadData()
     if (!data.servers?.[serverId]) {
       return this.createServerKeys(serverId)
@@ -149,15 +190,15 @@ export const e2eService = {
     data.servers[serverId].updatedAt = new Date().toISOString()
     data.servers[serverId].memberKeys = {}
     
-    saveData(data)
+    await saveData(data)
     return data.servers[serverId]
   },
 
-  deleteServerKeys(serverId) {
+  async deleteServerKeys(serverId) {
     const data = loadData()
     if (data.servers?.[serverId]) {
       delete data.servers[serverId]
-      saveData(data)
+      await saveData(data)
     }
     return true
   }
@@ -169,7 +210,7 @@ export const dmE2eService = {
     return data.dms?.[conversationId] || null
   },
 
-  createDmKeys(conversationId) {
+  async createDmKeys(conversationId) {
     const data = loadData()
     
     if (!data.dms) data.dms = {}
@@ -186,7 +227,7 @@ export const dmE2eService = {
       updatedAt: new Date().toISOString()
     }
     
-    saveData(data)
+    await saveData(data)
     return data.dms[conversationId]
   },
 
@@ -198,7 +239,7 @@ export const dmE2eService = {
     return keys
   },
 
-  enableDmEncryption(conversationId) {
+  async enableDmEncryption(conversationId) {
     const data = loadData()
     
     if (!data.dms?.[conversationId]) {
@@ -207,11 +248,11 @@ export const dmE2eService = {
     
     data.dms[conversationId].enabled = true
     data.dms[conversationId].updatedAt = new Date().toISOString()
-    saveData(data)
+    await saveData(data)
     return data.dms[conversationId]
   },
 
-  disableDmEncryption(conversationId) {
+  async disableDmEncryption(conversationId) {
     const data = loadData()
     if (!data.dms?.[conversationId]) {
       return null
@@ -219,7 +260,7 @@ export const dmE2eService = {
     
     data.dms[conversationId].enabled = false
     data.dms[conversationId].updatedAt = new Date().toISOString()
-    saveData(data)
+    await saveData(data)
     return data.dms[conversationId]
   },
 
@@ -234,11 +275,21 @@ export const dmE2eService = {
     return keys.symmetricKey ? Buffer.from(keys.symmetricKey, 'base64') : null
   },
 
-  setParticipantEncryptedKey(conversationId, userId, encryptedKey) {
+  async setParticipantEncryptedKey(conversationId, userId, encryptedKey) {
     const data = loadData()
     
     if (!data.dms?.[conversationId]) {
-      this.createDmKeys(conversationId)
+      if (!data.dms) data.dms = {}
+      const symmetricKey = crypto.generateSymmetricKey()
+      const keyId = crypto.generateKeyIdentifier()
+      data.dms[conversationId] = {
+        keyId,
+        symmetricKey: symmetricKey.toString('base64'),
+        enabled: false,
+        participants: {},
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
     }
     
     if (!data.dms[conversationId].participants) {
@@ -250,7 +301,7 @@ export const dmE2eService = {
       timestamp: new Date().toISOString()
     }
     
-    saveData(data)
+    await saveData(data)
     return true
   },
 
@@ -259,7 +310,7 @@ export const dmE2eService = {
     return keys?.participants || {}
   },
 
-  rotateDmKey(conversationId) {
+  async rotateDmKey(conversationId) {
     const data = loadData()
     if (!data.dms?.[conversationId]) {
       return this.createDmKeys(conversationId)
@@ -273,15 +324,15 @@ export const dmE2eService = {
     data.dms[conversationId].updatedAt = new Date().toISOString()
     data.dms[conversationId].participants = {}
     
-    saveData(data)
+    await saveData(data)
     return data.dms[conversationId]
   },
 
-  deleteDmKeys(conversationId) {
+  async deleteDmKeys(conversationId) {
     const data = loadData()
     if (data.dms?.[conversationId]) {
       delete data.dms[conversationId]
-      saveData(data)
+      await saveData(data)
     }
     return true
   }
@@ -293,7 +344,7 @@ export const userKeyService = {
     return data.users?.[userId] || null
   },
 
-  saveUserKeys(userId, keys) {
+  async saveUserKeys(userId, keys) {
     const data = loadData()
     
     if (!data.users) data.users = {}
@@ -306,11 +357,11 @@ export const userKeyService = {
       updatedAt: new Date().toISOString()
     }
     
-    saveData(data)
+    await saveData(data)
     return data.users[userId]
   },
 
-  updateUserKeys(userId, updates) {
+  async updateUserKeys(userId, updates) {
     const data = loadData()
     if (!data.users?.[userId]) {
       return null
@@ -322,15 +373,15 @@ export const userKeyService = {
       updatedAt: new Date().toISOString()
     }
     
-    saveData(data)
+    await saveData(data)
     return data.users[userId]
   },
 
-  deleteUserKeys(userId) {
+  async deleteUserKeys(userId) {
     const data = loadData()
     if (data.users?.[userId]) {
       delete data.users[userId]
-      saveData(data)
+      await saveData(data)
     }
     return true
   },

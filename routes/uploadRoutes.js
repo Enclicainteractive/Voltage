@@ -77,6 +77,11 @@ const upload = multer({
   }
 })
 
+const uploadFields = upload.fields([
+  { name: 'files', maxCount: 10 },
+  { name: 'file', maxCount: 10 }
+])
+
 // Determine file type category
 const getFileType = (mimetype, filename) => {
   const ext = path.extname(filename).toLowerCase()
@@ -116,16 +121,22 @@ const formatFileSize = (bytes) => {
   return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
 }
 
-// Upload endpoint
-router.post('/', authenticateToken, upload.array('files', 10), async (req, res) => {
+const handleUpload = async (req, res) => {
   try {
-    if (!req.files || req.files.length === 0) {
+    const uploadedFiles = Array.isArray(req.files)
+      ? req.files
+      : [
+          ...((req.files && Array.isArray(req.files.files)) ? req.files.files : []),
+          ...((req.files && Array.isArray(req.files.file)) ? req.files.file : [])
+        ]
+
+    if (!uploadedFiles || uploadedFiles.length === 0) {
       return res.status(400).json({ error: 'No files uploaded' })
     }
 
-    const serverId = req.body.serverId || null
+    const serverId = req.body.serverId || req.query.serverId || null
 
-    const attachments = await Promise.all(req.files.map(async (file) => {
+    const attachments = await Promise.all(uploadedFiles.map(async (file) => {
       const fileId = uuidv4()
       const ext = path.extname(file.originalname)
       const storedFilename = `${fileId}${ext}`
@@ -164,7 +175,11 @@ router.post('/', authenticateToken, upload.array('files', 10), async (req, res) 
     console.error('[API] Upload error:', err)
     res.status(500).json({ error: 'Upload failed', message: err.message })
   }
-})
+}
+
+// Upload endpoint
+router.post('/', authenticateToken, uploadFields, handleUpload)
+router.post('/file', authenticateToken, uploadFields, handleUpload)
 
 // Get file metadata
 router.get('/metadata/:fileId', authenticateToken, (req, res) => {
@@ -266,7 +281,7 @@ router.delete('/:fileId', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'File not found' })
     }
     
-    if (fileData.uploadedBy !== req.user.id && !req.user.isAdmin) {
+    if (fileData.uploadedBy !== req.user.id && !isAdminFlag(req.user.isAdmin)) {
       return res.status(403).json({ error: 'Not authorized to delete this file' })
     }
     
@@ -311,3 +326,4 @@ router.get('/cdn/status', authenticateToken, (req, res) => {
 })
 
 export default router
+const isAdminFlag = (value) => value === true || value === 1 || value === '1' || value === 'true'

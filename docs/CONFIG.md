@@ -829,10 +829,10 @@ Configure authentication methods.
       "provider": "enclica",
       "enclica": {
         "clientId": "app_xxx",
-        "authUrl": "https://voltchatapp.enclicainteractive.com/oauth/authorize",
-        "tokenUrl": "https://voltchatapp.enclicainteractive.com/api/oauth/token",
-        "userInfoUrl": "https://voltchatapp.enclicainteractive.com/api/user/me",
-        "revokeUrl": "https://voltchatapp.enclicainteractive.com/api/oauth/revoke"
+        "authUrl": "https://api.enclicainteractive.com/oauth/authorize",
+        "tokenUrl": "https://api.enclicainteractive.com/api/oauth/token",
+        "userInfoUrl": "https://api.enclicainteractive.com/api/user/me",
+        "revokeUrl": "https://api.enclicainteractive.com/api/oauth/revoke"
       }
     }
   }

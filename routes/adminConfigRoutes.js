@@ -509,19 +509,13 @@ router.get('/logs', authenticateToken, requireOwner, async (req, res) => {
       }
     }
 
-    let adminLogs = {}
-    const adminLogPath = path.join(DATA_DIR, 'admin-logs.json')
-    if (fs.existsSync(adminLogPath)) {
-      try {
-        adminLogs = JSON.parse(fs.readFileSync(adminLogPath, 'utf8'))
-      } catch {
-        adminLogs = {}
-      }
+    let recentAdminActions = []
+    try {
+      const { adminLogService } = await import('../services/dataService.js')
+      recentAdminActions = adminLogService.getLogs(lines)
+    } catch {
+      recentAdminActions = []
     }
-
-    const recentAdminActions = Object.values(adminLogs)
-      .sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
-      .slice(0, lines)
 
     res.json({
       success: true,

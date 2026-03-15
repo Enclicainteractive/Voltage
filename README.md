@@ -88,9 +88,9 @@ Create a `config.json` in the backend directory or use environment variables.
       "provider": "enclica",
       "enclica": {
         "clientId": "your-client-id",
-        "authUrl": "https://enclica.com/oauth/authorize",
-        "tokenUrl": "https://api.enclica.com/api/oauth/token",
-        "userInfoUrl": "https://api.enclica.com/api/user/me"
+        "authUrl": "https://api.enclicainteractive.com/oauth/authorize",
+        "tokenUrl": "https://api.enclicainteractive.com/api/oauth/token",
+        "userInfoUrl": "https://api.enclicainteractive.com/api/user/me"
       }
     }
   }

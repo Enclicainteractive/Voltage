@@ -31,6 +31,393 @@ const TABLES = [
   'admin_logs'
 ]
 
+const getAllowedStorageTableNames = () => {
+  const schemaTables = typeof TABLE_SCHEMAS === 'object' && TABLE_SCHEMAS
+    ? Object.keys(TABLE_SCHEMAS)
+    : []
+  return new Set([...TABLES, ...schemaTables, 'storage_kv'])
+}
+
+const assertSafeTableName = (tableName) => {
+  const normalized = String(tableName || '').trim()
+  if (!/^[a-z0-9_]+$/i.test(normalized)) {
+    throw new Error(`Unsafe table name: ${tableName}`)
+  }
+  if (!getAllowedStorageTableNames().has(normalized)) {
+    throw new Error(`Unknown table name: ${tableName}`)
+  }
+  return normalized
+}
+
+const normalizeFriendRequestRow = (row = {}) => {
+  const from = row.fromUserId || row.from || null
+  const to = row.toUserId || row.to || null
+  return {
+    id: row.id,
+    from,
+    to,
+    fromUsername: row.fromUsername || null,
+    toUsername: row.toUsername || null,
+    createdAt: row.createdAt || null,
+    status: row.status || null,
+    respondedAt: row.respondedAt || null
+  }
+}
+
+const isPendingFriendRequest = (status) => {
+  if (status === null || status === undefined) return true
+  const normalized = String(status).trim().toLowerCase()
+  return normalized === '' || normalized === 'pending'
+}
+
+const buildFriendRequestsStateFromRows = (rows = []) => {
+  const result = { incoming: {}, outgoing: {} }
+  const incomingSeen = new Set()
+  const outgoingSeen = new Set()
+
+  for (const row of rows) {
+    const req = normalizeFriendRequestRow(row)
+    if (!req.id || !req.from || !req.to) continue
+    if (!isPendingFriendRequest(req.status)) continue
+
+    const direction = row.direction || null
+    const inKey = `${req.to}:${req.id}`
+    const outKey = `${req.from}:${req.id}`
+
+    if (direction === 'incoming' || !direction) {
+      if (!result.incoming[req.to]) result.incoming[req.to] = []
+      if (!incomingSeen.has(inKey)) {
+        result.incoming[req.to].push(req)
+        incomingSeen.add(inKey)
+      }
+    }
+
+    if (direction === 'outgoing' || !direction) {
+      if (!result.outgoing[req.from]) result.outgoing[req.from] = []
+      if (!outgoingSeen.has(outKey)) {
+        result.outgoing[req.from].push(req)
+        outgoingSeen.add(outKey)
+      }
+    }
+  }
+
+  return result
+}
+
+const safeJsonParse = (value, fallback = null) => {
+  if (value === null || value === undefined) return fallback
+  if (typeof value !== 'string') return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return fallback
+  }
+}
+
+const extractColumnMeta = (column) => {
+  const actual = column?.Field || column?.field || column?.COLUMN_NAME || column?.column_name || column
+  const type = String(column?.Type || column?.type || column?.DATA_TYPE || column?.data_type || '').trim()
+  const typeLower = type.toLowerCase()
+  const maxLengthMatch = typeLower.match(/\((\d+)\)/)
+  return {
+    actual,
+    normalized: normalizeColumnToken(actual),
+    type,
+    typeLower,
+    maxLength: maxLengthMatch ? Number(maxLengthMatch[1]) : null
+  }
+}
+
+const formatSqlDateTime = (value) => {
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  const yyyy = date.getUTCFullYear()
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(date.getUTCDate()).padStart(2, '0')
+  const hh = String(date.getUTCHours()).padStart(2, '0')
+  const mi = String(date.getUTCMinutes()).padStart(2, '0')
+  const ss = String(date.getUTCSeconds()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`
+}
+
+const normalizeSqlValue = (value, columnMeta = null) => {
+  if (value === undefined || value === null) return null
+
+  const typeLower = columnMeta?.typeLower || ''
+  if (typeLower.includes('date') || typeLower.includes('time')) {
+    if (typeof value === 'string' || value instanceof Date) {
+      return formatSqlDateTime(value)
+    }
+  }
+
+  if (typeLower.includes('tinyint(1)') || typeLower === 'boolean' || typeLower === 'bool') {
+    if (typeof value === 'string') {
+      const lowered = value.trim().toLowerCase()
+      if (lowered === 'true') return 1
+      if (lowered === 'false') return 0
+    }
+  }
+
+  if (typeof value === 'boolean') return value ? 1 : 0
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null
+    if (typeLower.includes('char') || typeLower.includes('text')) {
+      return String(value)
+    }
+    return value
+  }
+
+  let normalized = value
+  if (typeof normalized === 'object') {
+    normalized = JSON.stringify(normalized)
+  }
+
+  if (typeof normalized !== 'string') {
+    normalized = String(normalized)
+  }
+
+  if (columnMeta?.maxLength && !typeLower.includes('text') && !typeLower.includes('blob') && normalized.length > columnMeta.maxLength) {
+    normalized = normalized.slice(0, columnMeta.maxLength)
+  }
+
+  return normalized
+}
+
+const normalizeColumnToken = (value) => String(value || '').replace(/[^a-z0-9]/gi, '').toLowerCase()
+
+const hasMeaningfulValue = (value) => {
+  if (value === null || value === undefined) return false
+  const normalized = String(value).trim()
+  return normalized !== '' && normalized !== '0' && normalized.toLowerCase() !== 'null'
+}
+
+const toSnakeCase = (value) => String(value || '')
+  .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+  .replace(/[\s-]+/g, '_')
+  .toLowerCase()
+
+const mapActualColumnsByNormalized = (columns = []) => {
+  const byNormalized = new Map()
+  for (const column of columns) {
+    const meta = extractColumnMeta(column)
+    if (meta.actual && meta.normalized && !byNormalized.has(meta.normalized)) {
+      byNormalized.set(meta.normalized, meta)
+    }
+  }
+  return byNormalized
+}
+
+const getAvailableColumnSet = (columns = []) => new Set(
+  (columns || []).map(column => column?.Field || column?.field || column?.COLUMN_NAME || column?.column_name || column).filter(Boolean)
+)
+
+const TABLE_COLUMN_ALIASES = {
+  users: {
+    birthDate: ['birth_date'],
+    ageVerificationJurisdiction: ['age_verification_jurisdiction']
+  },
+  messages: {
+    authorId: ['userId'],
+    userId: ['authorId'],
+    createdAt: ['timestamp'],
+    timestamp: ['createdAt'],
+    mentions: ['mentions_json'],
+    storage: ['storage_json']
+  }
+}
+
+const getAliasCandidates = (table, canonicalName) => {
+  const aliases = TABLE_COLUMN_ALIASES[table]?.[canonicalName] || []
+  return [canonicalName, toSnakeCase(canonicalName), ...aliases]
+}
+
+const getActualColumnName = (canonicalName, availableColumns = new Map(), table = null) => {
+  if (!canonicalName) return null
+  const candidates = getAliasCandidates(table, canonicalName)
+  for (const candidate of candidates) {
+    const meta = availableColumns.get(normalizeColumnToken(candidate))
+    if (meta?.actual) return meta.actual
+  }
+  return null
+}
+
+const getActualColumnMeta = (canonicalName, availableColumns = new Map(), table = null) => {
+  if (!canonicalName) return null
+  const candidates = getAliasCandidates(table, canonicalName)
+  for (const candidate of candidates) {
+    const meta = availableColumns.get(normalizeColumnToken(candidate))
+    if (meta?.actual) return meta
+  }
+  return null
+}
+
+const getRecordValueForColumn = (record = {}, canonicalName, actualName = null, table = null) => {
+  if (!record || typeof record !== 'object') return undefined
+  const candidates = [
+    ...getAliasCandidates(table, canonicalName),
+    actualName,
+  ].filter(Boolean)
+
+  for (const candidate of candidates) {
+    if (Object.prototype.hasOwnProperty.call(record, candidate)) {
+      return record[candidate]
+    }
+  }
+
+  const normalizedCandidates = new Set(candidates.map(normalizeColumnToken))
+  for (const [key, value] of Object.entries(record)) {
+    if (normalizedCandidates.has(normalizeColumnToken(key))) {
+      return value
+    }
+  }
+
+  return undefined
+}
+
+const mapRowToCanonicalColumns = (row = {}, schemaColumns = [], table = null) => {
+  const canonicalByNormalized = new Map(schemaColumns.map(column => [normalizeColumnToken(column), column]))
+  const aliases = TABLE_COLUMN_ALIASES[table] || {}
+  for (const [canonical, aliasList] of Object.entries(aliases)) {
+    for (const alias of aliasList) {
+      const normalized = normalizeColumnToken(alias)
+      if (!canonicalByNormalized.has(normalized)) {
+        canonicalByNormalized.set(normalized, canonical)
+      }
+    }
+  }
+  const mapped = {}
+
+  for (const [key, value] of Object.entries(row || {})) {
+    const canonicalKey = canonicalByNormalized.get(normalizeColumnToken(key)) || key
+    mapped[canonicalKey] = value
+  }
+
+  return mapped
+}
+
+const normalizeLoadedRecord = (table, record = {}) => {
+  if (!record || typeof record !== 'object') return record
+
+  if (table === 'users') {
+    if (hasMeaningfulValue(record.birth_date) && !hasMeaningfulValue(record.birthDate)) {
+      record.birthDate = record.birth_date
+    } else if (hasMeaningfulValue(record.birthDate) && !hasMeaningfulValue(record.birth_date)) {
+      record.birth_date = record.birthDate
+    }
+    if (hasMeaningfulValue(record.age_verification_jurisdiction) && !hasMeaningfulValue(record.ageVerificationJurisdiction)) {
+      record.ageVerificationJurisdiction = record.age_verification_jurisdiction
+    } else if (hasMeaningfulValue(record.ageVerificationJurisdiction) && !hasMeaningfulValue(record.age_verification_jurisdiction)) {
+      record.age_verification_jurisdiction = record.ageVerificationJurisdiction
+    }
+  }
+
+  if (table === 'messages') {
+    if (record.userId === undefined && record.authorId !== undefined) record.userId = record.authorId
+    if (record.authorId === undefined && record.userId !== undefined) record.authorId = record.userId
+    if (record.createdAt === undefined && record.timestamp !== undefined) record.createdAt = record.timestamp
+    if (record.timestamp === undefined && record.createdAt !== undefined) record.timestamp = record.createdAt
+    if (record.mentions === undefined && record.mentions_json !== undefined) record.mentions = record.mentions_json
+    if (record.storage === undefined && record.storage_json !== undefined) record.storage = record.storage_json
+  }
+
+  return record
+}
+
+const normalizeDmConversationRow = (row = {}) => {
+  const parsedParticipants = safeJsonParse(row.participants_json, [])
+  let participants = Array.isArray(parsedParticipants) ? parsedParticipants.filter(Boolean) : []
+  if (participants.length === 0 && typeof row.participantKey === 'string' && row.participantKey.includes(':')) {
+    participants = row.participantKey.split(':').filter(Boolean)
+  }
+  if (participants.length === 0) {
+    participants = [row.ownerId, row.recipientId].filter(Boolean)
+  }
+  participants = Array.from(new Set(participants))
+
+  const isGroup = row.isGroup === true || row.isGroup === 1 || row.isGroup === '1'
+  return {
+    id: row.id,
+    participantKey: row.participantKey || participants.slice().sort().join(':'),
+    participants,
+    createdAt: row.createdAt || null,
+    lastMessageAt: row.lastMessageAt || row.createdAt || null,
+    isGroup,
+    groupName: row.groupName || null,
+    ownerId: row.ownerId || null,
+    recipientId: row.recipientId || null
+  }
+}
+
+const buildDmsStateFromRows = (rows = []) => {
+  const result = {}
+  const seen = new Set()
+  for (const row of rows) {
+    const conversation = normalizeDmConversationRow(row)
+    if (!conversation.id) continue
+    const participants = Array.isArray(conversation.participants) ? conversation.participants : []
+    if (participants.length === 0) continue
+
+    for (const userId of participants) {
+      if (!result[userId]) result[userId] = []
+      const key = `${userId}:${conversation.id}`
+      if (seen.has(key)) continue
+      const other = participants.find(p => p !== userId) || null
+      result[userId].push({
+        ...conversation,
+        recipientId: conversation.isGroup ? null : (conversation.recipientId && conversation.recipientId !== userId ? conversation.recipientId : other)
+      })
+      seen.add(key)
+    }
+  }
+  return result
+}
+
+const normalizeDmMessageRow = (row = {}) => {
+  const mentions = safeJsonParse(row.mentions_json, row.mentions_json || [])
+  const storage = safeJsonParse(row.storage_json, row.storage_json || null)
+  const replyTo = safeJsonParse(row.replyTo, row.replyTo || null)
+  const attachments = safeJsonParse(row.attachments, row.attachments || [])
+  return {
+    id: row.id,
+    conversationId: row.conversationId || null,
+    userId: row.userId || null,
+    username: row.username || null,
+    avatar: row.avatar || null,
+    content: row.content || '',
+    bot: row.bot === true || row.bot === 1 || row.bot === '1',
+    encrypted: row.encrypted === true || row.encrypted === 1 || row.encrypted === '1',
+    iv: row.iv || null,
+    epoch: row.epoch || null,
+    timestamp: row.timestamp || row.createdAt || null,
+    mentions: Array.isArray(mentions) ? mentions : [],
+    storage,
+    edited: row.edited === true || row.edited === 1 || row.edited === '1',
+    editedAt: row.editedAt || null,
+    replyTo,
+    attachments: Array.isArray(attachments) ? attachments : [],
+    keyVersion: row.keyVersion || null,
+    createdAt: row.createdAt || row.timestamp || null
+  }
+}
+
+const buildDmMessagesStateFromRows = (rows = []) => {
+  const result = {}
+  for (const row of rows) {
+    const message = normalizeDmMessageRow(row)
+    if (!message.id || !message.conversationId) continue
+    if (!result[message.conversationId]) result[message.conversationId] = []
+    result[message.conversationId].push(message)
+  }
+  for (const list of Object.values(result)) {
+    list.sort((a, b) => {
+      const at = new Date(a.timestamp || a.createdAt || 0).getTime()
+      const bt = new Date(b.timestamp || b.createdAt || 0).getTime()
+      return at - bt
+    })
+  }
+  return result
+}
+
 const initJsonStorage = () => {
   const storageConfig = config.config.storage
   const dataDir = storageConfig.json?.dataDir || path.join(__dirname, '..', 'data')
@@ -126,9 +513,25 @@ const initSqliteStorage = () => {
       status TEXT DEFAULT 'offline',
       socialLinks TEXT,
       ageVerification TEXT,
+      ageVerificationJurisdiction TEXT,
       host TEXT,
       createdAt TEXT,
-      updatedAt TEXT
+      updatedAt TEXT,
+      customUsername TEXT,
+      avatarHost TEXT,
+      adminRole TEXT,
+      proofSummary TEXT,
+      device TEXT,
+      isAdmin INTEGER DEFAULT 0,
+      isModerator INTEGER DEFAULT 0,
+      profileTheme TEXT,
+      profileBackground TEXT,
+      profileAccentColor TEXT,
+      profileFont TEXT,
+      profileAnimation TEXT,
+      profileBackgroundType TEXT,
+      profileBackgroundOpacity INTEGER DEFAULT 100,
+      birthDate TEXT
     );
     
     CREATE TABLE IF NOT EXISTS friends (
@@ -203,9 +606,23 @@ const initSqliteStorage = () => {
     
     CREATE TABLE IF NOT EXISTS dm_messages (
       id TEXT PRIMARY KEY,
-      dmId TEXT NOT NULL,
-      senderId TEXT NOT NULL,
+      conversationId TEXT,
+      userId TEXT,
+      username TEXT,
+      avatar TEXT,
       content TEXT,
+      bot INTEGER DEFAULT 0,
+      encrypted INTEGER DEFAULT 0,
+      iv TEXT,
+      epoch TEXT,
+      timestamp TEXT,
+      mentions_json TEXT,
+      storage_json TEXT,
+      edited INTEGER DEFAULT 0,
+      editedAt TEXT,
+      replyTo TEXT,
+      attachments TEXT,
+      keyVersion TEXT,
       createdAt TEXT
     );
     
@@ -286,11 +703,12 @@ const initSqliteStorage = () => {
     provider: 'sqlite',
     db,
     load(table, defaultValue = {}) {
+      const safeTable = assertSafeTableName(table)
       try {
         // First, try to load from individual table (after distribution)
-        const tableCheck = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table)
+        const tableCheck = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(safeTable)
         if (tableCheck) {
-          const rows = db.prepare(`SELECT * FROM ${table}`).all()
+          const rows = db.prepare(`SELECT * FROM ${safeTable}`).all()
           const result = {}
           for (const row of rows) {
             const id = row.id || row.code || row.serverId || row.userId
@@ -321,7 +739,7 @@ const initSqliteStorage = () => {
         // Fall back to storage_kv if it exists (for migration)
         try {
           const kvStmt = db.prepare('SELECT data FROM storage_kv WHERE id = ?')
-          const kvRow = kvStmt.get(table)
+          const kvRow = kvStmt.get(safeTable)
           if (kvRow?.data) {
             try {
               return JSON.parse(kvRow.data)
@@ -339,64 +757,122 @@ const initSqliteStorage = () => {
         return defaultValue
       }
     },
-    save(table, data) {
-      try {
-        // Check if individual table exists
-        const tableCheck = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table)
-        
-        if (tableCheck) {
-          // Save to individual table
-          const schema = TABLE_SCHEMAS[table]
-          const columns = schema?.columns || ['id', 'data']
-          
-          // Clear existing data and insert new
-          db.exec(`DELETE FROM ${table}`)
-          
-          if (typeof data === 'object' && data !== null) {
-            const placeholders = columns.map(() => '?').join(', ')
-            const insertStmt = db.prepare(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`)
-            
-            for (const [key, value] of Object.entries(data)) {
-              try {
-                const record = typeof value === 'object' ? { id: key, ...value } : { id: key, data: value }
-                const values = columns.map(col => {
-                  const val = record[col]
-                  if (val === undefined || val === null) return null
-                  if (typeof val === 'object') return JSON.stringify(val)
-                  return String(val)
-                })
-                insertStmt.run(values)
-              } catch (err) {
-                console.error(`[Storage] Error inserting record into ${table}:`, err.message)
-              }
-            }
-          }
-          return true
-        }
-        
-        // Fall back to storage_kv for tables without individual schemas
-        try {
-          const upsert = db.prepare(`
-            INSERT INTO storage_kv (id, data) VALUES (?, ?)
-            ON CONFLICT(id) DO UPDATE SET data = excluded.data
-          `)
-          upsert.run(table, JSON.stringify(data ?? {}))
-          return true
-        } catch {
-          // storage_kv might not exist after distribution, create it temporarily
-          db.exec(`CREATE TABLE IF NOT EXISTS storage_kv (id TEXT PRIMARY KEY, data TEXT NOT NULL)`)
-          const upsert = db.prepare(`
-            INSERT INTO storage_kv (id, data) VALUES (?, ?)
-            ON CONFLICT(id) DO UPDATE SET data = excluded.data
-          `)
-          upsert.run(table, JSON.stringify(data ?? {}))
-          return true
-        }
-      } catch (err) {
-        console.error(`[Storage] Error saving ${table}:`, err.message)
-        return false
-      }
-    }
+     save(table, data) {
+       const safeTable = assertSafeTableName(table)
+       try {
+         // Check if individual table exists
+         const tableCheck = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(safeTable)
+         
+           if (tableCheck) {
+           // Save to individual table
+           const schema = TABLE_SCHEMAS[safeTable]
+           const columns = schema?.columns || ['id', 'data']
+
+           // Flatten nested data for channels and categories (serverId-keyed arrays)
+           let processedData = data
+           if (typeof data === 'object' && data !== null && (safeTable === 'channels' || safeTable === 'categories')) {
+             const sampleVal = Object.values(data)[0]
+             if (Array.isArray(sampleVal)) {
+               processedData = {}
+               for (const [parentKey, items] of Object.entries(data)) {
+                 if (Array.isArray(items)) {
+                   for (const item of items) {
+                     if (item && typeof item === 'object' && item.id) {
+                       // Ensure serverId is present for channels/categories
+                       if (!item.serverId) {
+                         item.serverId = parentKey
+                       }
+                       processedData[item.id] = item
+                     }
+                   }
+                 }
+               }
+             }
+           }
+           
+           if (typeof processedData === 'object' && processedData !== null) {
+             if (schema?.dataFormat === 'messages') {
+                const availableColumns = new Set(columns)
+                for (const [channelId, messages] of Object.entries(processedData)) {
+                  if (!Array.isArray(messages)) continue
+                  for (const msg of messages) {
+                    if (!msg || typeof msg !== 'object' || !msg.id) continue
+                    try {
+                      // Resolve the user identifier - userId and authorId must always be the same
+                      const userIdentifier = msg.userId || msg.authorId || null
+                      const record = {
+                        id: msg.id,
+                        channelId: msg.channelId || channelId,
+                        userId: userIdentifier,
+                        authorId: userIdentifier,
+                        content: msg.content || null,
+                        type: msg.type || 'message',
+                        createdAt: msg.createdAt || msg.timestamp || null,
+                        updatedAt: msg.updatedAt || null,
+                        mentions: JSON.stringify(Array.isArray(msg.mentions) ? msg.mentions : []),
+                        attachments: JSON.stringify(Array.isArray(msg.attachments) ? msg.attachments : []),
+                        embeds: JSON.stringify(Array.isArray(msg.embeds) ? msg.embeds : []),
+                        replyTo: msg.replyTo ? JSON.stringify(msg.replyTo) : null,
+                        edited: msg.edited ? 1 : 0,
+                        editedAt: msg.editedAt || null,
+                        username: msg.username || null,
+                        avatar: msg.avatar || null,
+                        storage: msg.storage ? JSON.stringify(msg.storage) : null,
+                        encrypted: msg.encrypted ? 1 : 0,
+                        iv: msg.iv || null,
+                        epoch: msg.epoch ?? null,
+                        bot: msg.bot ? 1 : 0,
+                        timestamp: msg.timestamp || msg.createdAt || null
+                      }
+                     const values = columns.map(col => availableColumns.has(col) ? normalizeSqlValue(record[col]) : null)
+                     insertStmt.run(values)
+                   } catch (err) {
+                     console.error(`[Storage] Error inserting message into ${safeTable}:`, err.message)
+                   }
+                 }
+               }
+               return true
+             }
+
+             const placeholders = columns.map(() => '?').join(', ')
+             const insertStmt = db.prepare(`INSERT INTO ${safeTable} (${columns.join(', ')}) VALUES (${placeholders})`)
+             
+             for (const [key, value] of Object.entries(processedData)) {
+               try {
+                 const record = typeof value === 'object' ? { id: key, ...value } : { id: key, data: value }
+                 const values = columns.map(col => normalizeSqlValue(record[col]))
+                 insertStmt.run(values)
+               } catch (err) {
+                 console.error(`[Storage] Error inserting record into ${safeTable}:`, err.message)
+               }
+             }
+           }
+           return true
+         }
+         
+         // Fall back to storage_kv for tables without individual schemas
+         try {
+           const upsert = db.prepare(`
+             INSERT INTO storage_kv (id, data) VALUES (?, ?)
+             ON CONFLICT(id) DO UPDATE SET data = excluded.data
+           `)
+           upsert.run(safeTable, JSON.stringify(data ?? {}))
+           return true
+         } catch {
+           // storage_kv might not exist after distribution, create it temporarily
+           db.exec(`CREATE TABLE IF NOT EXISTS storage_kv (id TEXT PRIMARY KEY, data TEXT NOT NULL)`)
+           const upsert = db.prepare(`
+             INSERT INTO storage_kv (id, data) VALUES (?, ?)
+             ON CONFLICT(id) DO UPDATE SET data = excluded.data
+           `)
+           upsert.run(safeTable, JSON.stringify(data ?? {}))
+           return true
+         }
+       } catch (err) {
+         console.error(`[Storage] Error saving ${safeTable}:`, err.message)
+         return false
+       }
+     }
   }
 }
 
@@ -444,9 +920,25 @@ const initMysqlStorage = () => {
             status VARCHAR(50) DEFAULT 'offline',
             socialLinks TEXT,
             ageVerification TEXT,
+            ageVerificationJurisdiction TEXT,
             host VARCHAR(255),
             createdAt TEXT,
-            updatedAt TEXT
+            updatedAt TEXT,
+            customUsername VARCHAR(255),
+            avatarHost VARCHAR(255),
+            adminRole VARCHAR(50),
+            proofSummary TEXT,
+            device VARCHAR(50),
+            isAdmin INT DEFAULT 0,
+            isModerator INT DEFAULT 0,
+            profileTheme LONGTEXT,
+            profileBackground TEXT,
+            profileAccentColor VARCHAR(20),
+            profileFont VARCHAR(50),
+            profileAnimation VARCHAR(20),
+            profileBackgroundType VARCHAR(20),
+            profileBackgroundOpacity INT DEFAULT 100,
+            birthDate VARCHAR(20)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `)
         
@@ -508,6 +1000,21 @@ const initMysqlStorage = () => {
             type VARCHAR(50) DEFAULT 'text',
             createdAt TEXT,
             updatedAt TEXT,
+            mentions TEXT,
+            attachments TEXT,
+            embeds TEXT,
+            replyTo TEXT,
+            edited TINYINT DEFAULT 0,
+            editedAt TEXT,
+            username TEXT,
+            avatar TEXT,
+            storage TEXT,
+            encrypted TINYINT DEFAULT 0,
+            iv TEXT,
+            epoch INT DEFAULT 0,
+            bot TINYINT DEFAULT 0,
+            ui TEXT,
+            timestamp TEXT,
             INDEX idx_channelId (channelId),
             INDEX idx_authorId (authorId),
             INDEX idx_createdAt (createdAt)
@@ -549,9 +1056,23 @@ const initMysqlStorage = () => {
         await conn.execute(`
           CREATE TABLE IF NOT EXISTS dm_messages (
             id VARCHAR(255) PRIMARY KEY,
-            conversationId VARCHAR(255) NOT NULL,
-            authorId VARCHAR(255) NOT NULL,
+            conversationId VARCHAR(255),
+            userId VARCHAR(255),
+            username VARCHAR(255),
+            avatar TEXT,
             content TEXT,
+            bot BOOLEAN DEFAULT FALSE,
+            encrypted BOOLEAN DEFAULT FALSE,
+            iv VARCHAR(255),
+            epoch VARCHAR(255),
+            timestamp TEXT,
+            mentions_json TEXT,
+            storage_json TEXT,
+            edited BOOLEAN DEFAULT FALSE,
+            editedAt TEXT,
+            replyTo TEXT,
+            attachments TEXT,
+            keyVersion VARCHAR(255),
             createdAt TEXT,
             INDEX idx_conversationId (conversationId),
             INDEX idx_createdAt (createdAt)
@@ -659,13 +1180,135 @@ const initMysqlStorage = () => {
       provider: 'mysql',
       pool,
       load: async (table, defaultValue = {}) => {
+        const safeTable = assertSafeTableName(table)
         try {
           await ready
           
+          const schema = TABLE_SCHEMAS[safeTable]
+          
           // First, try to load from individual table
           try {
-            const [rows] = await pool.execute(`SELECT * FROM ${table}`)
+            const [rows] = await pool.execute(`SELECT * FROM ${safeTable}`)
             if (rows.length > 0) {
+              // Handle special data formats
+              if (schema?.dataFormat === 'friends_list') {
+                // Friends: { userId: [friendId1, friendId2, ...] }
+                const result = {}
+                for (const row of rows) {
+                  if (row.userId && row.friendId) {
+                    if (!result[row.userId]) {
+                      result[row.userId] = []
+                    }
+                    result[row.userId].push(row.friendId)
+                  }
+                }
+                return result
+              }
+              
+              if (schema?.dataFormat === 'nested_array') {
+                // Blocked: { userId: [blockedUserId1, blockedUserId2, ...] }
+                const result = {}
+                for (const row of rows) {
+                  if (row.userId && row.blockedUserId) {
+                    if (!result[row.userId]) {
+                      result[row.userId] = []
+                    }
+                    result[row.userId].push(row.blockedUserId)
+                  }
+                }
+                return result
+              }
+              
+              if (schema?.dataFormat === 'friend_requests') {
+                return buildFriendRequestsStateFromRows(rows)
+              }
+
+              if (schema?.dataFormat === 'dm_conversations') {
+                return buildDmsStateFromRows(rows)
+              }
+
+              if (schema?.dataFormat === 'dm_messages') {
+                return buildDmMessagesStateFromRows(rows)
+              }
+
+              if (safeTable === 'discovery') {
+                // Discovery: { submissions: [...], approved: [...] }
+                const result = { submissions: [], approved: [] }
+                for (const row of rows) {
+                  const entry = {
+                    serverId: row.serverId,
+                    name: row.name,
+                    icon: row.icon,
+                    description: row.description,
+                    category: row.category,
+                    memberCount: row.memberCount,
+                    submittedBy: row.submittedBy,
+                    submittedAt: row.submittedAt,
+                    status: row.status,
+                    approvedAt: row.approvedAt
+                  }
+                  if (row.status === 'approved') {
+                    result.approved.push(entry)
+                  } else {
+                    result.submissions.push(entry)
+                  }
+                }
+                return result
+              }
+              
+              if (schema?.dataFormat === 'reactions') {
+                // Reactions: { messageId: { emoji: [userIds] } }
+                const result = {}
+                for (const row of rows) {
+                  if (row.messageId && row.emoji) {
+                    if (!result[row.messageId]) {
+                      result[row.messageId] = {}
+                    }
+                    try {
+                      result[row.messageId][row.emoji] = typeof row.userIds === 'string' ? JSON.parse(row.userIds) : row.userIds
+                    } catch {
+                      result[row.messageId][row.emoji] = []
+                    }
+                  }
+                }
+                return result
+              }
+              
+              if (schema?.dataFormat === 'json_blob') {
+                // JSON blob: { id: { ...data }, ... }
+                const result = {}
+                for (const row of rows) {
+                  if (row.id && row.data) {
+                    try {
+                      result[row.id] = typeof row.data === 'string' ? JSON.parse(row.data) : row.data
+                    } catch {
+                      result[row.id] = row.data
+                    }
+                  }
+                }
+                return result
+              }
+              
+              if (schema?.dataFormat === 'array') {
+                // Array format: [{ ...record }, ...]
+                return rows.map(row => {
+                  const parsed = {}
+                  for (const [key, value] of Object.entries(row)) {
+                    if (typeof value === 'string' && (value.startsWith('{') || value.startsWith('['))) {
+                      try {
+                        parsed[key] = JSON.parse(value)
+                      } catch {
+                        parsed[key] = value
+                      }
+                    } else {
+                      parsed[key] = value
+                    }
+                  }
+                  return parsed
+                })
+              }
+              
+              // Default object format
               const result = {}
               for (const row of rows) {
                 const id = row.id || row.code || row.serverId || row.userId
@@ -697,7 +1340,7 @@ const initMysqlStorage = () => {
 
           // Fall back to storage_kv if it exists (for migration)
           try {
-            const [kvRows] = await pool.execute('SELECT data FROM storage_kv WHERE id = ? LIMIT 1', [table])
+            const [kvRows] = await pool.execute('SELECT data FROM storage_kv WHERE id = ? LIMIT 1', [safeTable])
             if (Array.isArray(kvRows) && kvRows[0]?.data) {
               try {
                 return JSON.parse(kvRows[0].data)
@@ -711,45 +1354,285 @@ const initMysqlStorage = () => {
 
           return defaultValue
         } catch (err) {
-          console.error(`[Storage] Error loading ${table}:`, err.message)
+          console.error(`[Storage] Error loading ${safeTable}:`, err.message)
           return defaultValue
         }
       },
       save: async (table, data) => {
+        const safeTable = assertSafeTableName(table)
         try {
           await ready
           const conn = await pool.getConnection()
           try {
             // Check if individual table exists
-            const [tables] = await conn.query(`SHOW TABLES LIKE ?`, [table])
+            const [tables] = await conn.query(`SHOW TABLES LIKE ?`, [safeTable])
             
             if (tables.length > 0) {
               // Save to individual table
-              const schema = TABLE_SCHEMAS[table]
+              const schema = TABLE_SCHEMAS[safeTable]
               const columns = schema?.columns || ['id', 'data']
               
-              // Clear existing data and insert new
-              await conn.execute(`DELETE FROM ${table}`)
-              
               if (typeof data === 'object' && data !== null) {
-                const placeholders = columns.map(() => '?').join(', ')
-                const updateSet = columns.filter(c => c !== 'id' && c !== schema?.primaryKey).map(c => `${c} = VALUES(${c})`).join(', ')
-                const insertSql = `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders}) ON DUPLICATE KEY UPDATE ${updateSet || 'id = id'}`
-                
-                for (const [key, value] of Object.entries(data)) {
-                  try {
-                    const record = typeof value === 'object' ? { id: key, ...value } : { id: key, data: value }
-                    const values = columns.map(col => {
-                      const val = record[col]
-                      if (val === undefined || val === null) return null
-                      if (typeof val === 'object') return JSON.stringify(val)
-                      return String(val)
-                    })
-                    await conn.execute(insertSql, values)
-                  } catch (err) {
-                    console.error(`[Storage] Error inserting record into ${table}:`, err.message)
+                // Flatten nested data for channels and categories (serverId-keyed arrays)
+                let processedData = data
+                if (safeTable === 'channels' || safeTable === 'categories') {
+                  const sampleVal = Object.values(data)[0]
+                  if (Array.isArray(sampleVal)) {
+                    processedData = {}
+                    for (const [parentKey, items] of Object.entries(data)) {
+                      if (Array.isArray(items)) {
+                        for (const item of items) {
+                          if (item && typeof item === 'object' && item.id) {
+                            if (!item.serverId) {
+                              item.serverId = parentKey
+                            }
+                            processedData[item.id] = item
+                          }
+                        }
+                      }
+                    }
                   }
                 }
+
+                if (schema?.dataFormat === 'friends_list') {
+                  await conn.execute(`DELETE FROM ${safeTable}`)
+                  for (const [userId, friendIds] of Object.entries(data)) {
+                    if (!Array.isArray(friendIds)) continue
+                    for (const friendId of friendIds) {
+                      await conn.execute(
+                        `INSERT INTO ${safeTable} (userId, friendId, createdAt) VALUES (?, ?, ?)`,
+                        [userId, friendId, new Date().toISOString()]
+                      )
+                    }
+                  }
+                  return true
+                }
+
+                if (schema?.dataFormat === 'friend_requests') {
+                  await conn.execute(`DELETE FROM ${safeTable}`)
+                  const [columnRows] = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                  const availableColumns = new Set((columnRows || []).map(col => col.Field))
+                  const seen = new Set()
+                  const addRow = async (request, directionHint = null) => {
+                    const req = normalizeFriendRequestRow(request)
+                    if (!req.id || !req.from || !req.to) return
+                    if (seen.has(req.id)) return
+                    seen.add(req.id)
+
+                    const record = {
+                      id: req.id,
+                      fromUserId: req.from,
+                      toUserId: req.to,
+                      fromUsername: req.fromUsername,
+                      toUsername: req.toUsername,
+                      createdAt: req.createdAt,
+                      status: req.status,
+                      respondedAt: req.respondedAt,
+                      direction: directionHint || null
+                    }
+                    const insertColumns = Object.keys(record).filter(col => availableColumns.has(col))
+                    const insertValues = insertColumns.map(col => record[col] ?? null)
+                    if (insertColumns.length === 0) return
+                    const placeholders = insertColumns.map(() => '?').join(', ')
+                    await conn.execute(
+                      `INSERT INTO ${safeTable} (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+                      insertValues
+                    )
+                  }
+
+                  const incoming = data.incoming && typeof data.incoming === 'object' ? data.incoming : {}
+                  const outgoing = data.outgoing && typeof data.outgoing === 'object' ? data.outgoing : {}
+
+                  for (const requests of Object.values(incoming)) {
+                    if (!Array.isArray(requests)) continue
+                    for (const req of requests) {
+                      await addRow(req, 'incoming')
+                    }
+                  }
+                  for (const requests of Object.values(outgoing)) {
+                    if (!Array.isArray(requests)) continue
+                    for (const req of requests) {
+                      await addRow(req, 'outgoing')
+                    }
+                  }
+                  return true
+                }
+
+                if (schema?.dataFormat === 'dm_conversations') {
+                  await conn.execute(`DELETE FROM ${safeTable}`)
+                  const [columnRows] = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                  const availableColumns = new Set((columnRows || []).map(col => col.Field))
+                  const byConversation = new Map()
+
+                  for (const conversations of Object.values(data)) {
+                    if (!Array.isArray(conversations)) continue
+                    for (const conv of conversations) {
+                      if (!conv || typeof conv !== 'object' || !conv.id) continue
+                      if (!byConversation.has(conv.id)) {
+                        byConversation.set(conv.id, conv)
+                      }
+                    }
+                  }
+
+                  for (const conv of byConversation.values()) {
+                    let participants = Array.isArray(conv.participants) ? conv.participants.filter(Boolean) : []
+                    if (participants.length === 0 && typeof conv.participantKey === 'string') {
+                      participants = conv.participantKey.split(':').filter(Boolean)
+                    }
+                    participants = Array.from(new Set(participants))
+                    const record = {
+                      id: conv.id,
+                      participantKey: conv.participantKey || participants.slice().sort().join(':'),
+                      participants_json: JSON.stringify(participants),
+                      createdAt: conv.createdAt || null,
+                      lastMessageAt: conv.lastMessageAt || conv.createdAt || null,
+                      isGroup: conv.isGroup ? 1 : 0,
+                      groupName: conv.groupName || null,
+                      ownerId: conv.ownerId || null,
+                      recipientId: conv.recipientId || (participants.length === 2 ? participants[1] : null)
+                    }
+                    const insertColumns = Object.keys(record).filter(col => availableColumns.has(col))
+                    if (insertColumns.length === 0) continue
+                    const insertValues = insertColumns.map(col => record[col] ?? null)
+                    const placeholders = insertColumns.map(() => '?').join(', ')
+                    await conn.execute(
+                      `INSERT INTO ${safeTable} (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+                      insertValues
+                    )
+                  }
+                  return true
+                }
+
+                 if (schema?.dataFormat === 'messages') {
+                   await conn.execute(`DELETE FROM ${safeTable}`)
+                   const [columnRows] = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                   const availableColumns = mapActualColumnsByNormalized(columnRows || [])
+                   let hadInsertError = false
+                   for (const [channelId, messages] of Object.entries(data)) {
+                     if (!Array.isArray(messages)) continue
+                     for (const msg of messages) {
+                       if (!msg || typeof msg !== 'object' || !msg.id) continue
+                       try {
+                         // Resolve the user identifier - userId and authorId must always be the same
+                         const userIdentifier = msg.userId || msg.authorId || null
+                         const record = {
+                           id: msg.id,
+                           channelId: msg.channelId || channelId,
+                           userId: userIdentifier,
+                           authorId: userIdentifier,
+                           content: msg.content || null,
+                           type: msg.type || 'message',
+                           createdAt: msg.createdAt || msg.timestamp || null,
+                           updatedAt: msg.updatedAt || null,
+                           mentions: JSON.stringify(Array.isArray(msg.mentions) ? msg.mentions : []),
+                           attachments: JSON.stringify(Array.isArray(msg.attachments) ? msg.attachments : []),
+                           embeds: JSON.stringify(Array.isArray(msg.embeds) ? msg.embeds : []),
+                           replyTo: msg.replyTo ? JSON.stringify(msg.replyTo) : null,
+                           edited: msg.edited ? 1 : 0,
+                           editedAt: msg.editedAt || null,
+                           username: msg.username || null,
+                           avatar: msg.avatar || null,
+                           storage: msg.storage ? JSON.stringify(msg.storage) : null,
+                           encrypted: msg.encrypted ? 1 : 0,
+                           iv: msg.iv || null,
+                           epoch: msg.epoch ?? null,
+                           bot: msg.bot ? 1 : 0,
+                           timestamp: msg.timestamp || msg.createdAt || null
+                         }
+                        const insertColumns = Object.keys(record)
+                          .map((col) => {
+                            const meta = getActualColumnMeta(col, availableColumns, safeTable)
+                            return meta ? { canonical: col, actual: meta.actual, meta } : null
+                          })
+                          .filter(Boolean)
+                          .filter((col, index, arr) => arr.findIndex(c => c.actual === col.actual) === index)
+                        if (insertColumns.length === 0) continue
+                        const insertValues = insertColumns.map(({ canonical, meta }) => normalizeSqlValue(record[canonical], meta))
+                        const placeholders = insertColumns.map(() => '?').join(', ')
+                        await conn.execute(
+                          `INSERT INTO ${safeTable} (${insertColumns.map(({ actual }) => actual).join(', ')}) VALUES (${placeholders})`,
+                          insertValues
+                        )
+                      } catch (err) {
+                        hadInsertError = true
+                        console.error(`[Storage] Error inserting record into ${safeTable}:`, err.message, 'key:', msg.id)
+                      }
+                    }
+                  }
+                  return !hadInsertError
+                }
+
+                if (schema?.dataFormat === 'dm_messages') {
+                  await conn.execute(`DELETE FROM ${safeTable}`)
+                  const [columnRows] = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                  const availableColumns = new Set((columnRows || []).map(col => col.Field))
+                  for (const [conversationId, messages] of Object.entries(data)) {
+                    if (!Array.isArray(messages)) continue
+                    for (const msg of messages) {
+                      if (!msg || typeof msg !== 'object' || !msg.id) continue
+                      const record = {
+                        id: msg.id,
+                        conversationId: msg.conversationId || conversationId,
+                        userId: msg.userId || null,
+                        username: msg.username || null,
+                        avatar: msg.avatar || null,
+                        content: msg.content || null,
+                        bot: msg.bot ? 1 : 0,
+                        encrypted: msg.encrypted ? 1 : 0,
+                        iv: msg.iv || null,
+                        epoch: msg.epoch || null,
+                        timestamp: msg.timestamp || msg.createdAt || null,
+                        mentions_json: JSON.stringify(Array.isArray(msg.mentions) ? msg.mentions : []),
+                        storage_json: msg.storage ? JSON.stringify(msg.storage) : null,
+                        edited: msg.edited ? 1 : 0,
+                        editedAt: msg.editedAt || null,
+                        replyTo: msg.replyTo ? JSON.stringify(msg.replyTo) : null,
+                        attachments: JSON.stringify(Array.isArray(msg.attachments) ? msg.attachments : []),
+                        keyVersion: msg.keyVersion || null,
+                        createdAt: msg.createdAt || msg.timestamp || null
+                      }
+                      const insertColumns = Object.keys(record).filter(col => availableColumns.has(col))
+                      if (insertColumns.length === 0) continue
+                      const insertValues = insertColumns.map(col => record[col] ?? null)
+                      const placeholders = insertColumns.map(() => '?').join(', ')
+                      await conn.execute(
+                        `INSERT INTO ${safeTable} (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+                        insertValues
+                      )
+                    }
+                  }
+                  return true
+                }
+
+                const [columnRows] = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                const availableColumns = mapActualColumnsByNormalized(columnRows || [])
+                const actualPrimaryKey = getActualColumnName(schema?.primaryKey || 'id', availableColumns, safeTable)
+                const mappedColumns = columns
+                  .map((column) => {
+                    const meta = getActualColumnMeta(column, availableColumns, safeTable)
+                    return meta ? { canonical: column, actual: meta.actual, meta } : null
+                  })
+                  .filter(Boolean)
+                  .filter((col, index, arr) => arr.findIndex(c => c.actual === col.actual) === index)
+                const placeholders = mappedColumns.map(() => '?').join(', ')
+                const updateSet = mappedColumns
+                  .filter(({ actual }) => actual !== actualPrimaryKey)
+                  .map(({ actual }) => `${actual} = VALUES(${actual})`)
+                  .join(', ')
+                const insertSql = `INSERT INTO ${safeTable} (${mappedColumns.map(({ actual }) => actual).join(', ')}) VALUES (${placeholders}) ON DUPLICATE KEY UPDATE ${updateSet || `${actualPrimaryKey || mappedColumns[0].actual} = ${actualPrimaryKey || mappedColumns[0].actual}`}`
+                
+                let hadInsertError = false
+                for (const [key, value] of Object.entries(processedData)) {
+                  try {
+                    const record = typeof value === 'object' ? { id: key, ...value } : { id: key, data: value }
+                    const values = mappedColumns.map(({ canonical, actual, meta }) => normalizeSqlValue(getRecordValueForColumn(record, canonical, actual, safeTable), meta))
+                    await conn.execute(insertSql, values)
+                  } catch (err) {
+                    hadInsertError = true
+                    console.error(`[Storage] Error inserting record into ${safeTable}:`, err.message)
+                  }
+                }
+                if (hadInsertError) return false
               }
               return true
             }
@@ -759,7 +1642,7 @@ const initMysqlStorage = () => {
               await conn.execute(
                 `INSERT INTO storage_kv (id, data) VALUES (?, ?)
                  ON DUPLICATE KEY UPDATE data = VALUES(data)`,
-                [table, JSON.stringify(data ?? {})]
+                [safeTable, JSON.stringify(data ?? {})]
               )
               return true
             } catch (kvErr) {
@@ -829,20 +1712,339 @@ const initMariadbStorage = () => {
             banner TEXT,
             bio TEXT,
             customStatus TEXT,
-            status VARCHAR(50) DEFAULT 'offline',
+            status TEXT DEFAULT 'offline',
             socialLinks TEXT,
             ageVerification TEXT,
             host VARCHAR(255),
             createdAt TEXT,
-            updatedAt TEXT
+            updatedAt TEXT,
+            customUsername TEXT,
+            avatarHost TEXT,
+            adminRole TEXT,
+            proofSummary TEXT,
+            device TEXT,
+            isAdmin INT DEFAULT 0,
+            isModerator INT DEFAULT 0,
+            profileTheme LONGTEXT,
+            profileBackground TEXT,
+            profileAccentColor VARCHAR(20),
+            profileFont VARCHAR(50),
+            profileAnimation VARCHAR(20),
+            profileBackgroundType VARCHAR(20),
+            profileBackgroundOpacity INT DEFAULT 100,
+            birthDate VARCHAR(20)
           )
-        `)
+        `        )
         
-        // Fix existing tables with wrong column types
+        // Fix existing tables with wrong column types or missing columns
         try {
           await conn.query(`ALTER TABLE users MODIFY COLUMN ageVerification TEXT`)
         } catch {
           // Column might already be correct or table doesn't exist yet
+        }
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN isAdmin INT DEFAULT 0`)
+        } catch {
+          // Column might already exist
+        }
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN isModerator INT DEFAULT 0`)
+        } catch {
+          // Column might already exist
+        }
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN customUsername TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN avatarHost TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN adminRole TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN proofSummary TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN device TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileTheme LONGTEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileBackground TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileAccentColor VARCHAR(20)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileFont VARCHAR(50)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileAnimation VARCHAR(20)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileBackgroundType VARCHAR(20)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileBackgroundOpacity INT DEFAULT 100`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN birthDate VARCHAR(20)`)
+        } catch {}
+
+        try {
+          await conn.query(`ALTER TABLE friends ADD COLUMN createdAt TEXT`)
+        } catch {}
+
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN ageVerificationJurisdiction TEXT`)
+        } catch {}
+
+        try {
+          await conn.query(`ALTER TABLE users MODIFY COLUMN birthDate VARCHAR(20) NULL DEFAULT NULL`)
+        } catch {}
+
+        try {
+          await conn.query(`ALTER TABLE users MODIFY COLUMN birth_date VARCHAR(20) NULL DEFAULT NULL`)
+        } catch {}
+
+        try {
+          await conn.query(`
+            UPDATE users
+            SET birthDate = birth_date
+            WHERE (birthDate IS NULL OR birthDate = '' OR birthDate = '0')
+              AND birth_date IS NOT NULL
+              AND birth_date <> ''
+              AND birth_date <> '0'
+          `)
+        } catch {}
+
+        try {
+          await conn.query(`
+            UPDATE users
+            SET birth_date = birthDate
+            WHERE (birth_date IS NULL OR birth_date = '' OR birth_date = '0')
+              AND birthDate IS NOT NULL
+              AND birthDate <> ''
+              AND birthDate <> '0'
+          `)
+        } catch {}
+
+        try {
+          await conn.query(`
+            UPDATE users
+            SET ageVerificationJurisdiction = age_verification_jurisdiction
+            WHERE (ageVerificationJurisdiction IS NULL OR ageVerificationJurisdiction = '')
+              AND age_verification_jurisdiction IS NOT NULL
+              AND age_verification_jurisdiction <> ''
+          `)
+        } catch {}
+
+        try {
+          await conn.query(`
+            UPDATE users
+            SET age_verification_jurisdiction = ageVerificationJurisdiction
+            WHERE (age_verification_jurisdiction IS NULL OR age_verification_jurisdiction = '')
+              AND ageVerificationJurisdiction IS NOT NULL
+              AND ageVerificationJurisdiction <> ''
+          `)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE users MODIFY COLUMN status TEXT DEFAULT 'offline'`)
+        } catch {}
+        
+        // Fix messages table - add missing columns
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN mentions TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN attachments TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN embeds TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN replyTo TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN edited TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN editedAt TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN username TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN avatar TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN storage TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN encrypted TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN iv TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN epoch INT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN bot TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN ui TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE messages ADD COLUMN timestamp TEXT`)
+        } catch {}
+        
+        // Fix servers table
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN themeColor VARCHAR(20)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN bannerUrl TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN backgroundUrl TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN bannerPosition VARCHAR(50)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN roles LONGTEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN members LONGTEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN bans LONGTEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN emojis LONGTEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN automod TEXT`)
+        } catch {}
+        
+        // Fix dms table
+        try {
+          await conn.query(`ALTER TABLE dms ADD COLUMN participantKey VARCHAR(255)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE dms ADD COLUMN participants_json LONGTEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE dms ADD COLUMN lastMessageAt TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE dms ADD COLUMN isGroup TINYINT DEFAULT 0`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE dms ADD COLUMN groupName VARCHAR(255)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE dms ADD COLUMN ownerId VARCHAR(255)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE dms ADD COLUMN recipientId VARCHAR(255)`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN conversationId VARCHAR(255)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN userId VARCHAR(255)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN username VARCHAR(255)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN avatar TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN bot TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN ui TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN encrypted TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN iv VARCHAR(255)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN epoch VARCHAR(255)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN timestamp TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN mentions_json TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN storage_json TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN edited TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN editedAt TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN replyTo TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN attachments TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE dm_messages ADD COLUMN keyVersion VARCHAR(255)`)
+        } catch {}
+        
+        try {
+          await conn.query(`CREATE TABLE IF NOT EXISTS e2e_true_state (
+            id VARCHAR(255) PRIMARY KEY,
+            data LONGTEXT,
+            updatedAt TEXT
+          )`)
+        } catch {
+          // Table might already exist, check if id column exists
+          try {
+            await conn.query(`ALTER TABLE e2e_true_state ADD COLUMN id VARCHAR(255) PRIMARY KEY`)
+          } catch {}
         }
         
         await conn.query(`
@@ -854,7 +2056,16 @@ const initMariadbStorage = () => {
             banner TEXT,
             ownerId VARCHAR(255) NOT NULL,
             createdAt TEXT,
-            updatedAt TEXT
+            updatedAt TEXT,
+            themeColor VARCHAR(20),
+            bannerUrl TEXT,
+            backgroundUrl TEXT,
+            bannerPosition VARCHAR(50),
+            roles LONGTEXT,
+            members LONGTEXT,
+            bans LONGTEXT,
+            emojis LONGTEXT,
+            automod TEXT
           )
         `)
         
@@ -871,14 +2082,332 @@ const initMariadbStorage = () => {
         `)
         
         await conn.query(`
-          CREATE TABLE IF NOT EXISTS messages (
-            id VARCHAR(255) PRIMARY KEY,
-            channelId VARCHAR(255) NOT NULL,
-            authorId VARCHAR(255) NOT NULL,
-            content TEXT,
-            type VARCHAR(50) DEFAULT 'text',
+          CREATE TABLE IF NOT EXISTS friends (
+            userId VARCHAR(255) NOT NULL,
+            friendId VARCHAR(255) NOT NULL,
             createdAt TEXT,
+            PRIMARY KEY (userId, friendId)
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS friend_requests (
+            id VARCHAR(255) PRIMARY KEY,
+            fromUserId VARCHAR(255) NOT NULL,
+            toUserId VARCHAR(255) NOT NULL,
+            fromUsername VARCHAR(255),
+            toUsername VARCHAR(255),
+            createdAt TEXT,
+            direction VARCHAR(50)
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS dms (
+            id VARCHAR(255) PRIMARY KEY,
+            participantKey VARCHAR(255) NOT NULL,
+            participants_json LONGTEXT NOT NULL,
+            createdAt TEXT,
+            lastMessageAt TEXT,
+            isGroup TINYINT DEFAULT 0,
+            groupName VARCHAR(255),
+            ownerId VARCHAR(255),
+            recipientId VARCHAR(255)
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS dm_messages (
+            id VARCHAR(255) PRIMARY KEY,
+            conversationId VARCHAR(255),
+            userId VARCHAR(255),
+            username VARCHAR(255),
+            avatar TEXT,
+            content TEXT,
+            bot TINYINT DEFAULT 0,
+            encrypted TINYINT DEFAULT 0,
+            iv VARCHAR(255),
+            epoch VARCHAR(255),
+            timestamp TEXT,
+            mentions_json TEXT,
+            storage_json TEXT,
+            edited TINYINT DEFAULT 0,
+            editedAt TEXT,
+            replyTo TEXT,
+            attachments TEXT,
+            keyVersion VARCHAR(255),
+            createdAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS reactions (
+            id VARCHAR(255) PRIMARY KEY,
+            messageId VARCHAR(255) NOT NULL,
+            emoji VARCHAR(255),
+            userIds TEXT,
+            createdAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS blocked (
+            userId VARCHAR(255) NOT NULL,
+            blockedUserId VARCHAR(255) NOT NULL,
+            createdAt TEXT,
+            PRIMARY KEY (userId, blockedUserId)
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS invites (
+            code VARCHAR(255) PRIMARY KEY,
+            serverId VARCHAR(255) NOT NULL,
+            createdBy VARCHAR(255),
+            uses INTEGER DEFAULT 0,
+            maxUses INTEGER,
+            expiresAt TEXT,
+            createdAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS discovery (
+            id VARCHAR(255) PRIMARY KEY,
+            serverId VARCHAR(255),
+            name VARCHAR(255),
+            icon TEXT,
+            description TEXT,
+            category VARCHAR(255),
+            memberCount INTEGER DEFAULT 0,
+            submittedBy VARCHAR(255),
+            submittedAt TEXT,
+            status VARCHAR(50),
+            approvedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS categories (
+            id VARCHAR(255) PRIMARY KEY,
+            serverId VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            position INTEGER,
+            createdAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS bots (
+            id VARCHAR(255) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            description TEXT,
+            avatar TEXT,
+            ownerId VARCHAR(255) NOT NULL,
+            token TEXT,
+            tokenHash VARCHAR(255),
+            prefix VARCHAR(50),
+            permissions_json LONGTEXT,
+            servers_json LONGTEXT,
+            intents_json LONGTEXT,
+            commands_json LONGTEXT,
+            status VARCHAR(50),
+            public TINYINT DEFAULT 0,
+            webhookUrl TEXT,
+            webhookSecret TEXT,
+            customStatus TEXT,
+            createdAt TEXT,
+            updatedAt TEXT,
+            lastActive TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS e2e_keys (
+            id VARCHAR(255) PRIMARY KEY,
+            data LONGTEXT,
             updatedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS system_messages (
+            id VARCHAR(255) PRIMARY KEY,
+            data LONGTEXT,
+            updatedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS self_volts (
+            id VARCHAR(255) PRIMARY KEY,
+            data LONGTEXT,
+            updatedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS federation (
+            id VARCHAR(255) PRIMARY KEY,
+            data LONGTEXT,
+            updatedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS server_start (
+            id VARCHAR(255) PRIMARY KEY,
+            data LONGTEXT,
+            updatedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS files (
+            id VARCHAR(255) PRIMARY KEY,
+            name VARCHAR(255),
+            type VARCHAR(255),
+            mimetype VARCHAR(255),
+            size INTEGER,
+            url TEXT,
+            filename VARCHAR(255),
+            uploadedAt TEXT,
+            uploadedBy VARCHAR(255),
+            path TEXT,
+            createdAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS attachments (
+            id VARCHAR(255) PRIMARY KEY,
+            messageId VARCHAR(255),
+            fileId VARCHAR(255),
+            createdAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS global_bans (
+            id VARCHAR(255) PRIMARY KEY,
+            userId VARCHAR(255) NOT NULL,
+            reason TEXT,
+            bannedBy VARCHAR(255),
+            expiresAt TEXT,
+            createdAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS server_bans (
+            id VARCHAR(255) PRIMARY KEY,
+            serverId VARCHAR(255) NOT NULL,
+            userId VARCHAR(255) NOT NULL,
+            reason TEXT,
+            bannedBy VARCHAR(255),
+            bannedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS admin_logs (
+            id VARCHAR(255) PRIMARY KEY,
+            adminId VARCHAR(255) NOT NULL,
+            action VARCHAR(100) NOT NULL,
+            targetId VARCHAR(255),
+            details LONGTEXT,
+            timestamp TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS pinned_messages (
+            id VARCHAR(255) PRIMARY KEY,
+            channelId VARCHAR(255),
+            userId VARCHAR(255),
+            username VARCHAR(255),
+            avatar TEXT,
+            content TEXT,
+            timestamp TEXT,
+            pinnedAt TEXT,
+            pinnedBy VARCHAR(255)
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS call_logs (
+            callId VARCHAR(255) PRIMARY KEY,
+            conversationId VARCHAR(255) NOT NULL,
+            callerId VARCHAR(255) NOT NULL,
+            recipientId VARCHAR(255) NOT NULL,
+            type VARCHAR(20) NOT NULL,
+            status VARCHAR(20) NOT NULL,
+            duration INT DEFAULT 0,
+            startedAt TEXT,
+            endedAt TEXT,
+            endedBy VARCHAR(255),
+            updatedAt TEXT
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS activity_apps (
+            id VARCHAR(255) PRIMARY KEY,
+            client_id VARCHAR(255) NOT NULL,
+            client_secret VARCHAR(255) NOT NULL,
+            owner_id VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            description TEXT,
+            redirect_uris TEXT,
+            scopes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS activity_oauth_codes (
+            code VARCHAR(255) PRIMARY KEY,
+            client_id VARCHAR(255) NOT NULL,
+            user_id VARCHAR(255) NOT NULL,
+            scope TEXT,
+            redirect_uri TEXT,
+            context_type VARCHAR(50),
+            context_id VARCHAR(255),
+            session_id VARCHAR(255),
+            app_id VARCHAR(255),
+            expires_at BIGINT NOT NULL
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS activity_oauth_tokens (
+            access_token VARCHAR(255) PRIMARY KEY,
+            app_id VARCHAR(255) NOT NULL,
+            client_id VARCHAR(255) NOT NULL,
+            user_id VARCHAR(255) NOT NULL,
+            scope TEXT,
+            context_type VARCHAR(50),
+            context_id VARCHAR(255),
+            session_id VARCHAR(255),
+            created_at BIGINT NOT NULL,
+            expires_at BIGINT NOT NULL
+          )
+        `)
+        
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS activity_public (
+            id VARCHAR(255) PRIMARY KEY,
+            owner_id VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            description TEXT,
+            icon VARCHAR(100),
+            category VARCHAR(100),
+            launch_url TEXT,
+            visibility VARCHAR(50) DEFAULT 'public',
+            is_builtin_client TINYINT DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           )
         `)
         
@@ -899,22 +2428,86 @@ const initMariadbStorage = () => {
       provider: 'mariadb',
       pool,
       load: async (table, defaultValue = {}) => {
+        const safeTable = assertSafeTableName(table)
         try {
           await ready
+          const schema = TABLE_SCHEMAS[safeTable]
           
           // First, try to load from individual table
           try {
-            const rows = await pool.query(`SELECT * FROM ${table}`)
+            const rows = await pool.query(`SELECT * FROM ${safeTable}`)
             if (rows.length > 0) {
+              if (schema?.dataFormat === 'friends_list') {
+                const result = {}
+                for (const row of rows) {
+                  if (row.userId && row.friendId) {
+                    if (!result[row.userId]) result[row.userId] = []
+                    result[row.userId].push(row.friendId)
+                  }
+                }
+                return result
+              }
+
+              if (schema?.dataFormat === 'nested_array') {
+                const result = {}
+                for (const row of rows) {
+                  if (row.userId && row.blockedUserId) {
+                    if (!result[row.userId]) result[row.userId] = []
+                    result[row.userId].push(row.blockedUserId)
+                  }
+                }
+                return result
+              }
+
+              if (schema?.dataFormat === 'friend_requests') {
+                return buildFriendRequestsStateFromRows(rows)
+              }
+
+              if (schema?.dataFormat === 'dm_conversations') {
+                return buildDmsStateFromRows(rows)
+              }
+
+              if (schema?.dataFormat === 'dm_messages') {
+                return buildDmMessagesStateFromRows(rows)
+              }
+
+              if (schema?.dataFormat === 'reactions') {
+                const result = {}
+                for (const row of rows) {
+                  if (row.messageId && row.emoji) {
+                    if (!result[row.messageId]) result[row.messageId] = {}
+                    try {
+                      result[row.messageId][row.emoji] = typeof row.userIds === 'string' ? JSON.parse(row.userIds) : row.userIds
+                    } catch {
+                      result[row.messageId][row.emoji] = []
+                    }
+                  }
+                }
+                return result
+              }
+
               const result = {}
-              for (const row of rows) {
-                const id = row.id || row.code || row.serverId || row.userId
+              for (const rawRow of rows) {
+                const row = mapRowToCanonicalColumns(rawRow, schema?.columns || [], table)
+                // Handle all possible ID column names
+                const id = row.id || row.code || row.serverId || row.userId || row.callId || row.participantKey || row.access_token
                 if (id) {
                   const parsed = {}
                   for (const [key, value] of Object.entries(row)) {
-                    if (key === 'id' || key === 'code' || key === 'serverId' || key === 'userId') {
+                    // Skip ID columns in the data object
+                    if (['id', 'code', 'serverId', 'userId', 'callId', 'participantKey', 'access_token'].includes(key)) {
                       parsed[key] = value
-                    } else if (typeof value === 'string' && (value.startsWith('{') || value.startsWith('['))) {
+                    } else if (
+                      // Check for _json suffix columns
+                      key.endsWith('_json') ||
+                      // Known JSON columns
+                      key === 'roles' || key === 'members' || key === 'bans' || key === 'emojis' ||
+                      key === 'permissions' || key === 'permissions_json' || key === 'servers_json' || key === 'intents_json' || key === 'commands_json' ||
+                      key === 'participants_json' || key === 'mentions_json' || key === 'storage_json' ||
+                      key === 'redirect_uris' || key === 'scopes' ||
+                      // Auto-detect JSON strings
+                      (typeof value === 'string' && (value.startsWith('{') || value.startsWith('[')))
+                    ) {
                       try {
                         parsed[key] = JSON.parse(value)
                       } catch {
@@ -924,10 +2517,11 @@ const initMariadbStorage = () => {
                       parsed[key] = value
                     }
                   }
-                  result[id] = parsed
+                  result[id] = normalizeLoadedRecord(safeTable, parsed)
                 }
               }
               if (Object.keys(result).length > 0) {
+                console.log(`[Storage] Loaded ${safeTable}: ${Object.keys(result).length} records`)
                 return result
               }
             }
@@ -937,7 +2531,7 @@ const initMariadbStorage = () => {
 
           // Fall back to storage_kv if it exists (for migration)
           try {
-            const kvRows = await pool.query('SELECT data FROM storage_kv WHERE id = ? LIMIT 1', [table])
+            const kvRows = await pool.query('SELECT data FROM storage_kv WHERE id = ? LIMIT 1', [safeTable])
             if (Array.isArray(kvRows) && kvRows[0]?.data) {
               try {
                 return JSON.parse(kvRows[0].data)
@@ -951,49 +2545,397 @@ const initMariadbStorage = () => {
 
           return defaultValue
         } catch (err) {
-          console.error(`[Storage] Error loading ${table}:`, err.message)
+          console.error(`[Storage] Error loading ${safeTable}:`, err.message)
           return defaultValue
         }
       },
       save: async (table, data) => {
+        const safeTable = assertSafeTableName(table)
         try {
           await ready
           const conn = await pool.getConnection()
           try {
             // Check if individual table exists
-            const tables = await conn.query(`SHOW TABLES LIKE ?`, [table])
+            const tables = await conn.query(`SHOW TABLES LIKE ?`, [safeTable])
             
             if (tables.length > 0) {
               // Save to individual table
-              const schema = TABLE_SCHEMAS[table]
+              const schema = TABLE_SCHEMAS[safeTable]
               const columns = schema?.columns || ['id', 'data']
+              const primaryKey = schema?.primaryKey
               
-              // Clear existing data and insert new
-              await conn.query(`DELETE FROM ${table}`)
-              
-              if (typeof data === 'object' && data !== null) {
-                const placeholders = columns.map(() => '?').join(', ')
-                const updateSet = columns.filter(c => c !== 'id' && c !== schema?.primaryKey).map(c => `${c} = VALUES(${c})`).join(', ')
-                const insertSql = `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders}) ON DUPLICATE KEY UPDATE ${updateSet || 'id = id'}`
-                
-                for (const [key, value] of Object.entries(data)) {
-                  try {
-                    const record = typeof value === 'object' ? { id: key, ...value } : { id: key, data: value }
-                    const values = columns.map(col => {
-                      const val = record[col]
-                      if (val === undefined || val === null) return null
-                      if (typeof val === 'object') return JSON.stringify(val)
-                      return String(val)
-                    })
-                    await conn.query(insertSql, values)
-                  } catch (err) {
-                    console.error(`[Storage] Error inserting record into ${table}:`, err.message)
+               if (typeof data === 'object' && data !== null) {
+                 if (schema?.dataFormat === 'friends_list') {
+                    const columnRows = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                    const availableColumns = getAvailableColumnSet(columnRows)
+                    const insertColumns = availableColumns.has('createdAt')
+                      ? ['userId', 'friendId', 'createdAt']
+                      : ['userId', 'friendId']
+                    const placeholders = insertColumns.map(() => '?').join(', ')
+
+                    // Collect all valid pairs for the new state
+                    const newPairs = new Set()
+                    const rows = []
+                    for (const [userId, friendIds] of Object.entries(data)) {
+                      if (!Array.isArray(friendIds)) continue
+                      for (const friendId of friendIds) {
+                        const pairKey = `${userId}:${friendId}`
+                        if (newPairs.has(pairKey)) continue
+                        newPairs.add(pairKey)
+                        rows.push(insertColumns.includes('createdAt')
+                          ? [userId, friendId, new Date().toISOString()]
+                          : [userId, friendId])
+                      }
+                    }
+
+                    // Use a transaction: upsert all rows then delete stale ones
+                    await conn.beginTransaction()
+                    try {
+                      for (const values of rows) {
+                        await conn.query(
+                          `INSERT IGNORE INTO ${safeTable} (${insertColumns.join(', ')}) VALUES (${placeholders})`,
+                          values
+                        )
+                      }
+                      // Remove rows that are no longer in the data
+                      if (newPairs.size > 0) {
+                        const existing = await conn.query(`SELECT userId, friendId FROM ${safeTable}`)
+                        for (const row of existing) {
+                          if (!newPairs.has(`${row.userId}:${row.friendId}`)) {
+                            await conn.query(`DELETE FROM ${safeTable} WHERE userId = ? AND friendId = ?`, [row.userId, row.friendId])
+                          }
+                        }
+                      } else {
+                        await conn.query(`DELETE FROM ${safeTable}`)
+                      }
+                      await conn.commit()
+                    } catch (txErr) {
+                      await conn.rollback()
+                      throw txErr
+                    }
+                    return true
                   }
-                }
-              }
-              return true
-            }
-            
+
+                 if (schema?.dataFormat === 'friend_requests') {
+                    const columnRows = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                    const availableColumns = new Set((columnRows || []).map(col => col.Field))
+                    const seen = new Set()
+
+                    const addRow = async (request, directionHint = null) => {
+                      const req = normalizeFriendRequestRow(request)
+                      if (!req.id || !req.from || !req.to) return
+                      if (seen.has(req.id)) return
+                      seen.add(req.id)
+
+                      const record = {
+                        id: req.id,
+                        fromUserId: req.from,
+                        toUserId: req.to,
+                        fromUsername: req.fromUsername,
+                        toUsername: req.toUsername,
+                        createdAt: req.createdAt,
+                        status: req.status,
+                        respondedAt: req.respondedAt,
+                        direction: directionHint || null
+                      }
+                      const insertColumns = Object.keys(record).filter(col => availableColumns.has(col))
+                      const insertValues = insertColumns.map(col => record[col] ?? null)
+                      if (insertColumns.length === 0) return
+                      const placeholders = insertColumns.map(() => '?').join(', ')
+                      const updateSet = insertColumns
+                        .filter(col => col !== 'id')
+                        .map(col => `${col} = VALUES(${col})`)
+                        .join(', ')
+                      await conn.query(
+                        `INSERT INTO ${safeTable} (${insertColumns.join(', ')}) VALUES (${placeholders})${updateSet ? ` ON DUPLICATE KEY UPDATE ${updateSet}` : ''}`,
+                        insertValues
+                      )
+                    }
+
+                    const incoming = data.incoming && typeof data.incoming === 'object' ? data.incoming : {}
+                    const outgoing = data.outgoing && typeof data.outgoing === 'object' ? data.outgoing : {}
+
+                    await conn.beginTransaction()
+                    try {
+                      for (const requests of Object.values(incoming)) {
+                        if (!Array.isArray(requests)) continue
+                        for (const req of requests) {
+                          await addRow(req, 'incoming')
+                        }
+                      }
+                      for (const requests of Object.values(outgoing)) {
+                        if (!Array.isArray(requests)) continue
+                        for (const req of requests) {
+                          await addRow(req, 'outgoing')
+                        }
+                      }
+                      // Remove stale requests that no longer exist in data
+                      if (seen.size > 0) {
+                        const existingRows = await conn.query(`SELECT id FROM ${safeTable}`)
+                        for (const row of existingRows) {
+                          if (!seen.has(row.id)) {
+                            await conn.query(`DELETE FROM ${safeTable} WHERE id = ?`, [row.id])
+                          }
+                        }
+                      }
+                      await conn.commit()
+                    } catch (txErr) {
+                      await conn.rollback()
+                      throw txErr
+                    }
+                    return true
+                  }
+
+                  if (schema?.dataFormat === 'dm_conversations') {
+                   const columnRows = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                   const availableColumns = new Set((columnRows || []).map(col => col.Field))
+                   const byConversation = new Map()
+
+                   for (const conversations of Object.values(data)) {
+                     if (!Array.isArray(conversations)) continue
+                     for (const conv of conversations) {
+                       if (!conv || typeof conv !== 'object' || !conv.id) continue
+                       if (!byConversation.has(conv.id)) {
+                         byConversation.set(conv.id, conv)
+                       }
+                     }
+                   }
+
+                   for (const conv of byConversation.values()) {
+                     let participants = Array.isArray(conv.participants) ? conv.participants.filter(Boolean) : []
+                     if (participants.length === 0 && typeof conv.participantKey === 'string') {
+                       participants = conv.participantKey.split(':').filter(Boolean)
+                     }
+                     participants = Array.from(new Set(participants))
+                     const record = {
+                       id: conv.id,
+                       participantKey: conv.participantKey || participants.slice().sort().join(':'),
+                       participants_json: JSON.stringify(participants),
+                       createdAt: conv.createdAt || null,
+                       lastMessageAt: conv.lastMessageAt || conv.createdAt || null,
+                       isGroup: conv.isGroup ? 1 : 0,
+                       groupName: conv.groupName || null,
+                       ownerId: conv.ownerId || null,
+                       recipientId: conv.recipientId || (participants.length === 2 ? participants[1] : null)
+                     }
+                     const insertColumns = Object.keys(record).filter(col => availableColumns.has(col))
+                     if (insertColumns.length === 0) continue
+                     const insertValues = insertColumns.map(col => record[col] ?? null)
+                      const placeholders = insertColumns.map(() => '?').join(', ')
+                      const updateSet = insertColumns
+                        .filter(col => col !== 'id')
+                        .map(col => `${col} = VALUES(${col})`)
+                        .join(', ')
+                      await conn.query(
+                        `INSERT INTO ${safeTable} (${insertColumns.join(', ')}) VALUES (${placeholders})${updateSet ? ` ON DUPLICATE KEY UPDATE ${updateSet}` : ''}`,
+                        insertValues
+                      )
+                    }
+                    // Remove conversations that are no longer in the data
+                    if (byConversation.size > 0) {
+                      const existingRows = await conn.query(`SELECT id FROM ${safeTable}`)
+                      for (const row of existingRows) {
+                        if (!byConversation.has(row.id)) {
+                          await conn.query(`DELETE FROM ${safeTable} WHERE id = ?`, [row.id])
+                        }
+                      }
+                    }
+                    return true
+                  }
+
+                  if (schema?.dataFormat === 'messages') {
+                    const columnRows = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                    const availableColumns = mapActualColumnsByNormalized(columnRows || [])
+                    let hadInsertError = false
+                    for (const [channelId, messages] of Object.entries(data)) {
+                      if (!Array.isArray(messages)) continue
+                      for (const msg of messages) {
+                        if (!msg || typeof msg !== 'object' || !msg.id) continue
+                        try {
+                          // Resolve the user identifier - userId and authorId must always be the same
+                          const userIdentifier = msg.userId || msg.authorId || null
+                          const record = {
+                            id: msg.id,
+                            channelId: msg.channelId || channelId,
+                            userId: userIdentifier,
+                            authorId: userIdentifier,
+                            content: msg.content || null,
+                            type: msg.type || 'message',
+                            createdAt: msg.createdAt || msg.timestamp || null,
+                            updatedAt: msg.updatedAt || null,
+                            mentions: JSON.stringify(Array.isArray(msg.mentions) ? msg.mentions : []),
+                            attachments: JSON.stringify(Array.isArray(msg.attachments) ? msg.attachments : []),
+                            embeds: JSON.stringify(Array.isArray(msg.embeds) ? msg.embeds : []),
+                            replyTo: msg.replyTo ? JSON.stringify(msg.replyTo) : null,
+                            edited: msg.edited ? 1 : 0,
+                            editedAt: msg.editedAt || null,
+                            username: msg.username || null,
+                            avatar: msg.avatar || null,
+                            storage: msg.storage ? JSON.stringify(msg.storage) : null,
+                            encrypted: msg.encrypted ? 1 : 0,
+                            iv: msg.iv || null,
+                            epoch: msg.epoch ?? null,
+                            bot: msg.bot ? 1 : 0,
+                            timestamp: msg.timestamp || msg.createdAt || null
+                          }
+                          const insertColumns = Object.keys(record)
+                            .map((col) => {
+                              const meta = getActualColumnMeta(col, availableColumns, safeTable)
+                              return meta ? { canonical: col, actual: meta.actual, meta } : null
+                            })
+                            .filter(Boolean)
+                            .filter((col, index, arr) => arr.findIndex(c => c.actual === col.actual) === index)
+                          if (insertColumns.length === 0) continue
+                          const insertValues = insertColumns.map(({ canonical, meta }) => normalizeSqlValue(record[canonical], meta))
+                          const placeholders = insertColumns.map(() => '?').join(', ')
+                          const updateSet = insertColumns
+                            .filter(({ actual }) => actual !== 'id')
+                            .map(({ actual }) => `${actual} = VALUES(${actual})`)
+                            .join(', ')
+                          await conn.query(
+                            `INSERT INTO ${safeTable} (${insertColumns.map(({ actual }) => actual).join(', ')}) VALUES (${placeholders})${updateSet ? ` ON DUPLICATE KEY UPDATE ${updateSet}` : ''}`,
+                            insertValues
+                          )
+                        } catch (err) {
+                          hadInsertError = true
+                          console.error(`[Storage] Error inserting record into ${safeTable}:`, err.message, 'key:', msg.id)
+                        }
+                      }
+                    }
+                    return !hadInsertError
+                  }
+
+                  if (schema?.dataFormat === 'dm_messages') {
+                    const columnRows = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                    const availableColumns = new Set((columnRows || []).map(col => col.Field))
+                    const seenIds = new Set()
+                    for (const [conversationId, messages] of Object.entries(data)) {
+                      if (!Array.isArray(messages)) continue
+                      for (const msg of messages) {
+                        if (!msg || typeof msg !== 'object' || !msg.id) continue
+                        seenIds.add(msg.id)
+                        const record = {
+                          id: msg.id,
+                          conversationId: msg.conversationId || conversationId,
+                          userId: msg.userId || null,
+                          username: msg.username || null,
+                          avatar: msg.avatar || null,
+                          content: msg.content || null,
+                          bot: msg.bot ? 1 : 0,
+                          encrypted: msg.encrypted ? 1 : 0,
+                          iv: msg.iv || null,
+                          epoch: msg.epoch || null,
+                          timestamp: msg.timestamp || msg.createdAt || null,
+                          mentions_json: JSON.stringify(Array.isArray(msg.mentions) ? msg.mentions : []),
+                          storage_json: msg.storage ? JSON.stringify(msg.storage) : null,
+                          edited: msg.edited ? 1 : 0,
+                          editedAt: msg.editedAt || null,
+                          replyTo: msg.replyTo ? JSON.stringify(msg.replyTo) : null,
+                          attachments: JSON.stringify(Array.isArray(msg.attachments) ? msg.attachments : []),
+                          keyVersion: msg.keyVersion || null,
+                          createdAt: msg.createdAt || msg.timestamp || null
+                        }
+                        const insertColumns = Object.keys(record).filter(col => availableColumns.has(col))
+                        if (insertColumns.length === 0) continue
+                        const insertValues = insertColumns.map(col => record[col] ?? null)
+                        const placeholders = insertColumns.map(() => '?').join(', ')
+                        const updateSet = insertColumns
+                          .filter(col => col !== 'id')
+                          .map(col => `${col} = VALUES(${col})`)
+                          .join(', ')
+                        await conn.query(
+                          `INSERT INTO ${safeTable} (${insertColumns.join(', ')}) VALUES (${placeholders})${updateSet ? ` ON DUPLICATE KEY UPDATE ${updateSet}` : ''}`,
+                          insertValues
+                        )
+                      }
+                    }
+                    return true
+                  }
+
+                 // Flatten nested data for channels and categories (serverId-keyed arrays)
+                 let processedData = data
+                 if ((safeTable === 'channels' || safeTable === 'categories') && typeof data === 'object' && data !== null) {
+                   const sampleVal = Object.values(data)[0]
+                   if (Array.isArray(sampleVal)) {
+                     processedData = {}
+                     for (const [parentKey, items] of Object.entries(data)) {
+                       if (Array.isArray(items)) {
+                         for (const item of items) {
+                           if (item && typeof item === 'object' && item.id) {
+                             if (!item.serverId) {
+                               item.serverId = parentKey
+                             }
+                             processedData[item.id] = item
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }
+
+                 const columnRows = await conn.query(`SHOW COLUMNS FROM ${safeTable}`)
+                 const availableColumns = mapActualColumnsByNormalized(columnRows || [])
+                 const actualPrimaryKey = getActualColumnName(primaryKey || 'id', availableColumns, safeTable)
+                 const mappedColumns = columns
+                    .map((column) => {
+                      const meta = getActualColumnMeta(column, availableColumns, safeTable)
+                      return meta ? { canonical: column, actual: meta.actual, meta } : null
+                    })
+                    .filter(Boolean)
+                    .filter((col, index, arr) => arr.findIndex(c => c.actual === col.actual) === index)
+
+                 if (mappedColumns.length === 0) {
+                   console.warn(`[Storage] No compatible columns found for ${safeTable}, skipping save`)
+                   return false
+                 }
+
+                 const placeholders = mappedColumns.map(() => '?').join(', ')
+                 const updateSet = mappedColumns
+                   .filter(({ actual }) => actual !== actualPrimaryKey)
+                   .map(({ actual }) => `${actual} = VALUES(${actual})`)
+                   .join(', ')
+                 const insertSql = `INSERT INTO ${safeTable} (${mappedColumns.map(({ actual }) => actual).join(', ')}) VALUES (${placeholders}) ON DUPLICATE KEY UPDATE ${updateSet || `${actualPrimaryKey || mappedColumns[0].actual} = ${actualPrimaryKey || mappedColumns[0].actual}`}`
+                 
+                 let hadInsertError = false
+                 for (const [key, value] of Object.entries(processedData)) {
+                   try {
+                     // Build record based on the table's columns
+                     const record = { }
+                     
+                     // Set the primary key
+                     if (primaryKey === 'id' || !primaryKey) {
+                       record.id = key
+                     } else if (primaryKey === 'code') {
+                       record.code = key
+                     } else if (primaryKey === 'userId') {
+                       record.userId = key
+                     } else if (primaryKey === 'callId') {
+                       record.callId = key
+                     } else if (primaryKey === 'participantKey') {
+                       record.participantKey = key
+                     }
+                     
+                     // Add all other fields from the value
+                     if (value && typeof value === 'object') {
+                       for (const [field, fieldValue] of Object.entries(value)) {
+                         record[field] = fieldValue
+                       }
+                     } else {
+                       record.data = value
+                     }
+                     
+                     const values = mappedColumns.map(({ canonical, actual, meta }) => normalizeSqlValue(getRecordValueForColumn(record, canonical, actual, safeTable), meta))
+                     await conn.query(insertSql, values)
+                   } catch (err) {
+                     hadInsertError = true
+                     console.error(`[Storage] Error inserting record into ${safeTable}:`, err.message, 'key:', key)
+                   }
+                 }
+                 if (hadInsertError) return false
+               }
+               return true
+             }
+
             // Fall back to storage_kv for tables without individual schemas
             try {
               await conn.query(
@@ -1012,6 +2954,9 @@ const initMariadbStorage = () => {
               )
               return true
             }
+          } catch (err) {
+            console.error(`[Storage] Error saving ${table}:`, err.message)
+            return false
           } finally {
             conn.release()
           }
@@ -1031,9 +2976,9 @@ const initMariadbStorage = () => {
 }
 
 const initPostgresStorage = () => {
-  let client
+  let pool
   try {
-    const { Client } = require('pg')
+    const { Pool } = require('pg')
     const storageConfig = config.config.storage.postgres
     
     const connectionConfig = {
@@ -1041,7 +2986,10 @@ const initPostgresStorage = () => {
       port: storageConfig.port || 5432,
       database: storageConfig.database || 'voltchat',
       user: storageConfig.user || 'postgres',
-      password: storageConfig.password || ''
+      password: storageConfig.password || '',
+      max: storageConfig.connectionLimit || 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000
     }
     
     if (storageConfig.connectionString) {
@@ -1052,93 +3000,97 @@ const initPostgresStorage = () => {
       connectionConfig.ssl = { rejectUnauthorized: false }
     }
     
-    client = new Client(connectionConfig)
+    pool = new Pool(connectionConfig)
     
     const createTables = async () => {
-      await client.connect()
-      
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS users (
-          id VARCHAR(255) PRIMARY KEY,
-          username VARCHAR(255) NOT NULL,
-          "displayName" VARCHAR(255),
-          email VARCHAR(255),
-          "passwordHash" VARCHAR(255),
-          "authProvider" VARCHAR(50),
-          avatar TEXT,
-          banner TEXT,
-          bio TEXT,
-          "customStatus" TEXT,
-          status VARCHAR(50) DEFAULT 'offline',
-          "socialLinks" TEXT,
-          "ageVerification" VARCHAR(50),
-          host VARCHAR(255),
-          "createdAt" TEXT,
-          "updatedAt" TEXT
-        )
-      `)
-      
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS servers (
-          id VARCHAR(255) PRIMARY KEY,
-          name VARCHAR(255) NOT NULL,
-          description TEXT,
-          icon TEXT,
-          banner TEXT,
-          "ownerId" VARCHAR(255) NOT NULL,
-          "createdAt" TEXT,
-          "updatedAt" TEXT
-        )
-      `)
-      
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS channels (
-          id VARCHAR(255) PRIMARY KEY,
-          "serverId" VARCHAR(255) NOT NULL,
-          name VARCHAR(255) NOT NULL,
-          type VARCHAR(50) DEFAULT 'text',
-          topic TEXT,
-          position INTEGER,
-          "createdAt" TEXT
-        )
-      `)
-      
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS messages (
-          id VARCHAR(255) PRIMARY KEY,
-          "channelId" VARCHAR(255) NOT NULL,
-          "authorId" VARCHAR(255) NOT NULL,
-          content TEXT,
-          type VARCHAR(50) DEFAULT 'text',
-          "createdAt" TEXT,
-          "updatedAt" TEXT
-        )
-      `)
-      
-      await client.query(`
-        CREATE INDEX IF NOT EXISTS idx_messages_channelId ON messages("channelId")
-      `)
-      
-      await client.query(`
-        CREATE INDEX IF NOT EXISTS idx_channels_serverId ON channels("serverId")
-      `)
-      
-      console.log('[Storage] PostgreSQL tables initialized')
+      const client = await pool.connect()
+      try {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS users (
+            id VARCHAR(255) PRIMARY KEY,
+            username VARCHAR(255) NOT NULL,
+            "displayName" VARCHAR(255),
+            email VARCHAR(255),
+            "passwordHash" VARCHAR(255),
+            "authProvider" VARCHAR(50),
+            avatar TEXT,
+            banner TEXT,
+            bio TEXT,
+            "customStatus" TEXT,
+            status VARCHAR(50) DEFAULT 'offline',
+            "socialLinks" TEXT,
+            "ageVerification" VARCHAR(50),
+            host VARCHAR(255),
+            "createdAt" TEXT,
+            "updatedAt" TEXT
+          )
+        `)
+        
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS servers (
+            id VARCHAR(255) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            description TEXT,
+            icon TEXT,
+            banner TEXT,
+            "ownerId" VARCHAR(255) NOT NULL,
+            "createdAt" TEXT,
+            "updatedAt" TEXT
+          )
+        `)
+        
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS channels (
+            id VARCHAR(255) PRIMARY KEY,
+            "serverId" VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            type VARCHAR(50) DEFAULT 'text',
+            topic TEXT,
+            position INTEGER,
+            "createdAt" TEXT
+          )
+        `)
+        
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS messages (
+            id VARCHAR(255) PRIMARY KEY,
+            "channelId" VARCHAR(255) NOT NULL,
+            "authorId" VARCHAR(255) NOT NULL,
+            content TEXT,
+            type VARCHAR(50) DEFAULT 'text',
+            "createdAt" TEXT,
+            "updatedAt" TEXT
+          )
+        `)
+        
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS idx_messages_channelId ON messages("channelId")
+        `)
+        
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS idx_channels_serverId ON channels("serverId")
+        `)
+        
+        console.log('[Storage] PostgreSQL tables initialized')
+      } finally {
+        client.release()
+      }
     }
     
     createTables().catch(err => {
       console.error('[Storage] Error creating PostgreSQL tables:', err.message)
     })
     
-    console.log('[Storage] PostgreSQL client created')
+    console.log('[Storage] PostgreSQL pool created')
     
     return {
       type: 'postgres',
       provider: 'postgres',
-      client,
+      pool,
       load: async (table, defaultValue = {}) => {
+        table = assertSafeTableName(table)
         try {
-          const res = await client.query(`SELECT * FROM ${table}`)
+          const res = await pool.query(`SELECT * FROM ${table}`)
           const result = {}
           res.rows.forEach(row => {
             try {
@@ -1155,6 +3107,8 @@ const initPostgresStorage = () => {
         }
       },
       save: async (table, data) => {
+        table = assertSafeTableName(table)
+        const client = await pool.connect()
         try {
           await client.query('BEGIN')
           for (const [id, row] of Object.entries(data)) {
@@ -1169,10 +3123,12 @@ const initPostgresStorage = () => {
           await client.query('ROLLBACK')
           console.error(`[Storage] Error saving ${table}:`, err.message)
           return false
+        } finally {
+          client.release()
         }
       },
       close: async () => {
-        await client.end()
+        await pool.end()
       }
     }
   } catch (err) {
@@ -1277,6 +3233,7 @@ const initCockroachdbStorage = () => {
       provider: 'cockroachdb',
       client,
       load: async (table, defaultValue = {}) => {
+        table = assertSafeTableName(table)
         try {
           const res = await client.query(`SELECT * FROM ${table}`)
           const result = {}
@@ -1295,6 +3252,7 @@ const initCockroachdbStorage = () => {
         }
       },
       save: async (table, data) => {
+        table = assertSafeTableName(table)
         try {
           await client.query('BEGIN')
           for (const [id, row] of Object.entries(data)) {
@@ -1429,6 +3387,7 @@ const initMssqlStorage = () => {
       provider: 'mssql',
       pool,
       load: async (table, defaultValue = {}) => {
+        table = assertSafeTableName(table)
         try {
           if (!pool) await mssql.connect(config)
           const result = await pool.request().query(`SELECT * FROM ${table}`)
@@ -1448,6 +3407,7 @@ const initMssqlStorage = () => {
         }
       },
       save: async (table, data) => {
+        table = assertSafeTableName(table)
         try {
           if (!pool) await mssql.connect(config)
           const transaction = new mssql.Transaction(pool)
@@ -1539,6 +3499,7 @@ const initMongodbStorage = () => {
       client,
       db: database,
       load: async (table, defaultValue = {}) => {
+        table = assertSafeTableName(table)
         try {
           if (!database) await createCollections()
           const collection = database.collection(table)
@@ -1555,6 +3516,7 @@ const initMongodbStorage = () => {
         }
       },
       save: async (table, data) => {
+        table = assertSafeTableName(table)
         try {
           if (!database) await createCollections()
           const collection = database.collection(table)
@@ -1619,6 +3581,7 @@ const initRedisStorage = () => {
       provider: 'redis',
       client: redisClient,
       load: async (table, defaultValue = {}) => {
+        table = assertSafeTableName(table)
         try {
           const keys = await redisClient.keys(`${prefix}${table}:*`)
           const result = {}
@@ -1638,6 +3601,7 @@ const initRedisStorage = () => {
         }
       },
       save: async (table, data) => {
+        table = assertSafeTableName(table)
         try {
           const pipeline = redisClient.multi()
           for (const [id, row] of Object.entries(data)) {
@@ -1872,58 +3836,58 @@ export const getStorage = () => {
 const TABLE_SCHEMAS = {
   users: {
     primaryKey: 'id',
-    columns: ['id', 'username', 'displayName', 'email', 'passwordHash', 'authProvider', 'avatar', 'banner', 'bio', 'customStatus', 'status', 'socialLinks', 'ageVerification', 'host', 'createdAt', 'updatedAt'],
-    dataFormat: 'object' // { userId: { ...userData } }
+    columns: ['id', 'username', 'displayName', 'email', 'passwordHash', 'authProvider', 'avatar', 'banner', 'bio', 'customStatus', 'status', 'socialLinks', 'ageVerification', 'ageVerificationJurisdiction', 'host', 'createdAt', 'updatedAt', 'customUsername', 'avatarHost', 'adminRole', 'proofSummary', 'device', 'isAdmin', 'isModerator', 'profileTheme', 'profileBackground', 'profileAccentColor', 'profileFont', 'profileAnimation', 'profileBackgroundType', 'profileBackgroundOpacity', 'birthDate'],
+    dataFormat: 'object'
   },
   servers: {
     primaryKey: 'id',
-    columns: ['id', 'name', 'description', 'icon', 'banner', 'ownerId', 'createdAt', 'updatedAt', 'themeColor', 'bannerUrl', 'roles', 'members', 'bans', 'emojis', 'backgroundUrl'],
-    dataFormat: 'array' // [{ ...serverData }]
+    columns: ['id', 'name', 'description', 'icon', 'banner', 'ownerId', 'createdAt', 'updatedAt', 'themeColor', 'bannerUrl', 'backgroundUrl', 'bannerPosition', 'roles', 'members', 'bans', 'emojis', 'automod'],
+    dataFormat: 'object'
   },
   channels: {
     primaryKey: 'id',
-    columns: ['id', 'serverId', 'name', 'type', 'topic', 'position', 'createdAt', 'isDefault', 'slowMode', 'nsfw', 'updatedAt', 'categoryId'],
-    dataFormat: 'nested_array' // { serverId: [{ ...channelData }] }
+    columns: ['id', 'serverId', 'name', 'type', 'isDefault', 'topic', 'slowMode', 'nsfw', 'categoryId', 'position', 'createdAt', 'updatedAt', 'permissions'],
+    dataFormat: 'object'
   },
   messages: {
     primaryKey: 'id',
-    columns: ['id', 'channelId', 'authorId', 'content', 'type', 'createdAt', 'updatedAt', 'mentions', 'attachments', 'embeds', 'replyTo', 'edited', 'editedAt', 'username', 'avatar', 'storage', 'encrypted', 'iv', 'epoch', 'bot', 'timestamp'],
-    dataFormat: 'messages' // { channelId: [{ ...messageData }] }
+    columns: ['id', 'channelId', 'userId', 'authorId', 'content', 'type', 'createdAt', 'updatedAt', 'mentions', 'attachments', 'embeds', 'replyTo', 'edited', 'editedAt', 'username', 'avatar', 'storage', 'encrypted', 'iv', 'epoch', 'bot', 'timestamp'],
+    dataFormat: 'messages'
   },
   friends: {
-    primaryKey: null, // Composite key
+    primaryKey: 'userId',
     columns: ['userId', 'friendId', 'createdAt'],
-    dataFormat: 'friends_list' // { userId: [friendId1, friendId2] }
+    dataFormat: 'friends_list'
   },
   friend_requests: {
     primaryKey: 'id',
-    columns: ['id', 'fromUserId', 'toUserId', 'fromUsername', 'toUsername', 'createdAt', 'direction'],
-    dataFormat: 'friend_requests' // { incoming: { userId: [...] }, outgoing: { userId: [...] } }
+    columns: ['id', 'fromUserId', 'toUserId', 'fromUsername', 'toUsername', 'createdAt', 'status', 'respondedAt', 'direction'],
+    dataFormat: 'friend_requests'
   },
   dms: {
     primaryKey: 'id',
-    columns: ['id', 'type', 'createdAt', 'participants'],
-    dataFormat: 'nested_array' // { userId: [{ ...dmData }] }
+    columns: ['id', 'participantKey', 'participants_json', 'createdAt', 'lastMessageAt', 'isGroup', 'groupName', 'ownerId', 'recipientId'],
+    dataFormat: 'dm_conversations'
   },
   dm_messages: {
     primaryKey: 'id',
-    columns: ['id', 'dmId', 'senderId', 'content', 'createdAt'],
-    dataFormat: 'nested_array' // { dmId: [{ ...messageData }] }
+    columns: ['id', 'conversationId', 'userId', 'username', 'avatar', 'content', 'bot', 'encrypted', 'iv', 'epoch', 'timestamp', 'mentions_json', 'storage_json', 'edited', 'editedAt', 'replyTo', 'attachments', 'keyVersion', 'createdAt'],
+    dataFormat: 'dm_messages'
   },
   reactions: {
     primaryKey: 'id',
     columns: ['id', 'messageId', 'emoji', 'userIds', 'createdAt'],
-    dataFormat: 'reactions' // { messageId: { emoji: [userIds] } }
+    dataFormat: 'reactions'
   },
   blocked: {
-    primaryKey: null, // Composite key
+    primaryKey: 'userId',
     columns: ['userId', 'blockedUserId', 'createdAt'],
-    dataFormat: 'nested_array' // { userId: [blockedId1, ...] }
+    dataFormat: 'nested_array'
   },
   files: {
     primaryKey: 'id',
     columns: ['id', 'name', 'type', 'mimetype', 'size', 'sizeBytes', 'url', 'filename', 'uploadedAt', 'uploadedBy', 'path', 'createdAt'],
-    dataFormat: 'object' // { fileId: { ...fileData } }
+    dataFormat: 'object'
   },
   attachments: {
     primaryKey: 'id',
@@ -1933,7 +3897,7 @@ const TABLE_SCHEMAS = {
   discovery: {
     primaryKey: 'id',
     columns: ['id', 'serverId', 'name', 'icon', 'description', 'category', 'memberCount', 'submittedBy', 'submittedAt', 'status', 'approvedAt'],
-    dataFormat: 'discovery' // { submissions: [...], approved: [...] }
+    dataFormat: 'object'
   },
   global_bans: {
     primaryKey: 'id',
@@ -1943,46 +3907,48 @@ const TABLE_SCHEMAS = {
   server_bans: {
     primaryKey: 'id',
     columns: ['id', 'serverId', 'userId', 'reason', 'bannedBy', 'bannedAt'],
-    dataFormat: 'server_bans' // Embedded in servers, extracted
+    dataFormat: 'object'
   },
   admin_logs: {
     primaryKey: 'id',
-    columns: ['id', 'action', 'adminId', 'targetId', 'targetType', 'details', 'createdAt'],
-    dataFormat: 'array' // [{ ...logData }]
+    columns: ['id', 'adminId', 'action', 'targetId', 'details', 'timestamp'],
+    dataFormat: 'array'
   },
   invites: {
     primaryKey: 'code',
     columns: ['code', 'serverId', 'createdBy', 'uses', 'maxUses', 'expiresAt', 'createdAt'],
-    dataFormat: 'nested_array' // { serverId: [{ ...inviteData }] }
-  },
-  server_members: {
-    primaryKey: null, // Composite key
-    columns: ['serverId', 'userId', 'roles', 'joinedAt'],
     dataFormat: 'object'
   },
   pinned_messages: {
     primaryKey: 'id',
     columns: ['id', 'channelId', 'userId', 'username', 'avatar', 'content', 'timestamp', 'pinnedAt', 'pinnedBy'],
-    dataFormat: 'pinned_messages' // { channelId: [pinnedMsgs] }
+    dataFormat: 'object'
   },
   categories: {
     primaryKey: 'id',
     columns: ['id', 'serverId', 'name', 'position', 'createdAt'],
-    dataFormat: 'categories' // { serverId: [categories] }
+    dataFormat: 'object'
   },
   call_logs: {
-    primaryKey: 'id',
-    columns: ['id', 'dmId', 'callId', 'participants', 'startedAt', 'endedAt', 'duration'],
-    dataFormat: 'nested_array' // { dmId: [callLogs] }
+    primaryKey: 'callId',
+    columns: ['callId', 'conversationId', 'callerId', 'recipientId', 'type', 'status', 'duration', 'startedAt', 'endedAt', 'endedBy', 'updatedAt'],
+    dataFormat: 'object'
   },
-  // Additional tables that may be in storage_kv - stored as JSON blobs
+  bots: {
+    primaryKey: 'id',
+    columns: ['id', 'name', 'description', 'avatar', 'ownerId', 'token', 'tokenHash', 'prefix', 'permissions_json', 'servers_json', 'intents_json', 'commands_json', 'status', 'public', 'webhookUrl', 'webhookSecret', 'customStatus', 'createdAt', 'updatedAt', 'lastActive'],
+    dataFormat: 'object'
+  },
   e2e_keys: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' },
-  e2e_true: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' },
+  e2e_true_state: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' },
   system_messages: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' },
   self_volts: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' },
   federation: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' },
   server_start: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' },
-  bots: { primaryKey: 'id', columns: ['id', 'data'], dataFormat: 'json_blob' }
+  activity_apps: { primaryKey: 'id', columns: ['id', 'client_id', 'client_secret', 'owner_id', 'name', 'description', 'redirect_uris', 'scopes', 'created_at', 'updated_at'], dataFormat: 'object' },
+  activity_oauth_codes: { primaryKey: 'code', columns: ['code', 'client_id', 'user_id', 'scope', 'redirect_uri', 'context_type', 'context_id', 'session_id', 'app_id', 'expires_at'], dataFormat: 'object' },
+  activity_oauth_tokens: { primaryKey: 'access_token', columns: ['access_token', 'app_id', 'client_id', 'user_id', 'scope', 'context_type', 'context_id', 'session_id', 'created_at', 'expires_at'], dataFormat: 'object' },
+  activity_public: { primaryKey: 'id', columns: ['id', 'owner_id', 'name', 'description', 'icon', 'category', 'launch_url', 'visibility', 'is_builtin_client', 'created_at', 'updated_at'], dataFormat: 'object' }
 }
 
 /**
@@ -2103,6 +4069,7 @@ export const distributeFromStorageKv = async () => {
  * Handles various data formats from storage_kv
  */
 const distributeTableToIndividual = async (tableName, tableData, storage) => {
+  tableName = assertSafeTableName(tableName)
   const schema = TABLE_SCHEMAS[tableName]
   const dataFormat = schema?.dataFormat || 'object'
   let count = 0
@@ -2322,6 +4289,74 @@ const distributeTableToIndividual = async (tableName, tableData, storage) => {
       }
       break
 
+    case 'dm_conversations':
+      // DMs: { userId: [{ ...conversationData }] }
+      // Normalize to one row per conversation id.
+      if (typeof tableData === 'object' && !Array.isArray(tableData)) {
+        const byConversation = new Map()
+        for (const conversations of Object.values(tableData)) {
+          if (!Array.isArray(conversations)) continue
+          for (const conv of conversations) {
+            if (typeof conv === 'object' && conv !== null && conv.id && !byConversation.has(conv.id)) {
+              byConversation.set(conv.id, conv)
+            }
+          }
+        }
+        for (const conv of byConversation.values()) {
+          let participants = Array.isArray(conv.participants) ? conv.participants.filter(Boolean) : []
+          if (participants.length === 0 && typeof conv.participantKey === 'string') {
+            participants = conv.participantKey.split(':').filter(Boolean)
+          }
+          participants = Array.from(new Set(participants))
+          records.push({
+            id: conv.id,
+            participantKey: conv.participantKey || participants.slice().sort().join(':'),
+            participants_json: JSON.stringify(participants),
+            createdAt: conv.createdAt || null,
+            lastMessageAt: conv.lastMessageAt || conv.createdAt || null,
+            isGroup: conv.isGroup ? 1 : 0,
+            groupName: conv.groupName || null,
+            ownerId: conv.ownerId || null,
+            recipientId: conv.recipientId || (participants.length === 2 ? participants[1] : null)
+          })
+        }
+      }
+      break
+
+    case 'dm_messages':
+      // DM messages: { conversationId: [{ ...messageData }] }
+      if (typeof tableData === 'object' && !Array.isArray(tableData)) {
+        for (const [conversationId, messages] of Object.entries(tableData)) {
+          if (!Array.isArray(messages)) continue
+          for (const msg of messages) {
+            if (typeof msg === 'object' && msg !== null && msg.id) {
+              records.push({
+                id: msg.id,
+                conversationId: msg.conversationId || conversationId,
+                userId: msg.userId || null,
+                username: msg.username || null,
+                avatar: msg.avatar || null,
+                content: msg.content || null,
+                bot: msg.bot ? 1 : 0,
+                encrypted: msg.encrypted ? 1 : 0,
+                iv: msg.iv || null,
+                epoch: msg.epoch || null,
+                timestamp: msg.timestamp || msg.createdAt || null,
+                mentions_json: JSON.stringify(Array.isArray(msg.mentions) ? msg.mentions : []),
+                storage_json: msg.storage ? JSON.stringify(msg.storage) : null,
+                edited: msg.edited ? 1 : 0,
+                editedAt: msg.editedAt || null,
+                replyTo: msg.replyTo ? JSON.stringify(msg.replyTo) : null,
+                attachments: JSON.stringify(Array.isArray(msg.attachments) ? msg.attachments : []),
+                keyVersion: msg.keyVersion || null,
+                createdAt: msg.createdAt || msg.timestamp || null
+              })
+            }
+          }
+        }
+      }
+      break
+
     case 'categories':
       // Categories: { serverId: [categories] }
       if (typeof tableData === 'object' && !Array.isArray(tableData)) {
@@ -2426,12 +4461,7 @@ const distributeTableToIndividual = async (tableName, tableData, storage) => {
         continue
       }
       try {
-        const values = columns.map(col => {
-          const val = record[col]
-          if (val === undefined || val === null) return null
-          if (typeof val === 'object') return JSON.stringify(val)
-          return String(val)
-        })
+        const values = columns.map(col => normalizeSqlValue(record[col]))
         insertStmt.run(values)
         count++
       } catch (err) {
@@ -2485,12 +4515,7 @@ const distributeTableToIndividual = async (tableName, tableData, storage) => {
           continue
         }
         try {
-          const values = columns.map(col => {
-            const val = record[col]
-            if (val === undefined || val === null) return null
-            if (typeof val === 'object') return JSON.stringify(val)
-            return String(val)
-          })
+          const values = columns.map(col => normalizeSqlValue(record[col]))
           await conn.query(insertSql, values)
           count++
         } catch (err) {
@@ -2532,6 +4557,36 @@ export const FILES = {
   adminLogs: 'admin_logs'
 }
 
+export const getServers = () => {
+  const store = getStorage()
+  return store ? store.load('servers', {}) : {}
+}
+
+export const setServers = (servers) => {
+  const store = getStorage()
+  return store ? store.save('servers', servers) : false
+}
+
+export const getAllChannels = () => {
+  const store = getStorage()
+  return store ? store.load('channels', {}) : {}
+}
+
+export const setAllChannels = (channels) => {
+  const store = getStorage()
+  return store ? store.save('channels', channels) : false
+}
+
+export const getAllCategories = () => {
+  const store = getStorage()
+  return store ? store.load('categories', {}) : {}
+}
+
+export const setAllCategories = (categories) => {
+  const store = getStorage()
+  return store ? store.save('categories', categories) : false
+}
+
 export default {
   initStorage,
   initStorageAndDistribute,
@@ -2540,5 +4595,11 @@ export default {
   distributeFromStorageKv,
   checkStorageKvExists,
   TABLE_SCHEMAS,
-  FILES
+  FILES,
+  getServers,
+  setServers,
+  getAllChannels,
+  setAllChannels,
+  getAllCategories,
+  setAllCategories
 }

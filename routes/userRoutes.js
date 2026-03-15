@@ -1,35 +1,135 @@
 import express from 'express'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import multer from 'multer'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import config from '../config/config.js'
-import path from 'path'
-import { fileURLToPath } from 'url'
+import { federationService } from '../services/federationService.js'
+import { cdnService } from '../services/cdnService.js'
 import { 
   userService, 
   friendService, 
   friendRequestService, 
   blockService,
+  serverService,
+  channelService,
+  messageService,
   FILES
 } from '../services/dataService.js'
 import { isUserOnline } from '../services/socketService.js'
 import { validateUsername, validateDisplayName } from '../utils/validation.js'
-import fs from 'fs'
+import { AGE_VERIFICATION_JURISDICTIONS, getAgeVerificationJurisdiction, normalizeAgeVerification } from '../utils/ageVerificationPolicy.js'
 
-const loadData = (file, defaultValue = {}) => {
-  try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'))
-    }
-  } catch (err) {
-    console.error(`[Data] Error loading ${file}:`, err.message)
-  }
-  return defaultValue
+const toArray = (value) => {
+  if (Array.isArray(value)) return value
+  if (value && typeof value === 'object') return Object.values(value)
+  return []
 }
 
 const router = express.Router()
+const TEMP_UPLOAD_DIR = path.join(os.tmpdir(), 'volt-avatar-uploads')
+
+if (!fs.existsSync(TEMP_UPLOAD_DIR)) {
+  fs.mkdirSync(TEMP_UPLOAD_DIR, { recursive: true })
+}
+
+const avatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, TEMP_UPLOAD_DIR),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase()
+      const safeExt = ext || '.bin'
+      cb(null, `${req.user?.id || 'user'}-${Date.now()}${safeExt}`)
+    }
+  }),
+  fileFilter: (req, file, cb) => {
+    if (typeof file?.mimetype === 'string' && file.mimetype.startsWith('image/')) {
+      return cb(null, true)
+    }
+    cb(new Error('Only image files can be used as profile pictures'))
+  },
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+    files: 1
+  }
+})
+
+const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
+
+const removeTempFile = (filePath) => {
+  if (!filePath) return
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+  } catch (err) {
+    console.warn(`[Avatar] Failed to remove temp file ${filePath}: ${err.message}`)
+  }
+}
+
+const toAbsoluteFileUrl = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  if (/^https?:\/\//i.test(raw)) return raw
+  if (raw.startsWith('data:image/')) return raw
+  const baseUrl = String(config.getImageServerUrl() || config.getServerUrl() || '').replace(/\/$/, '')
+  if (!baseUrl) return raw
+  return `${baseUrl}${raw.startsWith('/') ? raw : `/${raw}`}`
+}
+
+const resolveStoredProfileImage = (value, fallbackUrl = null) => {
+  const raw = String(value || '').trim()
+  if (!raw) return fallbackUrl
+  if (raw.startsWith('data:image/')) return raw
+  if (/^https?:\/\//i.test(raw)) return raw
+  if (raw.startsWith('/')) return toAbsoluteFileUrl(raw)
+  return fallbackUrl
+}
+
+const extractManagedUploadFilename = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const absoluteBase = String(config.getImageServerUrl() || config.getServerUrl() || '').replace(/\/$/, '')
+  const normalized = absoluteBase && raw.startsWith(absoluteBase) ? raw.slice(absoluteBase.length) : raw
+  const match = normalized.match(/^\/api\/upload\/file\/([^/?#]+)$/)
+  return match?.[1] || null
+}
+
+const runAvatarUpload = (req, res) => new Promise((resolve, reject) => {
+  avatarUpload.single('avatar')(req, res, (err) => {
+    if (err) return reject(err)
+    resolve()
+  })
+})
 
 const getAvatarUrl = (userId) => {
-  const imageServerUrl = config.getImageServerUrl()
-  return `${imageServerUrl}/api/images/users/${userId}/profile`
+  const safeUserId = String(userId || '')
+  if (!safeUserId) return null
+  const baseUrl = safeUserId.startsWith('u_')
+    ? (config.getServerUrl() || config.getImageServerUrl())
+    : config.getImageServerUrl()
+  return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
+}
+
+const resolveUserAvatar = (userId, profile = null) => {
+  const explicit = profile?.imageUrl || profile?.imageurl || profile?.avatar || null
+  const resolved = resolveStoredProfileImage(explicit, null)
+  if (resolved) return resolved
+  return getAvatarUrl(userId)
+}
+
+const resolvePresenceStatus = (userId, profile = null) => {
+  const profileHost = normalizeHost(profile?.host || config.getHost())
+  const localHost = normalizeHost(config.getHost())
+  if (profileHost && profileHost !== localHost) {
+    return profile?.status || 'offline'
+  }
+  const online = isUserOnline(userId)
+  if (!online) return 'offline'
+  // User is online - return their actual status (idle, dnd, invisible, online)
+  // Never return 'offline' for an online user
+  const status = profile?.status
+  if (!status || status === 'offline') return 'online'
+  return status
 }
 
 const sanitizeProofSummary = (proof = {}, depth = 0) => {
@@ -56,15 +156,51 @@ const computeAge = (birthYear) => {
   return currentYear - year
 }
 
+const BIRTHDATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
+
+const normalizeBirthDate = (value) => {
+  if (typeof value === 'undefined') return undefined
+  if (value === null || value === '') return null
+  if (typeof value !== 'string' || !BIRTHDATE_PATTERN.test(value)) return null
+  const parsed = new Date(`${value}T00:00:00Z`)
+  if (Number.isNaN(parsed.getTime()) || parsed > new Date()) return null
+  const ageYears = new Date().getUTCFullYear() - parsed.getUTCFullYear()
+  if (ageYears > 120) return null
+  return value
+}
+
+const normalizeHost = (value) => federationService.normalizeHost?.(value) || String(value || '').toLowerCase()
+
+const parseFederatedHandle = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const cleaned = raw.startsWith('@') ? raw.slice(1) : raw
+  const idx = cleaned.lastIndexOf(':')
+  if (idx <= 0) return null
+  return {
+    username: cleaned.slice(0, idx),
+    host: normalizeHost(cleaned.slice(idx + 1))
+  }
+}
+
+const buildAddress = (profile = {}) => {
+  const username = profile?.customUsername || profile?.username || ''
+  const host = normalizeHost(profile?.host || config.getHost())
+  return username && host ? `${username}:${host}` : username || ''
+}
+
 // Ensure authenticated user's profile exists in storage
-const ensureUserProfile = (req, res, next) => {
-  userService.saveUser(req.user.id, {
-    username: req.user.username,
-    displayName: req.user.displayName || req.user.username,
-    email: req.user.email,
-    host: req.user.host || config.getHost(),
-    avatarHost: config.getImageServerUrl()
-  })
+const ensureUserProfile = async (req, res, next) => {
+  const existingProfile = userService.getUser(req.user.id)
+  if (!existingProfile) {
+    await userService.saveUser(req.user.id, {
+      username: req.user.username,
+      displayName: req.user.displayName || req.user.username,
+      email: req.user.email,
+      host: req.user.host || config.getHost(),
+      avatarHost: config.getImageServerUrl()
+    })
+  }
   next()
 }
 
@@ -75,8 +211,8 @@ router.use(authenticateToken, ensureUserProfile)
 router.get('/me', async (req, res) => {
   try {
     const profile = userService.getUser(req.user.id)
-    const avatarUrl = getAvatarUrl(req.user.id)
-    const bannerUrl = profile?.banner ? `${config.getImageServerUrl()}/api/images/users/${req.user.id}/banner` : null
+    const avatarUrl = resolveUserAvatar(req.user.id, profile)
+    const bannerUrl = resolveStoredProfileImage(profile?.banner, null)
     
     res.json({
       ...req.user,
@@ -84,6 +220,7 @@ router.get('/me', async (req, res) => {
       id: req.user.id,
       host: profile?.host || req.user.host || config.getHost(),
       avatarHost: profile?.avatarHost || config.getImageServerUrl(),
+      imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
       avatar: avatarUrl,
       banner: bannerUrl
     })
@@ -92,9 +229,97 @@ router.get('/me', async (req, res) => {
   }
 })
 
+router.post('/avatar', async (req, res) => {
+  try {
+    await runAvatarUpload(req, res)
+
+    if (!req.file && typeof req.body?.avatar === 'string') {
+      const avatarUrl = resolveStoredProfileImage(req.body.avatar, req.body.avatar)
+      const profile = await userService.updateProfile(req.user.id, {
+        avatar: avatarUrl,
+        imageUrl: avatarUrl,
+        imageurl: avatarUrl,
+        avatarHost: config.getImageServerUrl()
+      })
+
+      return res.json({
+        success: true,
+        avatar: avatarUrl,
+        imageUrl: avatarUrl,
+        avatarHost: profile?.avatarHost || config.getImageServerUrl()
+      })
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No avatar image uploaded' })
+    }
+
+    const existingProfile = userService.getUser(req.user.id) || {}
+    const previousFilename = extractManagedUploadFilename(existingProfile.imageUrl || existingProfile.avatar)
+    const uploadResult = await cdnService.upload(req.file, { userId: req.user.id, type: 'avatar' })
+    const avatarUrl = toAbsoluteFileUrl(uploadResult?.url)
+
+    const profile = await userService.updateProfile(req.user.id, {
+      avatar: avatarUrl,
+      imageUrl: avatarUrl,
+      imageurl: avatarUrl,
+      avatarHost: config.getImageServerUrl()
+    })
+
+    if (previousFilename && previousFilename !== uploadResult?.filename) {
+      try {
+        await cdnService.delete(previousFilename)
+      } catch (err) {
+        console.warn(`[Avatar] Failed to delete previous avatar ${previousFilename}: ${err.message}`)
+      }
+    }
+
+    removeTempFile(req.file.path)
+
+    res.json({
+      success: true,
+      avatar: avatarUrl,
+      imageUrl: avatarUrl,
+      avatarHost: profile?.avatarHost || config.getImageServerUrl()
+    })
+  } catch (error) {
+    removeTempFile(req.file?.path)
+    console.error('[API] Avatar upload failed:', error)
+    const statusCode = error?.message?.includes('Only image files') || error?.message?.includes('File too large') ? 400 : 500
+    res.status(statusCode).json({ error: error.message || 'Avatar upload failed' })
+  }
+})
+
+router.delete('/avatar', async (req, res) => {
+  try {
+    const existingProfile = userService.getUser(req.user.id) || {}
+    const previousFilename = extractManagedUploadFilename(existingProfile.imageUrl || existingProfile.avatar)
+
+    await userService.updateProfile(req.user.id, {
+      avatar: null,
+      imageUrl: null,
+      imageurl: null,
+      avatarHost: config.getImageServerUrl()
+    })
+
+    if (previousFilename) {
+      try {
+        await cdnService.delete(previousFilename)
+      } catch (err) {
+        console.warn(`[Avatar] Failed to delete avatar ${previousFilename}: ${err.message}`)
+      }
+    }
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error('[API] Avatar delete failed:', error)
+    res.status(500).json({ error: 'Failed to delete avatar' })
+  }
+})
+
 // Update profile
 router.put('/profile', async (req, res) => {
-  const { displayName, bio, customStatus, socialLinks, banner, customUsername } = req.body
+  const { displayName, bio, customStatus, socialLinks, banner, avatar, customUsername, birthDate } = req.body
   const updates = {}
   
   if (customUsername !== undefined) {
@@ -119,9 +344,22 @@ router.put('/profile', async (req, res) => {
     }
     updates.displayName = displayName
   }
+  if (birthDate !== undefined) {
+    const normalizedBirthDate = normalizeBirthDate(birthDate)
+    if (birthDate && !normalizedBirthDate) {
+      return res.status(400).json({ error: 'Birth date must be a valid date in YYYY-MM-DD format' })
+    }
+    updates.birthDate = normalizedBirthDate
+  }
   if (bio !== undefined) updates.bio = bio
   if (customStatus !== undefined) updates.customStatus = customStatus
-  if (banner !== undefined) updates.banner = banner
+  if (banner !== undefined) updates.banner = resolveStoredProfileImage(banner, banner)
+  if (avatar !== undefined) {
+    const resolvedAvatar = resolveStoredProfileImage(avatar, avatar)
+    updates.avatar = resolvedAvatar
+    updates.imageUrl = resolvedAvatar
+    updates.imageurl = resolvedAvatar
+  }
   if (socialLinks !== undefined) {
     const allowed = ['github', 'twitter', 'youtube', 'twitch', 'website', 'steam', 'spotify']
     const sanitized = {}
@@ -133,7 +371,7 @@ router.put('/profile', async (req, res) => {
     updates.socialLinks = sanitized
   }
   
-  const profile = userService.updateProfile(req.user.id, updates)
+  const profile = await userService.updateProfile(req.user.id, updates)
   console.log(`[API] Profile updated for ${req.user.username}`)
   res.json(profile)
 })
@@ -147,7 +385,7 @@ router.put('/status', async (req, res) => {
     return res.status(400).json({ error: 'Invalid status' })
   }
   
-  const profile = userService.setStatus(req.user.id, status, customStatus)
+  const profile = await userService.setStatus(req.user.id, status, customStatus)
   console.log(`[API] Status updated for ${req.user.username}: ${status}`)
   res.json(profile)
 })
@@ -155,11 +393,55 @@ router.put('/status', async (req, res) => {
 // Age verification status
 router.get('/age-verification/status', async (req, res) => {
   const profile = userService.getUser(req.user.id)
-  res.json({ ageVerification: profile?.ageVerification || null })
+  const ageVerification = normalizeAgeVerification(profile?.ageVerification, profile || {})
+  res.json({
+    ageVerification,
+    jurisdictionCode: profile?.ageVerificationJurisdiction || ageVerification?.jurisdictionCode,
+    jurisdictions: AGE_VERIFICATION_JURISDICTIONS
+  })
+})
+
+router.post('/age-verification/jurisdiction', async (req, res) => {
+  const { jurisdictionCode } = req.body || {}
+  const jurisdiction = getAgeVerificationJurisdiction(jurisdictionCode)
+  await userService.updateProfile(req.user.id, { ageVerificationJurisdiction: jurisdiction.code })
+  const profile = userService.getUser(req.user.id)
+  res.json({
+    ageVerification: normalizeAgeVerification(profile?.ageVerification, profile || {}),
+    jurisdictionCode: jurisdiction.code,
+    jurisdictions: AGE_VERIFICATION_JURISDICTIONS
+  })
+})
+
+router.post('/age-verification/self-attest', async (req, res) => {
+  const profile = userService.getUser(req.user.id) || {}
+  const status = normalizeAgeVerification(profile?.ageVerification, profile)
+
+  if (status.requiresProofVerification) {
+    return res.status(400).json({ error: 'This jurisdiction requires full age verification before 18+ access is granted.' })
+  }
+
+  const verificationRecord = await userService.setAgeVerification(req.user.id, {
+    verified: false,
+    method: 'self_attestation',
+    category: 'adult',
+    selfDeclaredAdult: true,
+    age: 18,
+    estimatedAge: 18,
+    device: req.body?.device || 'web',
+    source: 'self_attestation',
+    jurisdictionCode: profile?.ageVerificationJurisdiction || status.jurisdictionCode
+  })
+
+  res.json({
+    ageVerification: verificationRecord.ageVerification,
+    jurisdictionCode: verificationRecord.ageVerificationJurisdiction,
+    jurisdictions: AGE_VERIFICATION_JURISDICTIONS
+  })
 })
 
 router.post('/age-verification', async (req, res) => {
-  const { method, birthYear, proofSummary = {}, device, category, estimatedAge } = req.body || {}
+  const { method, birthYear, proofSummary = {}, device, category, estimatedAge, jurisdictionCode } = req.body || {}
 
   if (!method || !['face', 'id', 'hybrid'].includes(method)) {
     return res.status(400).json({ error: 'method must be "face", "id", or "hybrid"' })
@@ -169,18 +451,23 @@ router.post('/age-verification', async (req, res) => {
 
   const age = computeAge(birthYear)
   const sanitizedProof = sanitizeProofSummary(proofSummary)
-  const verificationRecord = userService.setAgeVerification(req.user.id, {
+  const verificationRecord = await userService.setAgeVerification(req.user.id, {
     method,
     birthYear: birthYear || null,
     age,
     proofSummary: sanitizedProof,
     device: device || null,
     category: normalizedCategory,
-    estimatedAge: estimatedAge || age
+    estimatedAge: estimatedAge || age,
+    jurisdictionCode
   })
 
   console.log(`[API] Age verification stored for ${req.user.username} via ${method} - ${normalizedCategory}`)
-  res.json({ ageVerification: verificationRecord.ageVerification })
+  res.json({
+    ageVerification: verificationRecord.ageVerification,
+    jurisdictionCode: verificationRecord.ageVerificationJurisdiction,
+    jurisdictions: AGE_VERIFICATION_JURISDICTIONS
+  })
 })
 
 // Search users
@@ -194,7 +481,11 @@ router.get('/search', async (req, res) => {
   let searchUsername = q
   let searchHost = null
   
-  if (q.includes('@')) {
+  const federatedHandle = parseFederatedHandle(q)
+  if (federatedHandle) {
+    searchUsername = federatedHandle.username
+    searchHost = federatedHandle.host
+  } else if (q.includes('@')) {
     const parts = q.split('@')
     searchUsername = parts[0]
     searchHost = parts[1]
@@ -220,8 +511,10 @@ router.get('/search', async (req, res) => {
       username: u.customUsername || u.username,
       originalUsername: u.username,
       displayName: u.displayName,
-      avatar: getAvatarUrl(u.id),
-      host: u.host || localHost
+      imageUrl: u.imageUrl || u.imageurl || u.avatar || null,
+      avatar: resolveUserAvatar(u.id, u),
+      host: u.host || localHost,
+      address: buildAddress(u)
     }))
   
   res.json(results)
@@ -233,17 +526,18 @@ router.get('/friends', async (req, res) => {
   const localHost = config.getHost()
   const friends = friendIds.map(friendId => {
     const profile = userService.getUser(friendId)
-    const online = isUserOnline(friendId)
-    const status = online ? (profile?.status === 'invisible' ? 'invisible' : (profile?.status || 'online')) : 'offline'
+    const status = resolvePresenceStatus(friendId, profile)
     return {
       id: friendId,
       username: profile?.customUsername || profile?.username || 'Unknown',
       originalUsername: profile?.username,
       displayName: profile?.displayName,
-      avatar: getAvatarUrl(friendId),
+      imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+      avatar: resolveUserAvatar(friendId, profile),
       status,
       customStatus: profile?.customStatus,
-      host: profile?.host || localHost
+      host: profile?.host || localHost,
+      address: buildAddress(profile)
     }
   })
   
@@ -260,13 +554,14 @@ router.get('/friend-requests', async (req, res) => {
 
 // Get blocked users - MUST be before /:userId
 router.get('/blocked', async (req, res) => {
-  const blockedIds = blockService.getBlocked(req.user.id)
+  const blockedIds = await blockService.getBlocked(req.user.id)
   const blocked = blockedIds.map(id => {
     const profile = userService.getUser(id)
     return {
       id,
       username: profile?.username || 'Unknown',
-      avatar: getAvatarUrl(id)
+      imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+      avatar: resolveUserAvatar(id, profile)
     }
   })
   res.json(blocked)
@@ -287,20 +582,21 @@ router.get('/:userId', async (req, res) => {
   
   const isFriend = friendService.areFriends(req.user.id, userId)
   const isBlocked = blockService.isBlocked(req.user.id, userId)
-  const online = isUserOnline(userId)
-  const liveStatus = online ? (profile.status === 'invisible' ? 'invisible' : (profile.status || 'online')) : 'offline'
+  const liveStatus = resolvePresenceStatus(userId, profile)
   
   // Generate avatar URL dynamically to ensure correct server
-  const avatarUrl = getAvatarUrl(userId)
-  const bannerUrl = profile.banner ? `${config.getImageServerUrl()}/api/images/users/${userId}/banner` : null
+  const avatarUrl = resolveUserAvatar(userId, profile)
+  const bannerUrl = resolveStoredProfileImage(profile.banner, null)
   
   res.json({
     ...profile,
     host: profile.host || config.getHost(),
     avatarHost: profile.avatarHost || config.getImageServerUrl(),
+    imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
     avatar: avatarUrl,
     banner: bannerUrl,
     status: liveStatus,
+    address: buildAddress(profile),
     isFriend,
     isBlocked
   })
@@ -316,8 +612,25 @@ router.post('/friend-request', async (req, res) => {
   
   let targetUserId = userId
   let targetUsername = null
+  let targetHost = null
+  const localHost = normalizeHost(config.getHost())
+
+  const federatedHandle = username ? parseFederatedHandle(username) : null
   
-  if (username && !userId) {
+  if (federatedHandle && !userId) {
+    const allUsers = userService.getAllUsers()
+    const targetUser = Object.values(allUsers).find(
+      (user) => (user.host || localHost) === federatedHandle.host
+        && (user.username?.toLowerCase() === federatedHandle.username.toLowerCase()
+          || user.customUsername?.toLowerCase() === federatedHandle.username.toLowerCase())
+    )
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+    targetUserId = targetUser.id
+    targetUsername = targetUser.customUsername || targetUser.username
+    targetHost = normalizeHost(targetUser.host || federatedHandle.host)
+  } else if (username && !userId) {
     const allUsers = userService.getAllUsers()
     const targetUser = Object.values(allUsers).find(
       u => u.username?.toLowerCase() === username.toLowerCase()
@@ -327,6 +640,12 @@ router.post('/friend-request', async (req, res) => {
     }
     targetUserId = targetUser.id
     targetUsername = targetUser.username
+  }
+
+  if (!targetUsername && targetUserId) {
+    const targetProfile = userService.getUser(targetUserId)
+    targetUsername = targetProfile?.customUsername || targetProfile?.username || null
+    targetHost = normalizeHost(targetProfile?.host)
   }
   
   if (targetUserId === req.user.id) {
@@ -340,11 +659,42 @@ router.post('/friend-request', async (req, res) => {
   if (blockService.isBlocked(req.user.id, targetUserId)) {
     return res.status(400).json({ error: 'User is blocked' })
   }
+
+  if (targetHost && targetHost !== localHost) {
+    const peer = federationService.getPeerByHost(targetHost)
+    if (!peer || peer.status !== 'connected') {
+      return res.status(400).json({ error: 'Remote server is not connected for federation' })
+    }
+  }
   
-  const result = friendRequestService.sendRequest(req.user.id, targetUserId, req.user.username, targetUsername)
+  const result = await friendRequestService.sendRequest(req.user.id, targetUserId, req.user.username, targetUsername)
   
   if (result.error) {
     return res.status(400).json({ error: result.error })
+  }
+
+  if (targetHost && targetHost !== localHost) {
+    const peer = federationService.getPeerByHost(targetHost)
+    const requesterProfile = userService.getUser(req.user.id)
+    federationService.queueRelayMessage(peer.id, {
+      type: 'friend:request',
+      payload: {
+        toUserId: userService.getUser(targetUserId)?.remoteUserId || String(targetUserId).split('@')[0],
+        toUsername: targetUsername,
+        from: {
+          id: req.user.id,
+          username: requesterProfile?.username || req.user.username,
+          displayName: requesterProfile?.displayName || req.user.username,
+          customUsername: requesterProfile?.customUsername || null,
+          avatar: requesterProfile?.avatar || requesterProfile?.imageUrl || null,
+          imageUrl: requesterProfile?.imageUrl || requesterProfile?.avatar || null,
+          avatarHost: requesterProfile?.avatarHost || config.getImageServerUrl(),
+          host: localHost,
+          status: requesterProfile?.status || 'online',
+          customStatus: requesterProfile?.customStatus || null
+        }
+      }
+    })
   }
   
   console.log(`[API] Friend request sent from ${req.user.username} to ${targetUserId}`)
@@ -353,15 +703,44 @@ router.post('/friend-request', async (req, res) => {
 
 // Accept friend request
 router.post('/friend-request/:id/accept', async (req, res) => {
-  const result = friendRequestService.acceptRequest(req.user.id, req.params.id)
+  const incomingRequest = friendRequestService.getRequests(req.user.id).incoming?.find(request => request.id === req.params.id)
+  const result = await friendRequestService.acceptRequest(req.user.id, req.params.id)
   
   if (result.error) {
     return res.status(400).json({ error: result.error })
   }
   
-  userService.saveUser(req.user.id, {
+  await userService.saveUser(req.user.id, {
     username: req.user.username
   })
+
+  const remoteProfile = incomingRequest?.from ? userService.getUser(incomingRequest.from) : null
+  const remoteHost = normalizeHost(remoteProfile?.host)
+  const localHost = normalizeHost(config.getHost())
+  if (incomingRequest?.from && remoteHost && remoteHost !== localHost) {
+    const peer = federationService.getPeerByHost(remoteHost)
+    if (peer?.status === 'connected') {
+      const accepterProfile = userService.getUser(req.user.id)
+      federationService.queueRelayMessage(peer.id, {
+        type: 'friend:accept',
+        payload: {
+          toUserId: remoteProfile?.remoteUserId || String(incomingRequest.from).split('@')[0],
+          from: {
+            id: req.user.id,
+            username: accepterProfile?.username || req.user.username,
+            displayName: accepterProfile?.displayName || req.user.username,
+            customUsername: accepterProfile?.customUsername || null,
+            avatar: accepterProfile?.avatar || accepterProfile?.imageUrl || null,
+            imageUrl: accepterProfile?.imageUrl || accepterProfile?.avatar || null,
+            avatarHost: accepterProfile?.avatarHost || config.getImageServerUrl(),
+            host: localHost,
+            status: accepterProfile?.status || 'online',
+            customStatus: accepterProfile?.customStatus || null
+          }
+        }
+      })
+    }
+  }
   
   console.log(`[API] Friend request ${req.params.id} accepted by ${req.user.username}`)
   res.json(result)
@@ -369,7 +748,7 @@ router.post('/friend-request/:id/accept', async (req, res) => {
 
 // Reject friend request
 router.post('/friend-request/:id/reject', async (req, res) => {
-  const result = friendRequestService.rejectRequest(req.user.id, req.params.id)
+  const result = await friendRequestService.rejectRequest(req.user.id, req.params.id)
   
   if (result.error) {
     return res.status(400).json({ error: result.error })
@@ -381,7 +760,7 @@ router.post('/friend-request/:id/reject', async (req, res) => {
 
 // Cancel outgoing friend request
 router.delete('/friend-request/:id', async (req, res) => {
-  const result = friendRequestService.cancelRequest(req.user.id, req.params.id)
+  const result = await friendRequestService.cancelRequest(req.user.id, req.params.id)
   
   if (result.error) {
     return res.status(400).json({ error: result.error })
@@ -401,7 +780,7 @@ router.delete('/friend-request/user/:userId', async (req, res) => {
     return res.status(404).json({ error: 'No pending friend request found' })
   }
   
-  const result = friendRequestService.cancelRequest(req.user.id, outgoingRequest.id)
+  const result = await friendRequestService.cancelRequest(req.user.id, outgoingRequest.id)
   
   if (result.error) {
     return res.status(400).json({ error: result.error })
@@ -413,21 +792,21 @@ router.delete('/friend-request/user/:userId', async (req, res) => {
 
 // Remove friend
 router.delete('/friends/:friendId', async (req, res) => {
-  friendService.removeFriend(req.user.id, req.params.friendId)
+  await friendService.removeFriend(req.user.id, req.params.friendId)
   console.log(`[API] Friend ${req.params.friendId} removed by ${req.user.username}`)
   res.json({ success: true })
 })
 
 // Block user
 router.post('/block/:userId', async (req, res) => {
-  blockService.blockUser(req.user.id, req.params.userId)
+  await blockService.blockUser(req.user.id, req.params.userId)
   console.log(`[API] User ${req.params.userId} blocked by ${req.user.username}`)
   res.json({ success: true })
 })
 
 // Unblock user
 router.delete('/block/:userId', async (req, res) => {
-  blockService.unblockUser(req.user.id, req.params.userId)
+  await blockService.unblockUser(req.user.id, req.params.userId)
   console.log(`[API] User ${req.params.userId} unblocked by ${req.user.username}`)
   res.json({ success: true })
 })
@@ -436,23 +815,34 @@ router.delete('/block/:userId', async (req, res) => {
 router.get('/unread-counts', async (req, res) => {
   try {
     const userId = req.user.id
-    const serversData = loadData(FILES.servers, [])
-    const messagesData = loadData(FILES.messages, {})
-    const usersData = loadData(FILES.users, {})
-    
-    const userServers = Object.values(usersData).find(u => u.id === userId)?.servers || []
+    const serversData = toArray(serverService.getAllServers())
+    const channelsData = channelService.getAllChannels()
+    const messagesData = messageService.getAllMessages()
+    const currentUser = userService.getUser(userId) || {}
+    const lastRead = currentUser.lastRead || {}
+    const userServers = serversData.filter(server => Array.isArray(server.members) && server.members.some(m => m?.id === userId))
+    const allChannels = []
+    for (const value of Object.values(channelsData || {})) {
+      if (Array.isArray(value)) {
+        allChannels.push(...value)
+      } else if (value && typeof value === 'object') {
+        allChannels.push(value)
+      }
+    }
+    const allMessages = Object.values(messagesData || {}).filter(m => m && typeof m === 'object')
     
     const counts = {}
-    for (const serverEntry of userServers) {
-      const serverId = typeof serverEntry === 'string' ? serverEntry : serverEntry.id
-      const server = serversData.find(s => s.id === serverId)
-      if (!server) continue
-      
+    for (const server of userServers) {
+      const serverId = server.id
       let unread = 0
-      for (const channel of server.channels || []) {
-        const channelMessages = Object.values(messagesData).filter(m => m.channelId === channel.id)
-        const lastRead = serverEntry.lastRead?.[channel.id] || 0
-        const newMessages = channelMessages.filter(m => m.id > lastRead && m.senderId !== userId)
+      const serverChannels = allChannels.filter(channel => channel?.serverId === serverId)
+      for (const channel of serverChannels) {
+        const channelMessages = allMessages.filter(m => m.channelId === channel.id)
+        const lastReadTs = lastRead[channel.id] || 0
+        const newMessages = channelMessages.filter(m => {
+          const ts = new Date(m.timestamp || m.createdAt || 0).getTime()
+          return ts > lastReadTs && m.userId !== userId
+        })
         unread += newMessages.length
       }
       
@@ -477,7 +867,7 @@ router.put('/settings/server-mute', async (req, res) => {
   const serverMutes = userData.serverMutes || {}
   serverMutes[serverId] = muted
   
-  userService.saveUser(userId, {
+  await userService.saveUser(userId, {
     ...userData,
     serverMutes
   })
@@ -505,7 +895,8 @@ router.get('/:userId/mutual-friends', async (req, res) => {
         id: friendId,
         username: profile?.username || 'Unknown',
         displayName: profile?.displayName,
-        avatar: getAvatarUrl(friendId)
+        imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+        avatar: resolveUserAvatar(friendId, profile)
       }
     })
     
@@ -516,27 +907,84 @@ router.get('/:userId/mutual-friends', async (req, res) => {
   }
 })
 
+router.get('/me/themes', async (req, res) => {
+  try {
+    const user = await userService.getUser(req.user.id)
+    const themes = user?.savedThemes || []
+    res.json(themes)
+  } catch (err) {
+    console.error('[API] Get saved themes error:', err)
+    res.status(500).json({ error: 'Failed to get themes' })
+  }
+})
+
+router.post('/me/themes', async (req, res) => {
+  try {
+    const { themeId, name, theme: themeData } = req.body
+    const user = await userService.getUser(req.user.id)
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+    
+    const savedThemes = user.savedThemes || []
+    const existingIndex = savedThemes.findIndex(t => t.themeId === themeId)
+    
+    if (existingIndex >= 0) {
+      savedThemes[existingIndex] = { ...savedThemes[existingIndex], name, theme: themeData }
+    } else {
+      savedThemes.push({ themeId, name, theme: themeData, createdAt: new Date().toISOString() })
+    }
+    
+    await userService.updateUser(req.user.id, { savedThemes })
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[API] Save theme error:', err)
+    res.status(500).json({ error: 'Failed to save theme' })
+  }
+})
+
+router.delete('/me/themes/:themeId', async (req, res) => {
+  try {
+    const { themeId } = req.params
+    const user = await userService.getUser(req.user.id)
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+    
+     const savedThemes = Array.isArray(user.savedThemes) ? user.savedThemes.filter(t => t.themeId !== themeId) : []
+    await userService.updateUser(req.user.id, { savedThemes })
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[API] Delete theme error:', err)
+    res.status(500).json({ error: 'Failed to delete theme' })
+  }
+})
+
+router.put('/me/themes/active', async (req, res) => {
+  try {
+    const { themeId } = req.body
+    await userService.updateUser(req.user.id, { activeTheme: themeId })
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[API] Set active theme error:', err)
+    res.status(500).json({ error: 'Failed to set active theme' })
+  }
+})
+
 // Get mutual servers with another user
 router.get('/:userId/mutual-servers', async (req, res) => {
   const targetUserId = req.params.userId
   const currentUserId = req.user.id
   
   try {
-    const currentUserData = userService.getUser(currentUserId)
-    const targetUserData = userService.getUser(targetUserId)
-    
-    const currentUserServers = currentUserData?.servers || []
-    const targetUserServers = targetUserData?.servers || []
-    
-    const mutualServerIds = currentUserServers
-      .map(s => typeof s === 'string' ? s : s.id)
-      .filter(serverId => 
-        targetUserServers.some(s => (typeof s === 'string' ? s : s.id) === serverId)
-      )
-    
-    const serversData = loadData(FILES.servers, [])
-    const mutualServers = mutualServerIds
-      .map(serverId => serversData.find(s => s.id === serverId))
+    const serversData = toArray(serverService.getAllServers())
+    const mutualServers = serversData
+      .filter(server => {
+        const members = Array.isArray(server.members) ? server.members : []
+        const hasCurrent = members.some(m => m?.id === currentUserId)
+        const hasTarget = members.some(m => m?.id === targetUserId)
+        return hasCurrent && hasTarget
+      })
       .filter(Boolean)
       .map(server => ({
         id: server.id,

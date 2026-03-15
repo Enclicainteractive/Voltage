@@ -12,7 +12,10 @@ export const MESSAGE_TYPES = {
 export const CHANNEL_TYPES = {
   TEXT: 'text',
   VOICE: 'voice',
-  VIDEO: 'video'
+  VIDEO: 'video',
+  ANNOUNCEMENT: 'announcement',
+  FORUM: 'forum',
+  MEDIA: 'media'
 }
 
 export const USER_STATUS = {

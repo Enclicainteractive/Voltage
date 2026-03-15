@@ -1,30 +1,135 @@
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import crypto from 'crypto'
+import { FILES, supportsDirectQuery, directQuery } from './dataService.js'
+import { botCache, globalCoalescer, globalRateLimiter } from './cacheService.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const BOTS_FILE = path.join(DATA_DIR, 'bots.json')
+const BOTS_FILE = FILES.bots
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true })
-}
-
-const loadData = (defaultValue = {}) => {
-  try {
-    if (fs.existsSync(BOTS_FILE)) {
-      return JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8'))
-    }
-  } catch (err) {
-    console.error('[Bots] Error loading data:', err.message)
+const normalizeStringArray = (value, fallback = []) => {
+  if (Array.isArray(value)) return value.filter(item => typeof item === 'string' && item.trim())
+  if (typeof value === 'string' && value.trim()) return [value.trim()]
+  if (value && typeof value === 'object') {
+    return Object.values(value)
+      .filter(item => typeof item === 'string' && item.trim())
+      .map(item => item.trim())
   }
-  return defaultValue
+  return [...fallback]
 }
 
-const saveData = (data) => {
+const normalizeBotRecord = (bot = {}) => {
+  // Handle DB columns that come back as servers_json, permissions_json, etc.
+  // (MariaDB/MySQL/SQLite store these as JSON strings in _json columns)
+  const resolveJsonField = (direct, jsonField, fallback = []) => {
+    if (direct !== undefined && direct !== null) return direct
+    if (jsonField !== undefined && jsonField !== null) {
+      if (typeof jsonField === 'string') {
+        try { return JSON.parse(jsonField) } catch { /* ignore */ }
+      }
+      if (Array.isArray(jsonField) || typeof jsonField === 'object') return jsonField
+    }
+    return fallback
+  }
+
+  return {
+    ...bot,
+    permissions: normalizeStringArray(
+      resolveJsonField(bot.permissions, bot.permissions_json),
+      ['messages:read', 'messages:send', 'channels:read']
+    ),
+    servers: normalizeStringArray(
+      resolveJsonField(bot.servers, bot.servers_json),
+      []
+    ),
+    intents: normalizeStringArray(
+      resolveJsonField(bot.intents, bot.intents_json),
+      ['GUILD_MESSAGES', 'DIRECT_MESSAGES']
+    ),
+    commands: (() => {
+      const raw = resolveJsonField(bot.commands, bot.commands_json)
+      return Array.isArray(raw) ? raw.filter(command => command && typeof command === 'object') : []
+    })()
+  }
+}
+
+const normalizeBotsPayload = (raw, defaultValue = {}) => {
+  if (!raw || typeof raw !== 'object') return defaultValue
+  if (raw.bots && typeof raw.bots === 'object') return raw
+  return { bots: raw }
+}
+
+let botsCache = { bots: {} }
+let botsCacheLoaded = false
+
+const loadData = async (defaultValue = {}) => {
+  // Always try to load if cache is empty, even if previously marked as loaded
+  // (storage might not have been ready on first attempt)
+  if (botsCacheLoaded && botsCache.bots && Object.keys(botsCache.bots).length > 0) {
+    return botsCache
+  }
+
+  return globalCoalescer.coalesce('bots:load', async () => {
+    // Re-check inside coalescer in case another call already loaded
+    if (botsCacheLoaded && botsCache.bots && Object.keys(botsCache.bots).length > 0) {
+      return botsCache
+    }
+
+    await doLoadData()
+    return botsCache
+  })
+}
+
+const doLoadData = async () => {
+  console.log('[BotService] Loading bots, supportsDirectQuery:', supportsDirectQuery())
+  
+  let dbLoaded = false
+  if (supportsDirectQuery()) {
+    try {
+      const rows = await directQuery('SELECT * FROM bots')
+      console.log('[BotService] DB query result:', rows ? rows.length : 'null', 'rows')
+      if (rows && rows.length > 0) {
+        const botsFromDb = {}
+        for (const row of rows) {
+          const botId = row.id
+          botsFromDb[botId] = {
+            ...row,
+            permissions_json: row.permissions_json,
+            servers_json: row.servers_json,
+            intents_json: row.intents_json,
+            commands_json: row.commands_json
+          }
+        }
+        botsCache = normalizeBotsPayload({ bots: botsFromDb }, {})
+        if (botsCache?.bots && typeof botsCache.bots === 'object') {
+          botsCache.bots = Object.fromEntries(
+            Object.entries(botsCache.bots).map(([id, bot]) => [id, normalizeBotRecord({ ...bot, id: bot?.id || id })])
+          )
+        }
+        dbLoaded = true
+        botsCacheLoaded = true
+        console.log('[BotService] Loaded', Object.keys(botsCache.bots).length, 'bots from database')
+      } else {
+        console.log('[BotService] No bots found in database')
+        botsCache = { bots: {} }
+        dbLoaded = true
+        botsCacheLoaded = true
+      }
+    } catch (err) {
+      console.error('[BotService] Error loading from DB:', err.message)
+    }
+  } else {
+    // Storage not ready, don't mark as loaded - will retry on next request
+    console.log('[BotService] Storage not ready, will retry on next request')
+  }
+}
+
+// Note: Don't trigger initial load at module import time
+// Bots will be loaded lazily on first request when storage is ready
+
+const saveData = async (data) => {
+  const payload = data?.bots && typeof data.bots === 'object' ? data.bots : data
   try {
-    fs.writeFileSync(BOTS_FILE, JSON.stringify(data, null, 2))
+    // Update in-memory cache
+    botsCache = normalizeBotsPayload({ bots: payload }, {})
+    console.log('[Bots] Updated in-memory cache')
     return true
   } catch (err) {
     console.error('[Bots] Error saving data:', err.message)
@@ -33,8 +138,8 @@ const saveData = (data) => {
 }
 
 export const botService = {
-  createBot(ownerId, botData) {
-    const data = loadData()
+  async createBot(ownerId, botData) {
+    const data = await loadData()
     if (!data.bots) data.bots = {}
 
     const botId = `bot_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
@@ -49,7 +154,7 @@ export const botService = {
       token,
       tokenHash: crypto.createHash('sha256').update(token).digest('hex'),
       prefix: botData.prefix || '!',
-      permissions: botData.permissions || ['messages:read', 'messages:send'],
+      permissions: botData.permissions || ['messages:read', 'messages:send', 'channels:read'],
       servers: [],
       intents: botData.intents || ['GUILD_MESSAGES', 'DIRECT_MESSAGES'],
       status: 'offline',
@@ -61,39 +166,56 @@ export const botService = {
       updatedAt: new Date().toISOString()
     }
 
-    data.bots[botId] = bot
-    saveData(data)
+    data.bots[botId] = normalizeBotRecord(bot)
+    
+    if (supportsDirectQuery()) {
+      const permissionsJson = JSON.stringify(bot.permissions)
+      const serversJson = JSON.stringify(bot.servers)
+      const intentsJson = JSON.stringify(bot.intents)
+      const commandsJson = JSON.stringify(bot.commands)
+      await directQuery(
+        'INSERT INTO bots (id, name, description, avatar, ownerId, token, tokenHash, prefix, permissions_json, servers_json, intents_json, commands_json, status, public, webhookUrl, webhookSecret, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [botId, bot.name, bot.description, bot.avatar, ownerId, token, bot.tokenHash, bot.prefix, permissionsJson, serversJson, intentsJson, commandsJson, bot.status, bot.public ? 1 : 0, bot.webhookUrl, bot.webhookSecret, bot.createdAt, bot.updatedAt]
+      )
+    }
+    
+    await saveData(data)
     console.log(`[Bots] Created bot: ${bot.name} (${botId}) by ${ownerId}`)
-    return { ...bot, token }
+    return { ...data.bots[botId], token }
   },
 
-  getBot(botId) {
-    const data = loadData()
-    const bot = data.bots?.[botId]
+  async getBot(botId) {
+    const data = await loadData()
+    const bot = data.bots?.[botId] ? normalizeBotRecord(data.bots[botId]) : null
     if (!bot) return null
     const { token, ...safe } = bot
     return safe
   },
 
-  getBotByToken(token) {
-    const data = loadData()
+  async getBotByToken(token) {
+    const data = await loadData()
     if (!data.bots) return null
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
-    return Object.values(data.bots).find(b => b.tokenHash === tokenHash) || null
+    const bot = Object.values(data.bots).find(b => b.tokenHash === tokenHash)
+    return bot ? normalizeBotRecord(bot) : null
   },
 
-  getBotsByOwner(ownerId) {
-    const data = loadData()
+  async getBotsByOwner(ownerId) {
+    const data = await loadData()
     if (!data.bots) return []
     return Object.values(data.bots)
       .filter(b => b.ownerId === ownerId)
-      .map(({ token, ...safe }) => safe)
+      .map((bot) => {
+        const { token, ...safe } = normalizeBotRecord(bot)
+        return safe
+      })
   },
 
-  updateBot(botId, ownerId, updates) {
-    const data = loadData()
+  async updateBot(botId, ownerId, updates) {
+    const data = await loadData()
     if (!data.bots?.[botId]) return null
     if (data.bots[botId].ownerId !== ownerId) return { error: 'Not authorized' }
+    data.bots[botId] = normalizeBotRecord(data.bots[botId])
 
     const allowed = ['name', 'description', 'avatar', 'prefix', 'permissions', 'intents', 'public', 'webhookUrl']
     for (const key of allowed) {
@@ -107,79 +229,159 @@ export const botService = {
     }
 
     data.bots[botId].updatedAt = new Date().toISOString()
-    saveData(data)
+    
+    if (supportsDirectQuery()) {
+      console.log('[BotService] Saving bot to database:', botId)
+      
+      // First check if bot exists in DB
+      const existingBot = await directQuery('SELECT id FROM bots WHERE id = ?', [botId])
+      console.log('[BotService] Bot exists in DB:', existingBot && existingBot.length > 0 ? 'yes' : 'no')
+      
+      const name = data.bots[botId].name
+      const description = data.bots[botId].description
+      const avatar = data.bots[botId].avatar
+      const prefix = data.bots[botId].prefix
+      const permissionsJson = JSON.stringify(data.bots[botId].permissions)
+      const serversJson = JSON.stringify(data.bots[botId].servers)
+      const intentsJson = JSON.stringify(data.bots[botId].intents)
+      const commandsJson = JSON.stringify(data.bots[botId].commands)
+      const publicBot = data.bots[botId].public ? 1 : 0
+      const webhookUrl = data.bots[botId].webhookUrl
+      const result = await directQuery(
+        'UPDATE bots SET name = ?, description = ?, avatar = ?, prefix = ?, permissions_json = ?, servers_json = ?, intents_json = ?, commands_json = ?, public = ?, webhookUrl = ?, updatedAt = ? WHERE id = ?',
+        [name, description, avatar, prefix, permissionsJson, serversJson, intentsJson, commandsJson, publicBot, webhookUrl, data.bots[botId].updatedAt, botId]
+      )
+      if (result === null) {
+        console.error('[BotService] Failed to update bot in database:', botId)
+      } else {
+        console.log('[BotService] Bot saved to database successfully:', botId, 'permissions:', permissionsJson)
+      }
+    } else {
+      console.log('[BotService] supportsDirectQuery is false - not saving to DB')
+    }
+    
+    await saveData(data)
     const { token, ...safe } = data.bots[botId]
     return safe
   },
 
-  deleteBot(botId, ownerId) {
-    const data = loadData()
+  async deleteBot(botId, ownerId) {
+    const data = await loadData()
     if (!data.bots?.[botId]) return false
     if (data.bots[botId].ownerId !== ownerId) return false
 
+    if (supportsDirectQuery()) {
+      await directQuery('DELETE FROM bots WHERE id = ?', [botId])
+    }
+    
     delete data.bots[botId]
-    saveData(data)
+    await saveData(data)
     return true
   },
 
-  regenerateToken(botId, ownerId) {
-    const data = loadData()
+  async regenerateToken(botId, ownerId) {
+    const data = await loadData()
     if (!data.bots?.[botId]) return null
     if (data.bots[botId].ownerId !== ownerId) return null
 
     const newToken = `vbot_${crypto.randomBytes(32).toString('hex')}`
+    const tokenHash = crypto.createHash('sha256').update(newToken).digest('hex')
+    const updatedAt = new Date().toISOString()
+
     data.bots[botId].token = newToken
-    data.bots[botId].tokenHash = crypto.createHash('sha256').update(newToken).digest('hex')
-    data.bots[botId].updatedAt = new Date().toISOString()
-    saveData(data)
+    data.bots[botId].tokenHash = tokenHash
+    data.bots[botId].updatedAt = updatedAt
+    
+    if (supportsDirectQuery()) {
+      await directQuery(
+        'UPDATE bots SET token = ?, tokenHash = ?, updatedAt = ? WHERE id = ?',
+        [newToken, tokenHash, updatedAt, botId]
+      )
+    }
+    
+    await saveData(data)
     return newToken
   },
 
-  addBotToServer(botId, serverId) {
-    const data = loadData()
+  async addBotToServer(botId, serverId) {
+    const data = await loadData()
     if (!data.bots?.[botId]) return false
+
+    data.bots[botId] = normalizeBotRecord(data.bots[botId])
 
     if (!data.bots[botId].servers.includes(serverId)) {
       data.bots[botId].servers.push(serverId)
-      saveData(data)
+      data.bots[botId].updatedAt = new Date().toISOString()
+      
+      if (supportsDirectQuery()) {
+        const serversJson = JSON.stringify(data.bots[botId].servers)
+        await directQuery(
+          'UPDATE bots SET servers_json = ?, updatedAt = ? WHERE id = ?',
+          [serversJson, data.bots[botId].updatedAt, botId]
+        )
+      }
+      
+      await saveData(data)
     }
     return true
   },
 
-  removeBotFromServer(botId, serverId) {
-    const data = loadData()
+  async removeBotFromServer(botId, serverId) {
+    const data = await loadData()
     if (!data.bots?.[botId]) return false
 
+    data.bots[botId] = normalizeBotRecord(data.bots[botId])
     data.bots[botId].servers = data.bots[botId].servers.filter(s => s !== serverId)
-    saveData(data)
+    data.bots[botId].updatedAt = new Date().toISOString()
+    
+    if (supportsDirectQuery()) {
+      const serversJson = JSON.stringify(data.bots[botId].servers)
+      await directQuery(
+        'UPDATE bots SET servers_json = ?, updatedAt = ? WHERE id = ?',
+        [serversJson, data.bots[botId].updatedAt, botId]
+      )
+    }
+    
+    await saveData(data)
     return true
   },
 
-  getServerBots(serverId) {
-    const data = loadData()
+  async getServerBots(serverId) {
+    const data = await loadData()
     if (!data.bots) return []
     return Object.values(data.bots)
+      .map(bot => normalizeBotRecord(bot))
       .filter(b => b.servers.includes(serverId))
       .map(({ token, ...safe }) => safe)
   },
 
-  setBotStatus(botId, status, customStatus) {
-    const data = loadData()
+  async setBotStatus(botId, status, customStatus) {
+    const data = await loadData()
     if (!data.bots?.[botId]) return false
+    data.bots[botId] = normalizeBotRecord(data.bots[botId])
     data.bots[botId].status = status
     // customStatus: null clears it, undefined leaves it unchanged
     if (customStatus !== undefined) {
       data.bots[botId].customStatus = customStatus || null
     }
     data.bots[botId].lastActive = new Date().toISOString()
-    saveData(data)
+    
+    if (supportsDirectQuery()) {
+      await directQuery(
+        'UPDATE bots SET status = ?, customStatus = ?, lastActive = ? WHERE id = ?',
+        [status, data.bots[botId].customStatus, data.bots[botId].lastActive, botId]
+      )
+    }
+    
+    await saveData(data)
     return true
   },
 
   // Commands registry
-  registerCommands(botId, commands) {
-    const data = loadData()
+  async registerCommands(botId, commands) {
+    const data = await loadData()
     if (!data.bots?.[botId]) return false
+    data.bots[botId] = normalizeBotRecord(data.bots[botId])
 
     data.bots[botId].commands = commands.map(cmd => ({
       name: cmd.name,
@@ -189,27 +391,48 @@ export const botService = {
     }))
 
     data.bots[botId].updatedAt = new Date().toISOString()
-    saveData(data)
+    
+    if (supportsDirectQuery()) {
+      const commandsJson = JSON.stringify(data.bots[botId].commands)
+      const result = await directQuery(
+        'UPDATE bots SET commands_json = ?, updatedAt = ? WHERE id = ?',
+        [commandsJson, data.bots[botId].updatedAt, botId]
+      )
+      if (result === null) {
+        console.error('[BotService] Failed to save commands to database for bot:', botId)
+      }
+    }
+    
+    await saveData(data)
     return true
   },
 
-  getBotCommands(botId) {
-    const data = loadData()
+  async getBotCommands(botId) {
+    const data = await loadData()
     return data.bots?.[botId]?.commands || []
   },
 
-  getAllPublicBots() {
-    const data = loadData()
+  async getAllPublicBots() {
+    const data = await loadData()
     if (!data.bots) return []
     return Object.values(data.bots)
+      .map(bot => normalizeBotRecord(bot))
       .filter(b => b.public)
+      .map(({ token, tokenHash, webhookSecret, ...safe }) => safe)
+  },
+
+  async getAllBots() {
+    const data = await loadData()
+    if (!data.bots) return []
+    return Object.values(data.bots)
+      .map(bot => normalizeBotRecord(bot))
       .map(({ token, tokenHash, webhookSecret, ...safe }) => safe)
   },
 
   // Webhook event delivery
   async deliverWebhookEvent(botId, event, payload) {
-    const data = loadData()
-    const bot = data.bots?.[botId]
+    const data = await loadData()
+    const bot = data.bots?.[botId] ? normalizeBotRecord(data.bots[botId]) : null
     if (!bot?.webhookUrl) return false
 
     try {
@@ -235,12 +458,32 @@ export const botService = {
     }
   },
 
+  // Permission mapping: bot API format (colon) <-> server permission format (underscore)
+  PERMISSION_MAP: {
+    'roles:manage': 'manage_roles',
+    'channels:manage': 'manage_channels',
+    'members:manage': 'members_manage',
+    'messages:manage': 'manage_messages',
+    'manage_roles': 'roles:manage',
+    'manage_channels': 'channels:manage',
+    'members_manage': 'members:manage',
+    'manage_messages': 'messages:manage'
+  },
+
   // Bot permissions check
-  hasPermission(botId, permission) {
-    const data = loadData()
-    const bot = data.bots?.[botId]
+  async hasPermission(botId, permission) {
+    const data = await loadData()
+    const bot = data.bots?.[botId] ? normalizeBotRecord(data.bots[botId]) : null
     if (!bot) return false
-    return bot.permissions.includes(permission) || bot.permissions.includes('*')
+    
+    // Check direct permission
+    if (bot.permissions.includes(permission) || bot.permissions.includes('*')) return true
+    
+    // Check mapped permission
+    const mappedPermission = this.PERMISSION_MAP[permission]
+    if (mappedPermission && (bot.permissions.includes(mappedPermission) || bot.permissions.includes('*'))) return true
+    
+    return false
   },
 
   PERMISSIONS: {
@@ -251,10 +494,13 @@ export const botService = {
     CHANNELS_MANAGE: 'channels:manage',
     MEMBERS_READ: 'members:read',
     MEMBERS_MANAGE: 'members:manage',
+    ROLES_MANAGE: 'roles:manage',
+    MANAGE_ROLES: 'manage_roles',
     REACTIONS_ADD: 'reactions:add',
     VOICE_CONNECT: 'voice:connect',
     WEBHOOKS_MANAGE: 'webhooks:manage',
     SERVER_MANAGE: 'server:manage',
+    MANAGE_SERVER: 'manage_server',
     ADMIN: '*'
   },
 
@@ -266,6 +512,46 @@ export const botService = {
     GUILD_REACTIONS: 'GUILD_REACTIONS',
     GUILD_CHANNELS: 'GUILD_CHANNELS',
     MESSAGE_CONTENT: 'MESSAGE_CONTENT'
+  },
+
+  async syncBotsWithServerMembers(servers, saveServersFn) {
+    const data = await loadData()
+    if (!data.bots) return { added: 0, updated: 0 }
+
+    let added = 0
+    let updated = 0
+
+    for (const server of servers) {
+      if (!server.members) server.members = []
+
+      const botMembers = (server.members || []).filter(m => m.isBot)
+      const existingBotIds = new Set(botMembers.map(m => m.id))
+
+      const serverBots = Object.values(data.bots)
+        .map(bot => normalizeBotRecord(bot))
+        .filter(b => b.servers.includes(server.id))
+
+      for (const bot of serverBots) {
+        if (!existingBotIds.has(bot.id)) {
+          server.members.push({
+            id: bot.id,
+            username: bot.name,
+            avatar: bot.avatar || null,
+            roles: bot.roles || [],
+            role: bot.roles?.[0] || null,
+            status: bot.status || 'offline',
+            isBot: true
+          })
+          added++
+        }
+      }
+    }
+
+    if (added > 0 && saveServersFn) {
+      await saveServersFn(servers)
+    }
+
+    return { added, updated }
   }
 }
 

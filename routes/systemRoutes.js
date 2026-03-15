@@ -15,6 +15,7 @@ import { io } from '../server.js'
 
 const router = express.Router()
 router.use(authenticateToken)
+const isAdminFlag = (value) => value === true || value === 1 || value === '1' || value === 'true'
 
 // ---------------------------------------------------------------------------
 // Middleware: platform admin guard
@@ -92,7 +93,7 @@ router.post('/send', requireAdmin, (req, res) => {
     targetIds = userService.getAllUsers()
       .filter(u => {
         const role = u.adminRole || u.role
-        return role === 'admin' || role === 'owner' || u.isAdmin === true
+        return role === 'admin' || role === 'owner' || isAdminFlag(u.isAdmin)
       })
       .map(u => u.id)
   } else if (Array.isArray(recipients)) {

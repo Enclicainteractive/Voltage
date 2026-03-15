@@ -5,7 +5,7 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { io } from '../server.js'
-import { discoveryService, userService } from '../services/dataService.js'
+import { FILES, discoveryService, userService, serverService, channelService, messageService, fileService } from '../services/dataService.js'
 import config from '../config/config.js'
 import { botService } from '../services/botService.js'
 
@@ -17,41 +17,26 @@ const getServerHost = () => {
   }
 }
 
+const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
+
 const getAvatarUrl = (userId) => {
-  const imageServerUrl = config.getImageServerUrl()
-  return `${imageServerUrl}/api/images/users/${userId}/profile`
+  const safeUserId = String(userId || '')
+  if (!safeUserId) return null
+  const baseUrl = safeUserId.startsWith('u_')
+    ? (config.getServerUrl() || config.getImageServerUrl())
+    : config.getImageServerUrl()
+  return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
+}
+
+const resolveUserAvatar = (userId, profile = null) => {
+  const explicit = profile?.imageUrl || profile?.imageurl || profile?.avatarUrl || profile?.avatarURL || profile?.avatar || null
+  if (isExternalImage(explicit)) return explicit
+  return getAvatarUrl(userId)
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const SERVERS_FILE = path.join(DATA_DIR, 'servers.json')
-const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json')
-const CATEGORIES_FILE = path.join(DATA_DIR, 'categories.json')
-
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true })
-}
 
 const router = express.Router()
-
-const loadData = (file, defaultValue = []) => {
-  try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'))
-    }
-  } catch (err) {
-    console.error(`[Data] Error loading ${file}:`, err.message)
-  }
-  return defaultValue
-}
-
-const saveData = (file, data) => {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2))
-  } catch (err) {
-    console.error(`[Data] Error saving ${file}:`, err.message)
-  }
-}
 
 const PERMISSIONS = [
   'admin',
@@ -100,23 +85,109 @@ const normalizeMember = (member) => {
 const normalizeServer = (server) => {
   if (!server) return server
   server.roles = Array.isArray(server.roles) ? server.roles : []
-  server.members = (server.members || []).map(normalizeMember)
+  server.members = Array.isArray(server.members) ? server.members.map(normalizeMember) : []
   server.themeColor = server.themeColor || '#1fb6ff'
   server.bannerUrl = server.bannerUrl || ''
   return server
 }
 
-const getServers = () => {
-  const data = loadData(SERVERS_FILE, [])
-  return Array.isArray(data) ? data.map(normalizeServer) : []
+const toServerArray = (data) => {
+  if (Array.isArray(data)) return data.map(normalizeServer)
+  if (data && typeof data === 'object') return Object.values(data).map(normalizeServer)
+  return []
 }
-const setServers = (servers) => saveData(SERVERS_FILE, servers)
 
-const getAllChannels = () => loadData(CHANNELS_FILE, {})
-const setAllChannels = (channels) => saveData(CHANNELS_FILE, channels)
+const toServerRecord = (servers) => {
+  const record = {}
+  for (const server of servers || []) {
+    if (server?.id) record[server.id] = server
+  }
+  return record
+}
 
-const getAllCategories = () => loadData(CATEGORIES_FILE, {})
-const setAllCategories = (categories) => saveData(CATEGORIES_FILE, categories)
+const toGroupedItems = (value) => {
+  if (Array.isArray(value)) return value
+  if (!value || typeof value !== 'object') return []
+  if (value.serverId) return [value]
+  return Object.values(value).filter(item => item && typeof item === 'object')
+}
+
+const toGroupedByServer = (data, entityKey = 'id') => {
+  if (!data || typeof data !== 'object') return {}
+
+  const grouped = {}
+  for (const value of Object.values(data)) {
+    for (const item of toGroupedItems(value)) {
+      if (!item?.serverId) continue
+      if (!grouped[item.serverId]) grouped[item.serverId] = []
+      grouped[item.serverId].push(item)
+    }
+  }
+
+  if (Object.keys(grouped).length > 0) return grouped
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      if (!item?.serverId) continue
+      if (!grouped[item.serverId]) grouped[item.serverId] = []
+      grouped[item.serverId].push(item)
+    }
+    return grouped
+  }
+
+  if (entityKey && data && typeof data === 'object') {
+    const firstValue = Object.values(data)[0]
+    if (Array.isArray(firstValue)) return data
+  }
+
+  return {}
+}
+
+const toFlatRecord = (grouped, idField = 'id') => {
+  const flat = {}
+  for (const items of Object.values(grouped || {})) {
+    if (!Array.isArray(items)) continue
+    for (const item of items) {
+      const id = item?.[idField]
+      if (id) flat[id] = item
+    }
+  }
+  return flat
+}
+
+const getServers = () => {
+  const data = serverService.getAllServers()
+  return Array.isArray(data) ? data : Object.values(data || {})
+}
+const setServers = async (servers) => {
+  for (const server of servers) {
+    if (server && server.id) {
+      await serverService.updateServer(server.id, server)
+    }
+  }
+}
+
+const getAllChannels = () => channelService.getAllChannelsGrouped()
+const setAllChannels = async (channels) => {
+  for (const serverChannels of Object.values(channels)) {
+    for (const channel of serverChannels) {
+      if (channel && channel.id) {
+        await channelService.updateChannel(channel.id, channel)
+      }
+    }
+  }
+}
+
+const getAllCategories = () => serverService.getAllCategoriesGrouped()
+const setAllCategories = async (categories) => {
+  for (const serverCategories of Object.values(categories)) {
+    for (const category of serverCategories) {
+      if (category && category.id) {
+        await serverService.updateCategory(category.id, category)
+      }
+    }
+  }
+}
 
 const getMemberRoles = (server, userId) => {
   const member = server?.members?.find(m => m.id === userId)
@@ -165,7 +236,7 @@ router.get('/', authenticateToken, (req, res) => {
   res.json(userServers)
 })
 
-router.get('/:serverId/members', authenticateToken, (req, res) => {
+router.get('/:serverId/members', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -176,7 +247,7 @@ router.get('/:serverId/members', authenticateToken, (req, res) => {
   // Enrich member objects with host/avatarHost from user profile if not already stored
   const localHost = config.getHost()
   const localImageServerUrl = config.getImageServerUrl()
-  const enrichedMembers = (server.members || []).map(member => {
+  const enrichedMembers = Array.isArray(server.members) ? server.members.map(member => {
     // If both fields are present, no lookup needed
     if (member.host && member.avatarHost) return member
     const profile = userService.getUser(member.id)
@@ -184,20 +255,23 @@ router.get('/:serverId/members', authenticateToken, (req, res) => {
     // avatarHost is the image server URL for where this user's images are stored
     const avatarHost = member.avatarHost || profile?.avatarHost || localImageServerUrl
     return { ...member, host, avatarHost }
-  })
+  }) : []
 
-  const bots = botService.getServerBots(req.params.serverId)
-  const botMembers = bots.map(bot => ({
-    id:           bot.id,
-    username:     bot.name,
-    avatar:       bot.avatar || null,
-    status:       bot.status || 'offline',
-    customStatus: bot.customStatus || null,
-    roles: [],
-    role: null,
-    isBot: true
-    // bots deliberately have no host field
-  }))
+  // Merge bots - use roles from member entry if available, otherwise from botService
+  const existingBotIds = new Set(enrichedMembers.filter(m => m.isBot).map(m => m.id))
+  const bots = await botService.getServerBots(req.params.serverId)
+  const botMembers = bots
+    .filter(bot => !existingBotIds.has(bot.id))
+    .map(bot => ({
+      id:           bot.id,
+      username:     bot.name,
+      avatar:       bot.avatar || null,
+      status:       bot.status || 'offline',
+      customStatus: bot.customStatus || null,
+      roles:        bot.roles || [],
+      role:         bot.roles?.[0] || null,
+      isBot:        true
+    }))
 
   res.json([...enrichedMembers, ...botMembers])
 })
@@ -210,7 +284,7 @@ router.get('/:serverId/online-members', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Server not found' })
   }
 
-  const serverMemberIds = new Set((server.members || []).map(m => m.id))
+  const serverMemberIds = new Set(Array.isArray(server.members) ? server.members.map(m => m.id) : [])
   
   const onlineMembers = []
   for (const [socketId, socket] of io.sockets.sockets) {
@@ -226,7 +300,7 @@ router.get('/:serverId/online-members', authenticateToken, (req, res) => {
   res.json(onlineMembers)
 })
 
-router.get('/:serverId', authenticateToken, (req, res) => {
+router.get('/:serverId', authenticateToken, async (req, res) => {
   const servers = getServers()
   let server = servers.find(s => s.id === req.params.serverId)
   
@@ -249,26 +323,34 @@ router.get('/:serverId', authenticateToken, (req, res) => {
       server.members[memberIndex].roles = ['owner', adminRoleId]
       server.members[memberIndex].role = 'owner'
     }
-    setServers(servers)
+    await setServers(servers)
   }
   
   // Merge bots as members with isBot flag
-  const bots = botService.getServerBots(server.id)
-  const botMembers = bots.map(bot => ({
-    id:           bot.id,
-    username:     bot.name,
-    avatar:       bot.avatar || null,
-    status:       bot.status || 'offline',
-    customStatus: bot.customStatus || null,
-    roles: [],
-    role: null,
-    isBot: true
-  }))
+  // Bots that are already in members array have their roles preserved
+  // Bots not yet in members are added dynamically from botService
+  const existingBotMembers = (server.members || []).filter(m => m.isBot)
+  const existingBotIds = new Set(existingBotMembers.map(m => m.id))
+  
+  const bots = await botService.getServerBots(server.id)
+  const dynamicBotMembers = bots
+    .filter(bot => !existingBotIds.has(bot.id))
+    .map(bot => ({
+      id:           bot.id,
+      username:     bot.name,
+      avatar:       bot.avatar || null,
+      status:       bot.status || 'offline',
+      customStatus: bot.customStatus || null,
+      roles:        bot.roles || [],
+      role:         bot.roles?.[0] || null,
+      isBot:        true
+    }))
+  
   const serverWithBots = {
     ...server,
     members: [
       ...(server.members || []),
-      ...botMembers
+      ...dynamicBotMembers
     ]
   }
 
@@ -276,7 +358,7 @@ router.get('/:serverId', authenticateToken, (req, res) => {
   res.json(serverWithBots)
 })
 
-router.post('/', authenticateToken, (req, res) => {
+router.post('/', authenticateToken, async (req, res) => {
   const { name, icon } = req.body
   
   const serverId = uuidv4()
@@ -307,7 +389,7 @@ router.post('/', authenticateToken, (req, res) => {
   
   const servers = getServers()
   servers.push(newServer)
-  setServers(servers)
+  await setServers(servers)
   
   const generalChannel = {
     id: uuidv4(),
@@ -329,7 +411,7 @@ router.post('/', authenticateToken, (req, res) => {
   const channels = [generalChannel, voiceChannel]
   const allChannels = getAllChannels()
   allChannels[serverId] = channels
-  setAllChannels(allChannels)
+  await setAllChannels(allChannels)
   
   newServer.defaultChannelId = generalChannel.id
   
@@ -337,7 +419,7 @@ router.post('/', authenticateToken, (req, res) => {
   res.status(201).json(newServer)
 })
 
-router.put('/:serverId', authenticateToken, (req, res) => {
+router.put('/:serverId', authenticateToken, async (req, res) => {
   const servers = getServers()
   const index = servers.findIndex(s => s.id === req.params.serverId)
   
@@ -351,7 +433,7 @@ router.put('/:serverId', authenticateToken, (req, res) => {
   }
   
   servers[index] = { ...servers[index], ...req.body, updatedAt: new Date().toISOString() }
-  setServers(servers)
+  await setServers(servers)
   
   const updatedServer = servers[index]
   io.to(`server:${req.params.serverId}`).emit('server:updated', updatedServer)
@@ -360,32 +442,26 @@ router.put('/:serverId', authenticateToken, (req, res) => {
   res.json(updatedServer)
 })
 
-router.delete('/:serverId', authenticateToken, (req, res) => {
+router.delete('/:serverId', authenticateToken, async (req, res) => {
   const serverId = req.params.serverId
   
   const servers = getServers()
   const filtered = servers.filter(s => s.id !== serverId)
-  setServers(filtered)
+  await setServers(filtered)
   
   const allChannels = getAllChannels()
   const serverChannels = allChannels[serverId] || []
   delete allChannels[serverId]
-  setAllChannels(allChannels)
+  await setAllChannels(allChannels)
   
-  const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json')
-  const FILES_FILE = path.join(DATA_DIR, 'files.json')
-  const UPLOADS_DIR = path.join(__dirname, '..', 'uploads')
+  const serverChannelIds = new Set(serverChannels.map(c => c.id))
+  await messageService.deleteMessagesByChannelIds([...serverChannelIds])
   
-  const messages = loadData(MESSAGES_FILE, {})
-  serverChannels.forEach(channel => {
-    if (messages[channel.id]) {
-      delete messages[channel.id]
-    }
-  })
-  saveData(MESSAGES_FILE, messages)
-  
-  const files = loadData(FILES_FILE, {})
-  const filesToDelete = Object.values(files).filter(f => f.serverId === serverId)
+  const files = await fileService.getAllFiles()
+  const filesRecord = Array.isArray(files)
+    ? Object.fromEntries(files.filter(f => f?.id).map(f => [f.id, f]))
+    : (files || {})
+  const filesToDelete = Object.values(filesRecord).filter(f => f.serverId === serverId)
   filesToDelete.forEach(file => {
     if (file.path && fs.existsSync(file.path)) {
       try {
@@ -394,9 +470,10 @@ router.delete('/:serverId', authenticateToken, (req, res) => {
         console.error('[Data] Error deleting file:', err.message)
       }
     }
-    delete files[file.id]
   })
-  saveData(FILES_FILE, files)
+  for (const file of filesToDelete) {
+    await fileService.deleteFile(file.id)
+  }
   
   console.log(`[API] Deleted server: ${serverId} (${serverChannels.length} channels, ${filesToDelete.length} files deleted)`)
   res.json({ success: true })
@@ -409,7 +486,7 @@ router.get('/:serverId/channels', authenticateToken, (req, res) => {
   res.json(channels)
 })
 
-router.post('/:serverId/channels', authenticateToken, (req, res) => {
+router.post('/:serverId/channels', authenticateToken, async (req, res) => {
   const { name, type, categoryId } = req.body
   const serverId = req.params.serverId
 
@@ -444,7 +521,7 @@ router.post('/:serverId/channels', authenticateToken, (req, res) => {
   const channels = allChannels[serverId] || []
   channels.push(newChannel)
   allChannels[serverId] = channels
-  setAllChannels(allChannels)
+  await setAllChannels(allChannels)
   
   io.to(`server:${serverId}`).emit('channel:created', newChannel)
   
@@ -452,7 +529,7 @@ router.post('/:serverId/channels', authenticateToken, (req, res) => {
   res.status(201).json(newChannel)
 })
 
-router.put('/:serverId/channels/order', authenticateToken, (req, res) => {
+router.put('/:serverId/channels/order', authenticateToken, async (req, res) => {
   const { channelIds } = req.body
   const serverId = req.params.serverId
   
@@ -481,7 +558,7 @@ router.put('/:serverId/channels/order', authenticateToken, (req, res) => {
   }).filter(Boolean)
   
   allChannels[serverId] = reorderedChannels
-  setAllChannels(allChannels)
+  await setAllChannels(allChannels)
   
   io.to(`server:${serverId}`).emit('channel:order-updated', reorderedChannels)
   
@@ -496,7 +573,7 @@ router.get('/:serverId/invites', authenticateToken, (req, res) => {
   res.json(invites)
 })
 
-router.post('/:serverId/invites', authenticateToken, (req, res) => {
+router.post('/:serverId/invites', authenticateToken, async (req, res) => {
   const { maxUses, expiresAt } = req.body
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
@@ -505,12 +582,12 @@ router.post('/:serverId/invites', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Not authorized to create invites' })
   }
 
-  const invite = inviteService.createInvite(req.params.serverId, req.user.id, { maxUses, expiresAt })
+  const invite = await inviteService.createInvite(req.params.serverId, req.user.id, { maxUses, expiresAt })
   console.log(`[API] Created invite for server ${req.params.serverId}: ${invite.code}`)
   res.status(201).json(invite)
 })
 
-router.delete('/:serverId/invites/:code', authenticateToken, (req, res) => {
+router.delete('/:serverId/invites/:code', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
@@ -518,13 +595,13 @@ router.delete('/:serverId/invites/:code', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Not authorized to delete invites' })
   }
 
-  inviteService.deleteInvite(req.params.code)
+  await inviteService.deleteInvite(req.params.code)
   console.log(`[API] Deleted invite ${req.params.code}`)
   res.json({ success: true })
 })
 
-router.post('/invites/:code/join', authenticateToken, (req, res) => {
-  const result = inviteService.useInvite(req.params.code)
+router.post('/invites/:code/join', authenticateToken, async (req, res) => {
+  const result = await inviteService.useInvite(req.params.code)
   
   if (result.error) {
     return res.status(400).json({ error: result.error })
@@ -546,7 +623,8 @@ router.post('/invites/:code/join', authenticateToken, (req, res) => {
   server.members.push({
     id: req.user.id,
     username: req.user.username,
-    avatar: getAvatarUrl(req.user.id),
+    imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+    avatar: resolveUserAvatar(req.user.id, req.user),
     host: req.user.host || config.getHost(),
     avatarHost: config.getImageServerUrl(),
     roles: ['member'],
@@ -555,12 +633,12 @@ router.post('/invites/:code/join', authenticateToken, (req, res) => {
     joinedAt: new Date().toISOString()
   })
   
-  setServers(servers)
+  await setServers(servers)
   console.log(`[API] User ${req.user.username} joined server ${server.name}`)
   res.json(server)
 })
 
-router.post('/:serverId/join', authenticateToken, (req, res) => {
+router.post('/:serverId/join', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -581,7 +659,8 @@ router.post('/:serverId/join', authenticateToken, (req, res) => {
   server.members.push({
     id: req.user.id,
     username: req.user.username,
-    avatar: getAvatarUrl(req.user.id),
+    imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+    avatar: resolveUserAvatar(req.user.id, req.user),
     host: req.user.host || config.getHost(),
     avatarHost: config.getImageServerUrl(),
     roles: ['member'],
@@ -590,12 +669,12 @@ router.post('/:serverId/join', authenticateToken, (req, res) => {
     joinedAt: new Date().toISOString()
   })
   
-  setServers(servers)
+  await setServers(servers)
   console.log(`[API] User ${req.user.username} joined server ${server.name} directly`)
   res.json(server)
 })
 
-router.delete('/:serverId/members/:memberId', authenticateToken, (req, res) => {
+router.delete('/:serverId/members/:memberId', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -616,15 +695,16 @@ router.delete('/:serverId/members/:memberId', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Owner cannot kick themselves. Transfer ownership first.' })
   }
   
+  if (!server.members) server.members = []
   server.members = server.members.filter(m => m.id !== req.params.memberId)
-  setServers(servers)
+  await setServers(servers)
   
   console.log(`[API] ${isSelf ? 'User left' : 'Kicked member'} ${req.params.memberId} from server ${server.name}`)
   res.json({ success: true })
 })
 
 // User leaves server themselves
-router.post('/:serverId/leave', authenticateToken, (req, res) => {
+router.post('/:serverId/leave', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -636,14 +716,15 @@ router.post('/:serverId/leave', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Cannot leave your own server. Transfer ownership first or delete the server.' })
   }
   
+  if (!server.members) server.members = []
   server.members = server.members.filter(m => m.id !== req.user.id)
-  setServers(servers)
+  await setServers(servers)
   
   console.log(`[API] User ${req.user.username} left server ${server.name}`)
   res.json({ success: true })
 })
 
-router.put('/:serverId/members/:memberId', authenticateToken, (req, res) => {
+router.put('/:serverId/members/:memberId', authenticateToken, async (req, res) => {
   const { roles, role } = req.body
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
@@ -662,17 +743,17 @@ router.put('/:serverId/members/:memberId', authenticateToken, (req, res) => {
   }
 
   const nextRoles = Array.isArray(roles) ? roles : (role ? [role] : [])
-  const validRoleIds = new Set((server.roles || []).map(r => r.id))
+  const validRoleIds = new Set(Array.isArray(server.roles) ? server.roles.map(r => r.id) : [])
   const filtered = nextRoles.filter(r => validRoleIds.has(r) && r !== 'owner')
   member.roles = filtered
   member.role = member.roles[0] || null
   
-  setServers(servers)
-  console.log(`[API] Updated roles for ${member.username}: [${member.roles.join(', ')}]`)
+  await setServers(servers)
+  console.log(`[API] Updated roles for ${member.username}: [${(member.roles || []).join(', ')}]`)
   res.json({ success: true, roles: member.roles })
 })
 
-router.post('/:serverId/transfer', authenticateToken, (req, res) => {
+router.post('/:serverId/transfer', authenticateToken, async (req, res) => {
   const { memberId } = req.body
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
@@ -705,12 +786,12 @@ router.post('/:serverId/transfer', authenticateToken, (req, res) => {
     oldOwner.role = oldOwner.roles[0] || null
   }
   
-  setServers(servers)
+  await setServers(servers)
   console.log(`[API] Transferred server ${server.name} from ${oldOwnerId} to ${memberId}`)
   res.json({ success: true, ownerId: memberId })
 })
 
-router.post('/:serverId/bans/:memberId', authenticateToken, (req, res) => {
+router.post('/:serverId/bans/:memberId', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -722,6 +803,7 @@ router.post('/:serverId/bans/:memberId', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Not authorized' })
   }
   
+  if (!server.members) server.members = []
   server.members = server.members.filter(m => m.id !== req.params.memberId)
   if (!server.bans) server.bans = []
   server.bans.push({
@@ -730,7 +812,7 @@ router.post('/:serverId/bans/:memberId', authenticateToken, (req, res) => {
     bannedAt: new Date().toISOString()
   })
   
-  setServers(servers)
+  await setServers(servers)
   console.log(`[API] Banned member ${req.params.memberId} from server ${server.name}`)
   res.json({ success: true })
 })
@@ -747,7 +829,7 @@ router.get('/:serverId/roles', authenticateToken, (req, res) => {
   res.json(server.roles || [])
 })
 
-router.post('/:serverId/roles', authenticateToken, (req, res) => {
+router.post('/:serverId/roles', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -767,8 +849,9 @@ router.post('/:serverId/roles', authenticateToken, (req, res) => {
     position: req.body.position ?? (server.roles?.length || 0)
   }
   
+  if (!server.roles) server.roles = []
   server.roles.push(newRole)
-  setServers(servers)
+  await setServers(servers)
   
   io.to(`server:${req.params.serverId}`).emit('role:created', { ...newRole, serverId: req.params.serverId })
   
@@ -776,7 +859,7 @@ router.post('/:serverId/roles', authenticateToken, (req, res) => {
   res.status(201).json(newRole)
 })
 
-router.put('/:serverId/roles/:roleId', authenticateToken, (req, res) => {
+router.put('/:serverId/roles/:roleId', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -803,7 +886,7 @@ router.put('/:serverId/roles/:roleId', authenticateToken, (req, res) => {
     id: req.params.roleId // Ensure ID doesn't change
   }
   
-  setServers(servers)
+  await setServers(servers)
   
   io.to(`server:${req.params.serverId}`).emit('role:updated', { ...server.roles[roleIndex], serverId: req.params.serverId })
   
@@ -811,7 +894,7 @@ router.put('/:serverId/roles/:roleId', authenticateToken, (req, res) => {
   res.json(server.roles[roleIndex])
 })
 
-router.delete('/:serverId/roles/:roleId', authenticateToken, (req, res) => {
+router.delete('/:serverId/roles/:roleId', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
@@ -839,7 +922,7 @@ router.delete('/:serverId/roles/:roleId', authenticateToken, (req, res) => {
     }
   })
   
-  setServers(servers)
+  await setServers(servers)
   
   io.to(`server:${req.params.serverId}`).emit('role:deleted', { roleId: req.params.roleId, serverId: req.params.serverId })
   
@@ -848,7 +931,7 @@ router.delete('/:serverId/roles/:roleId', authenticateToken, (req, res) => {
 })
 
 router.get('/:serverId/emojis', (req, res) => {
-  const servers = loadData(SERVERS_FILE, [])
+  const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   
   if (!server) {
@@ -856,24 +939,24 @@ router.get('/:serverId/emojis', (req, res) => {
   }
   
   // Add host info to each emoji for global format
-  const emojisWithHost = (server.emojis || []).map(emoji => ({
+  const emojisWithHost = Array.isArray(server.emojis) ? server.emojis.map(emoji => ({
     ...emoji,
     host: getServerHost(),
     serverId: server.id,
     serverName: server.name
-  }))
+  })) : []
   
   res.json(emojisWithHost)
 })
 
-router.post('/:serverId/emojis', authenticateToken, (req, res) => {
+router.post('/:serverId/emojis', authenticateToken, async (req, res) => {
   const { name, url } = req.body
   
   if (!name || !url) {
     return res.status(400).json({ error: 'Name and URL required' })
   }
   
-  const servers = loadData(SERVERS_FILE, [])
+  const servers = getServers()
   const serverIndex = servers.findIndex(s => s.id === req.params.serverId)
   
   if (serverIndex === -1) {
@@ -894,9 +977,10 @@ router.post('/:serverId/emojis', authenticateToken, (req, res) => {
     addedAt: new Date().toISOString()
   }
   
+  if (!server.emojis) server.emojis = []
   server.emojis.push(emoji)
   servers[serverIndex] = server
-  saveData(SERVERS_FILE, servers)
+  await setServers(servers)
   
   const emojiData = { 
     ...emoji, 
@@ -914,8 +998,8 @@ router.post('/:serverId/emojis', authenticateToken, (req, res) => {
   res.json(emoji)
 })
 
-router.delete('/:serverId/emojis/:emojiId', authenticateToken, (req, res) => {
-  const servers = loadData(SERVERS_FILE, [])
+router.delete('/:serverId/emojis/:emojiId', authenticateToken, async (req, res) => {
+  const servers = getServers()
   const serverIndex = servers.findIndex(s => s.id === req.params.serverId)
   
   if (serverIndex === -1) {
@@ -923,9 +1007,9 @@ router.delete('/:serverId/emojis/:emojiId', authenticateToken, (req, res) => {
   }
   
   const server = servers[serverIndex]
-  server.emojis = (server.emojis || []).filter(e => e.id !== req.params.emojiId)
+  server.emojis = Array.isArray(server.emojis) ? server.emojis.filter(e => e.id !== req.params.emojiId) : []
   servers[serverIndex] = server
-  saveData(SERVERS_FILE, servers)
+  await setServers(servers)
   
   // Emit to server room
   io.to(`server:${req.params.serverId}`).emit('emoji:deleted', { emojiId: req.params.emojiId, serverId: req.params.serverId })
@@ -978,7 +1062,7 @@ router.get('/:serverId/categories', authenticateToken, (req, res) => {
   res.json(categories)
 })
 
-router.post('/:serverId/categories', authenticateToken, (req, res) => {
+router.post('/:serverId/categories', authenticateToken, async (req, res) => {
   const { name, position } = req.body
   const serverId = req.params.serverId
 
@@ -1004,7 +1088,7 @@ router.post('/:serverId/categories', authenticateToken, (req, res) => {
     allCategories[serverId] = []
   }
   allCategories[serverId].push(newCategory)
-  setAllCategories(allCategories)
+  await setAllCategories(allCategories)
   
   io.to(`server:${serverId}`).emit('category:created', newCategory)
   
@@ -1012,7 +1096,7 @@ router.post('/:serverId/categories', authenticateToken, (req, res) => {
   res.status(201).json(newCategory)
 })
 
-router.put('/:serverId/categories/order', authenticateToken, (req, res) => {
+router.put('/:serverId/categories/order', authenticateToken, async (req, res) => {
   const { categoryIds } = req.body
   const serverId = req.params.serverId
   
@@ -1041,7 +1125,7 @@ router.put('/:serverId/categories/order', authenticateToken, (req, res) => {
   }).filter(Boolean)
   
   allCategories[serverId] = reorderedCategories
-  setAllCategories(allCategories)
+  await setAllCategories(allCategories)
   
   io.to(`server:${serverId}`).emit('category:order-updated', reorderedCategories)
   
@@ -1050,13 +1134,14 @@ router.put('/:serverId/categories/order', authenticateToken, (req, res) => {
 })
 
 // Individual category routes (for update/delete)
-router.put('/categories/:categoryId', authenticateToken, (req, res) => {
+router.put('/categories/:categoryId', authenticateToken, async (req, res) => {
   const allCategories = getAllCategories()
   let foundCategory = null
   let serverId = null
   
   // Find category across all servers
   for (const [sid, categories] of Object.entries(allCategories)) {
+    if (!Array.isArray(categories)) continue
     const idx = categories.findIndex(c => c.id === req.params.categoryId)
     if (idx !== -1) {
       foundCategory = categories[idx]
@@ -1077,10 +1162,11 @@ router.put('/categories/:categoryId', authenticateToken, (req, res) => {
 
   // Update category
   for (const categories of Object.values(allCategories)) {
+    if (!Array.isArray(categories)) continue
     const idx = categories.findIndex(c => c.id === req.params.categoryId)
     if (idx !== -1) {
       categories[idx] = { ...categories[idx], ...req.body, updatedAt: new Date().toISOString() }
-      setAllCategories(allCategories)
+      await setAllCategories(allCategories)
       
       io.to(`server:${serverId}`).emit('category:updated', categories[idx])
       console.log(`[API] Updated category ${req.params.categoryId}`)
@@ -1089,7 +1175,7 @@ router.put('/categories/:categoryId', authenticateToken, (req, res) => {
   }
 })
 
-router.delete('/categories/:categoryId', authenticateToken, (req, res) => {
+router.delete('/categories/:categoryId', authenticateToken, async (req, res) => {
   if (req.params.categoryId === 'uncategorized') {
     return res.status(400).json({ error: 'Cannot delete uncategorized pseudo-category' })
   }
@@ -1099,6 +1185,7 @@ router.delete('/categories/:categoryId', authenticateToken, (req, res) => {
   
   // Find category across all servers
   for (const [sid, categories] of Object.entries(allCategories)) {
+    if (!Array.isArray(categories)) continue
     const idx = categories.findIndex(c => c.id === req.params.categoryId)
     if (idx !== -1) {
       serverId = sid
@@ -1117,8 +1204,8 @@ router.delete('/categories/:categoryId', authenticateToken, (req, res) => {
   }
 
   // Remove category
-  allCategories[serverId] = allCategories[serverId].filter(c => c.id !== req.params.categoryId)
-  setAllCategories(allCategories)
+  allCategories[serverId] = toGroupedItems(allCategories[serverId]).filter(c => c.id !== req.params.categoryId)
+  await setAllCategories(allCategories)
   
   // Move all channels in this category to uncategorized (null)
   const allChannels = getAllChannels()
@@ -1129,7 +1216,7 @@ router.delete('/categories/:categoryId', authenticateToken, (req, res) => {
       }
       return c
     })
-    setAllChannels(allChannels)
+    await setAllChannels(allChannels)
   }
   
   io.to(`server:${serverId}`).emit('category:deleted', { categoryId: req.params.categoryId, serverId })

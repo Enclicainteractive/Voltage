@@ -3,22 +3,12 @@ import { authenticateToken } from '../middleware/authMiddleware.js'
 import { e2eService, userKeyService, dmE2eService } from '../services/e2eService.js'
 import { io } from '../server.js'
 import * as crypto from '../services/cryptoService.js'
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const SERVERS_FILE = path.join(DATA_DIR, 'servers.json')
+import { serverService } from '../services/dataService.js'
 
 const getServers = () => {
-  try {
-    if (fs.existsSync(SERVERS_FILE)) {
-      return JSON.parse(fs.readFileSync(SERVERS_FILE, 'utf8'))
-    }
-  } catch (err) {
-    console.error('[Data] Error loading servers:', err.message)
-  }
+  const data = serverService.getAllServers()
+  if (Array.isArray(data)) return data
+  if (data && typeof data === 'object') return Object.values(data)
   return []
 }
 

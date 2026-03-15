@@ -1,35 +1,71 @@
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import crypto from 'crypto'
+import { supportsDirectQuery, directQuery, FILES } from './dataService.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const E2E_TRUE_FILE = path.join(DATA_DIR, 'e2e-true.json')
+const E2E_TRUE_FILE = FILES.e2eTrue
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true })
+let e2eTrueCache = { deviceKeys: {}, senderKeys: {}, epochs: {} }
+let cacheLoaded = false
+
+const ensureCacheLoaded = async () => {
+  if (!cacheLoaded) {
+    if (supportsDirectQuery()) {
+      try {
+        const rows = await directQuery('SELECT * FROM e2e_true_state')
+        if (rows && rows.length > 0) {
+          const deviceKeys = {}
+          const senderKeys = {}
+          const epochs = {}
+          for (const row of rows) {
+            const parsed = JSON.parse(row.data || '{}')
+            const key = row.id
+            if (key.startsWith('deviceKeys:')) {
+              deviceKeys[key.replace('deviceKeys:', '')] = parsed
+            } else if (key.startsWith('senderKeys:')) {
+              senderKeys[key.replace('senderKeys:', '')] = parsed
+            } else if (key.startsWith('epochs:')) {
+              epochs[key.replace('epochs:', '')] = parsed
+            }
+          }
+          e2eTrueCache = { deviceKeys, senderKeys, epochs }
+        }
+      } catch (err) {
+        console.error('[E2E-True] Error loading from DB:', err.message)
+      }
+    }
+    cacheLoaded = true
+  }
 }
 
 const loadData = (defaultValue = {}) => {
-  try {
-    if (fs.existsSync(E2E_TRUE_FILE)) {
-      return JSON.parse(fs.readFileSync(E2E_TRUE_FILE, 'utf8'))
-    }
-  } catch (err) {
-    console.error('[E2E-True] Error loading data:', err.message)
+  if (!cacheLoaded) {
+    ensureCacheLoaded().catch(err => console.error('[E2E-True] Failed to load cache:', err))
+    return { ...defaultValue, deviceKeys: {}, senderKeys: {}, epochs: {} }
   }
-  return defaultValue
+  return { ...e2eTrueCache }
 }
 
-const saveData = (data) => {
-  try {
-    fs.writeFileSync(E2E_TRUE_FILE, JSON.stringify(data, null, 2))
-    return true
-  } catch (err) {
-    console.error('[E2E-True] Error saving data:', err.message)
-    return false
+const saveData = async (data) => {
+  e2eTrueCache = { ...data }
+  if (supportsDirectQuery()) {
+    try {
+      await directQuery('DELETE FROM e2e_true_state')
+      for (const [keyId, value] of Object.entries(data.deviceKeys || {})) {
+        await directQuery('INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?)', [`deviceKeys:${keyId}`, JSON.stringify(value), new Date().toISOString()])
+      }
+      for (const [keyId, value] of Object.entries(data.senderKeys || {})) {
+        await directQuery('INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?)', [`senderKeys:${keyId}`, JSON.stringify(value), new Date().toISOString()])
+      }
+      for (const [keyId, value] of Object.entries(data.epochs || {})) {
+        await directQuery('INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?)', [`epochs:${keyId}`, JSON.stringify(value), new Date().toISOString()])
+      }
+      console.log('[E2E-True] Saved to database')
+      return true
+    } catch (err) {
+      console.error('[E2E-True] Error saving to DB:', err.message)
+      return false
+    }
   }
+  return false
 }
 
 /*
@@ -44,9 +80,18 @@ const saveData = (data) => {
 */
 
 export const e2eTrueService = {
+  async ensureLoaded() {
+    if (!cacheLoaded) {
+      await ensureCacheLoaded()
+    }
+  },
+
   // === Device Key Bundles (identity keys published by each device) ===
 
-  uploadDeviceKeyBundle(userId, deviceId, keyBundle) {
+  async uploadDeviceKeyBundle(userId, deviceId, keyBundle) {
+    if (!cacheLoaded) {
+      await ensureCacheLoaded()
+    }
     const data = loadData()
     if (!data.deviceKeys) data.deviceKeys = {}
     if (!data.deviceKeys[userId]) data.deviceKeys[userId] = {}
@@ -61,11 +106,11 @@ export const e2eTrueService = {
       uploadedAt: new Date().toISOString()
     }
 
-    saveData(data)
+    await saveData(data)
     return true
   },
 
-  getDeviceKeyBundle(userId, deviceId) {
+  async getDeviceKeyBundle(userId, deviceId) {
     const data = loadData()
     const bundle = data.deviceKeys?.[userId]?.[deviceId]
     if (!bundle) return null
@@ -74,7 +119,7 @@ export const e2eTrueService = {
     let oneTimePreKey = null
     if (bundle.oneTimePreKeys?.length > 0) {
       oneTimePreKey = bundle.oneTimePreKeys.shift()
-      saveData(data)
+      await saveData(data)
     }
 
     return {
@@ -96,11 +141,11 @@ export const e2eTrueService = {
     }))
   },
 
-  removeDevice(userId, deviceId) {
+  async removeDevice(userId, deviceId) {
     const data = loadData()
     if (data.deviceKeys?.[userId]?.[deviceId]) {
       delete data.deviceKeys[userId][deviceId]
-      saveData(data)
+      await saveData(data)
     }
     return true
   },
@@ -112,7 +157,7 @@ export const e2eTrueService = {
     return data.groupEpochs?.[groupId] || null
   },
 
-  createGroupEpoch(groupId, creatorUserId, creatorDeviceId) {
+  async createGroupEpoch(groupId, creatorUserId, creatorDeviceId) {
     const data = loadData()
     if (!data.groupEpochs) data.groupEpochs = {}
 
@@ -128,11 +173,11 @@ export const e2eTrueService = {
     }
 
     data.groupEpochs[groupId] = epoch
-    saveData(data)
+    await saveData(data)
     return epoch
   },
 
-  advanceEpoch(groupId, reason, triggerUserId) {
+  async advanceEpoch(groupId, reason, triggerUserId) {
     const data = loadData()
     if (!data.groupEpochs?.[groupId]) return null
 
@@ -141,11 +186,11 @@ export const e2eTrueService = {
     data.groupEpochs[groupId].lastRotationReason = reason
     data.groupEpochs[groupId].lastRotationBy = triggerUserId
 
-    saveData(data)
+    await saveData(data)
     return data.groupEpochs[groupId]
   },
 
-  addMemberToGroup(groupId, userId, deviceIds) {
+  async addMemberToGroup(groupId, userId, deviceIds) {
     const data = loadData()
     if (!data.groupEpochs?.[groupId]) return null
 
@@ -157,11 +202,11 @@ export const e2eTrueService = {
     group.memberDevices[userId] = deviceIds || []
     group.updatedAt = new Date().toISOString()
 
-    saveData(data)
+    await saveData(data)
     return group
   },
 
-  removeMemberFromGroup(groupId, userId) {
+  async removeMemberFromGroup(groupId, userId) {
     const data = loadData()
     if (!data.groupEpochs?.[groupId]) return null
 
@@ -170,7 +215,7 @@ export const e2eTrueService = {
     delete group.memberDevices?.[userId]
     group.updatedAt = new Date().toISOString()
 
-    saveData(data)
+    await saveData(data)
     return group
   },
 
@@ -183,7 +228,7 @@ export const e2eTrueService = {
 
   // === Encrypted Sender Key Distribution (opaque blobs, server cannot read) ===
 
-  storeEncryptedSenderKey(groupId, epoch, fromUserId, fromDeviceId, toUserId, toDeviceId, encryptedKeyBlob) {
+  async storeEncryptedSenderKey(groupId, epoch, fromUserId, fromDeviceId, toUserId, toDeviceId, encryptedKeyBlob) {
     const data = loadData()
     if (!data.senderKeys) data.senderKeys = {}
     const key = `${groupId}:${epoch}`
@@ -200,7 +245,7 @@ export const e2eTrueService = {
       createdAt: new Date().toISOString()
     })
 
-    saveData(data)
+    await saveData(data)
     return true
   },
 
@@ -213,7 +258,7 @@ export const e2eTrueService = {
 
   // === Queued Key Updates for Offline Devices ===
 
-  queueKeyUpdate(toUserId, toDeviceId, update) {
+  async queueKeyUpdate(toUserId, toDeviceId, update) {
     const data = loadData()
     if (!data.keyUpdateQueue) data.keyUpdateQueue = {}
     const key = `${toUserId}:${toDeviceId}`
@@ -225,18 +270,18 @@ export const e2eTrueService = {
       queuedAt: new Date().toISOString()
     })
 
-    saveData(data)
+    await saveData(data)
     return true
   },
 
-  dequeueKeyUpdates(toUserId, toDeviceId) {
+  async dequeueKeyUpdates(toUserId, toDeviceId) {
     const data = loadData()
     const key = `${toUserId}:${toDeviceId}`
     const updates = data.keyUpdateQueue?.[key] || []
 
     if (updates.length > 0) {
       data.keyUpdateQueue[key] = []
-      saveData(data)
+      await saveData(data)
     }
 
     return updates
@@ -244,7 +289,7 @@ export const e2eTrueService = {
 
   // === Encrypted Message Queue (for offline devices) ===
 
-  queueEncryptedMessage(toUserId, toDeviceId, message) {
+  async queueEncryptedMessage(toUserId, toDeviceId, message) {
     const data = loadData()
     if (!data.messageQueue) data.messageQueue = {}
     const key = `${toUserId}:${toDeviceId}`
@@ -261,18 +306,18 @@ export const e2eTrueService = {
       timestamp: message.timestamp || new Date().toISOString()
     })
 
-    saveData(data)
+    await saveData(data)
     return true
   },
 
-  dequeueEncryptedMessages(toUserId, toDeviceId, limit = 100) {
+  async dequeueEncryptedMessages(toUserId, toDeviceId, limit = 100) {
     const data = loadData()
     const key = `${toUserId}:${toDeviceId}`
     const messages = (data.messageQueue?.[key] || []).slice(0, limit)
 
     if (messages.length > 0) {
       data.messageQueue[key] = (data.messageQueue[key] || []).slice(limit)
-      saveData(data)
+      await saveData(data)
     }
 
     return messages
@@ -294,7 +339,7 @@ export const e2eTrueService = {
 
   // === Cleanup ===
 
-  deleteGroupData(groupId) {
+  async deleteGroupData(groupId) {
     const data = loadData()
     if (data.groupEpochs?.[groupId]) delete data.groupEpochs[groupId]
 
@@ -307,11 +352,11 @@ export const e2eTrueService = {
       }
     }
 
-    saveData(data)
+    await saveData(data)
     return true
   },
 
-  deleteUserData(userId) {
+  async deleteUserData(userId) {
     const data = loadData()
     if (data.deviceKeys?.[userId]) delete data.deviceKeys[userId]
 
@@ -327,7 +372,7 @@ export const e2eTrueService = {
       }
     }
 
-    saveData(data)
+    await saveData(data)
     return true
   }
 }

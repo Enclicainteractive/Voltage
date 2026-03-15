@@ -84,12 +84,12 @@
     }
   },
   "cache": {
-    "enabled": false,
-    "provider": "memory",
+    "enabled": true,
+    "provider": "redis",
     "redis": {
       "host": "localhost",
       "port": 6379,
-      "password": null,
+      "password": "",
       "db": 0
     }
   },
@@ -109,9 +109,9 @@
       "provider": "enclica",
       "enclica": {
         "clientId": "app_54f92e4d526840789998b4cca492aea1",
-        "authUrl": "https://voltchatapp.enclicainteractive.com/oauth/authorize",
-        "tokenUrl": "https://voltchatapp.enclicainteractive.com/api/oauth/token",
-        "userInfoUrl": "https://voltchatapp.enclicainteractive.com/api/user/me"
+        "authUrl": "https://api.enclicainteractive.com/oauth/authorize",
+        "tokenUrl": "https://api.enclicainteractive.com/api/oauth/token",
+        "userInfoUrl": "https://api.enclicainteractive.com/api/user/me"
       }
     }
   },

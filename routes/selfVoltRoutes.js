@@ -5,9 +5,21 @@ import { authenticateToken } from '../middleware/authMiddleware.js'
 import { selfVoltService } from '../services/selfVoltService.js'
 import config from '../config/config.js'
 
+const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
+
 const getAvatarUrl = (userId) => {
-  const imageServerUrl = config.getImageServerUrl()
-  return `${imageServerUrl}/api/images/users/${userId}/profile`
+  const safeUserId = String(userId || '')
+  if (!safeUserId) return null
+  const baseUrl = safeUserId.startsWith('u_')
+    ? (config.getServerUrl() || config.getImageServerUrl())
+    : config.getImageServerUrl()
+  return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
+}
+
+const resolveUserAvatar = (userId, profile = null) => {
+  const explicit = profile?.imageUrl || profile?.imageurl || profile?.avatarUrl || profile?.avatarURL || profile?.avatar || null
+  if (isExternalImage(explicit)) return explicit
+  return getAvatarUrl(userId)
 }
 
 const router = express.Router()
@@ -233,7 +245,8 @@ router.post('/auth', authenticateToken, (req, res) => {
       id: req.user.id,
       username: req.user.username,
       host: req.user.host,
-      avatar: getAvatarUrl(req.user.id),
+      imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+      avatar: resolveUserAvatar(req.user.id, req.user),
       email: req.user.email
     },
     serverId,

@@ -15,10 +15,10 @@ router.get('/config', (req, res) => {
 
 router.post('/subscribe', authenticateToken, async (req, res) => {
   try {
-    const { subscription } = req.body
+    const subscription = req.body?.subscription || req.body
     const userId = req.user.id
     
-    if (!subscription || !subscription.endpoint) {
+    if (!subscription || (!subscription.endpoint && !subscription.desktop)) {
       return res.status(400).json({ error: 'Invalid subscription' })
     }
     

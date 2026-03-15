@@ -1,40 +1,65 @@
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import crypto from 'crypto'
 import config from '../config/config.js'
+import { supportsDirectQuery, directQuery, FILES } from './dataService.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const SELF_VOLT_FILE = path.join(DATA_DIR, 'self-volts.json')
+const SELF_VOLT_FILE = FILES.selfVolts
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true })
+let selfVoltCache = { volts: [] }
+let cacheLoaded = false
+
+const ensureCacheLoaded = async () => {
+  if (!cacheLoaded) {
+    if (supportsDirectQuery()) {
+      try {
+        const rows = await directQuery('SELECT * FROM self_volts')
+        if (rows && rows.length > 0) {
+          selfVoltCache.volts = rows.map(r => ({ id: r.id, ...JSON.parse(r.data || '{}') }))
+        }
+      } catch (err) {
+        console.error('[SelfVolt] Error loading from DB:', err.message)
+      }
+    }
+    cacheLoaded = true
+  }
 }
 
 const loadData = (defaultValue = {}) => {
-  try {
-    if (fs.existsSync(SELF_VOLT_FILE)) {
-      return JSON.parse(fs.readFileSync(SELF_VOLT_FILE, 'utf8'))
-    }
-  } catch (err) {
-    console.error('[SelfVolt] Error loading data:', err.message)
+  if (!cacheLoaded) {
+    ensureCacheLoaded().catch(err => console.error('[SelfVolt] Failed to load cache:', err))
+    return { ...defaultValue, volts: [] }
   }
-  return defaultValue
+  return { ...selfVoltCache }
 }
 
-const saveData = (data) => {
-  try {
-    fs.writeFileSync(SELF_VOLT_FILE, JSON.stringify(data, null, 2))
-    return true
-  } catch (err) {
-    console.error('[SelfVolt] Error saving data:', err.message)
-    return false
+const saveData = async (data) => {
+  selfVoltCache = { ...data }
+  if (supportsDirectQuery()) {
+    try {
+      await directQuery('DELETE FROM self_volts')
+      for (const volt of data.volts || []) {
+        await directQuery('INSERT INTO self_volts (id, data, updatedAt) VALUES (?, ?, ?)', [volt.id, JSON.stringify(volt), new Date().toISOString()])
+      }
+      console.log('[SelfVolt] Saved to database')
+      return true
+    } catch (err) {
+      console.error('[SelfVolt] Error saving to DB:', err.message)
+      return false
+    }
   }
+  return false
 }
 
 export const selfVoltService = {
+  async ensureLoaded() {
+    if (!cacheLoaded) {
+      await ensureCacheLoaded()
+    }
+  },
+
   getAllVoltServers() {
+    if (!cacheLoaded) {
+      ensureCacheLoaded().catch(err => console.error('[SelfVolt] Failed to load cache:', err))
+    }
     const data = loadData()
     return data.volts || []
   },
@@ -44,7 +69,7 @@ export const selfVoltService = {
     return volts.find(v => v.id === voltId) || null
   },
 
-  addVoltServer(voltData) {
+  async addVoltServer(voltData) {
     const data = loadData()
     
     if (!data.volts) data.volts = []
@@ -69,12 +94,12 @@ export const selfVoltService = {
     }
     
     data.volts.push(volt)
-    saveData(data)
+    await saveData(data)
     console.log(`[SelfVolt] Registered: ${volt.name} (${volt.host})`)
     return volt
   },
 
-  updateVoltServer(voltId, updates) {
+  async updateVoltServer(voltId, updates) {
     const data = loadData()
     if (!data.volts) return null
     
@@ -86,16 +111,16 @@ export const selfVoltService = {
     }
     
     data.volts[index] = { ...data.volts[index], ...updates }
-    saveData(data)
+    await saveData(data)
     return data.volts[index]
   },
 
-  removeVoltServer(voltId) {
+  async removeVoltServer(voltId) {
     const data = loadData()
     if (!data.volts) return false
     
     data.volts = data.volts.filter(v => v.id !== voltId)
-    saveData(data)
+    await saveData(data)
     return true
   },
 
@@ -147,7 +172,7 @@ export const selfVoltService = {
     }
   },
 
-  addServerToVolt(voltId, serverData) {
+  async addServerToVolt(voltId, serverData) {
     const data = loadData()
     if (!data.volts) return null
     
@@ -175,11 +200,11 @@ export const selfVoltService = {
       data.volts[voltIndex].servers.push(server)
     }
     
-    saveData(data)
+    await saveData(data)
     return serverData
   },
 
-  removeServerFromVolt(voltId, serverId) {
+  async removeServerFromVolt(voltId, serverId) {
     const data = loadData()
     if (!data.volts) return false
     
@@ -190,11 +215,11 @@ export const selfVoltService = {
       data.volts[voltIndex].servers = data.volts[voltIndex].servers.filter(s => s.id !== serverId)
     }
     
-    saveData(data)
+    await saveData(data)
     return true
   },
 
-  generateApiKey(userId, keyData) {
+  async generateApiKey(userId, keyData) {
     const data = loadData()
     
     if (!data.apiKeys) data.apiKeys = {}
@@ -210,7 +235,7 @@ export const selfVoltService = {
     }
     
     data.apiKeys[userId].push(key)
-    saveData(data)
+    await saveData(data)
     return key
   },
 
@@ -219,12 +244,12 @@ export const selfVoltService = {
     return data.apiKeys?.[userId] || []
   },
 
-  deleteApiKey(userId, keyId) {
+  async deleteApiKey(userId, keyId) {
     const data = loadData()
     if (!data.apiKeys?.[userId]) return false
     
     data.apiKeys[userId] = data.apiKeys[userId].filter(k => k.keyId !== keyId)
-    saveData(data)
+    await saveData(data)
     return true
   },
 

@@ -1,15 +1,51 @@
-import fs from 'fs'
+/**
+ * VoltChat Data Service
+ * 
+ * This module provides the data layer for VoltChat, handling all database operations
+ * and serving as the interface between the API routes and the underlying storage.
+ * 
+ * SUPPORTED STORAGE BACKENDS:
+ * - MySQL/MariaDB (recommended for production)
+ * - PostgreSQL
+ * - SQLite (development only)
+ * - MongoDB
+ * - Redis
+ * 
+ * IMPORTANT: JSON file storage is deprecated and will be removed in a future version.
+ * Please migrate to a database backend for production use.
+ * 
+ * @author VoltChat Team
+ * @license MIT
+ */
+
 import path from 'path'
 import { fileURLToPath } from 'url'
 import config from '../config/config.js'
 import { getStorage, resetStorage as resetStorageLayer } from './storageService.js'
+import redisService from './redisService.js'
+import circuitBreakerManager from './circuitBreaker.js'
+import { globalCoalescer, messageCache } from './cacheService.js'
+import {
+  getAgeVerificationJurisdiction,
+  getAgeVerificationJurisdictionCode,
+  normalizeAgeVerification
+} from '../utils/ageVerificationPolicy.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-// Use configured data directory, not hardcoded path
-// IMPORTANT: This must be called AFTER config.load() to get correct path
+
+// Data directory - determined at runtime from config
+// This cannot be a constant because config must be loaded first
+// WARNING: Calling this before config.load() will result in incorrect path
 let _dataDir = null
+
+// Cache for FILES object to avoid rebuilding on every access
+// FILES contains paths to all data files (users.json, servers.json, etc.)
 let _filesCache = null
 
+/**
+ * Get the data directory path from config
+ * @returns {string} Path to data directory
+ */
 const getDataDir = () => {
   if (_dataDir) return _dataDir
   config.load()
@@ -17,16 +53,9 @@ const getDataDir = () => {
   return _dataDir
 }
 
-// Only create directory if using JSON storage
-const ensureDataDir = () => {
-  config.load()
-  if (config.config.storage?.type === 'json') {
-    const dataDir = getDataDir()
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true })
-    }
-  }
-}
+// Data directory is no longer used for storage. JSON is deprecated.
+// This no-op remains for backward compatibility with buildFiles().
+const ensureDataDir = () => {}
 
 // Build the FILES object with correct paths
 const buildFiles = () => {
@@ -50,6 +79,7 @@ const buildFiles = () => {
     files: path.join(dataDir, 'files.json'),
     attachments: path.join(dataDir, 'attachments.json'),
     discovery: path.join(dataDir, 'discovery.json'),
+    serverEvents: path.join(dataDir, 'server-events.json'),
     globalBans: path.join(dataDir, 'global-bans.json'),
     serverBans: path.join(dataDir, 'server-bans.json'),
     adminLogs: path.join(dataDir, 'admin-logs.json'),
@@ -59,7 +89,8 @@ const buildFiles = () => {
     selfVolts: path.join(dataDir, 'self-volts.json'),
     federation: path.join(dataDir, 'federation.json'),
     serverStart: path.join(dataDir, 'server-start.json'),
-    callLogs: path.join(dataDir, 'call-logs.json')
+    callLogs: path.join(dataDir, 'call-logs.json'),
+    reports: path.join(dataDir, 'moderation-reports.json')
   }
 }
 
@@ -97,6 +128,126 @@ let storageService = null
 let useStorage = false
 let storageCache = {}
 let cacheDirty = {}
+const REDIS_CACHE_PREFIX = 'volt:data:'
+const tableColumnCache = new Map()
+
+// Tables that are too large to keep fully in memory.
+// These tables will NOT be preloaded into storageCache during startup;
+// instead they are queried on-demand from the database.
+const LAZY_TABLES = new Set(['messages', 'dm_messages', 'reactions'])
+
+/**
+ * Get a connection from the underlying database pool for direct queries.
+ * Returns null if no pool-based backend is available.
+ */
+const getPoolConnection = async () => {
+  if (!storageService?.pool) return null
+  try {
+    return await storageService.pool.getConnection()
+  } catch (err) {
+    console.error('[DataService] Failed to get pool connection:', err.message)
+    return null
+  }
+}
+
+/**
+ * Execute a direct parameterized query against the database.
+ * Automatically acquires and releases a connection from the pool.
+ * Protected by circuit breaker to avoid hammering a failing DB.
+ * Returns rows on success, null on failure.
+ */
+const directQueryCache = new Map()
+const DIRECT_QUERY_CACHE_TTL = 1000
+
+const getDirectQueryCacheKey = (sql, params) => `${sql}:${JSON.stringify(params)}`
+
+const directQuery = async (sql, params = []) => {
+  const isSelectQuery = sql.trim().toUpperCase().startsWith('SELECT')
+  const isInsertQuery = sql.trim().toUpperCase().startsWith('INSERT')
+  
+  if (isSelectQuery) {
+    const cacheKey = getDirectQueryCacheKey(sql, params)
+    const cached = directQueryCache.get(cacheKey)
+    if (cached && Date.now() - cached.timestamp < DIRECT_QUERY_CACHE_TTL) {
+      return cached.rows
+    }
+  }
+
+  try {
+    const result = await circuitBreakerManager.execute('db:query', async () => {
+      const conn = await getPoolConnection()
+      if (!conn) throw new Error('No pool connection available')
+      try {
+        const rows = await conn.query(sql, params)
+        return rows
+      } finally {
+        conn.release()
+      }
+    }, { failureThreshold: 20, resetTimeout: 10000 })
+
+    if (isSelectQuery && result) {
+      const cacheKey = getDirectQueryCacheKey(sql, params)
+      directQueryCache.set(cacheKey, { rows: result, timestamp: Date.now() })
+      setTimeout(() => {
+        directQueryCache.delete(cacheKey)
+      }, DIRECT_QUERY_CACHE_TTL + 500)
+    }
+
+    return result
+  } catch (err) {
+    if (err.message === 'Circuit breaker is OPEN') {
+      console.warn('[DataService] Circuit breaker OPEN - DB may be overloaded')
+    } else {
+      console.error('[DataService] Direct query error:', err.message, '| SQL:', sql.substring(0, 100))
+    }
+    return null
+  }
+}
+
+/**
+ * Check whether we can use direct DB queries (pool-backed storage).
+ */
+const supportsDirectQuery = () => {
+  if (!useStorage) {
+    console.log('[DataService] supportsDirectQuery: useStorage is false')
+    return false
+  }
+  const storage = getStorage()
+  console.log('[DataService] supportsDirectQuery: storage type:', storage?.type, 'db:', !!storage?.db, 'pool:', !!storage?.pool)
+  // SQLite uses .db, other databases use .pool
+  if (storage?.type === 'sqlite') {
+    return !!storage?.db
+  }
+  return !!storage?.pool
+}
+
+const getDirectTableColumns = async (table) => {
+  const cacheKey = String(table || '').trim()
+  if (!cacheKey) return []
+  if (tableColumnCache.has(cacheKey)) return tableColumnCache.get(cacheKey)
+
+  if (!supportsDirectQuery()) return []
+
+  try {
+    let rows = await directQuery(`SHOW COLUMNS FROM ${cacheKey}`)
+    if (Array.isArray(rows) && rows.length > 0) {
+      const columns = rows.map(row => row?.Field || row?.field || row?.COLUMN_NAME || row?.column_name).filter(Boolean)
+      tableColumnCache.set(cacheKey, columns)
+      return columns
+    }
+  } catch {
+    // Ignore and fall through to empty result.
+  }
+
+  return []
+}
+
+const resolveMessageTimeColumn = async () => {
+  const columns = await getDirectTableColumns('messages')
+  if (columns.includes('timestamp')) return 'timestamp'
+  if (columns.includes('createdAt')) return 'createdAt'
+  return 'timestamp'
+}
 
 // Lazy-built lookup maps
 let _fileToTableCache = null
@@ -124,16 +275,18 @@ const getFileToTable = () => {
       [files.files]: 'files',
       [files.attachments]: 'attachments',
       [files.discovery]: 'discovery',
+      [files.serverEvents]: 'server_events',
       [files.globalBans]: 'global_bans',
       [files.serverBans]: 'server_bans',
       [files.adminLogs]: 'admin_logs',
       [files.systemMessages]: 'system_messages',
-      [files.e2eTrue]: 'e2e_true',
+      [files.e2eTrue]: 'e2e_true_state',
       [files.pinnedMessages]: 'pinned_messages',
       [files.selfVolts]: 'self_volts',
       [files.federation]: 'federation',
       [files.serverStart]: 'server_start',
-      [files.callLogs]: 'call_logs'
+      [files.callLogs]: 'call_logs',
+      [files.reports]: 'moderation_reports'
     }
   }
   return _fileToTableCache
@@ -154,6 +307,17 @@ const getStorageTables = () => {
     _storageTablesCache = Object.values(getFileToTable())
   }
   return _storageTablesCache
+}
+
+const assertKnownStorageTable = (table) => {
+  const normalized = String(table || '').trim()
+  if (!/^[a-z0-9_]+$/i.test(normalized)) {
+    throw new Error(`Unsafe table name: ${table}`)
+  }
+  if (!getStorageTables().includes(normalized)) {
+    throw new Error(`Unknown table name: ${table}`)
+  }
+  return normalized
 }
 
 // For backward compatibility with code that uses these as constants
@@ -183,6 +347,36 @@ const countDataEntries = (value) => {
   return value ? 1 : 0
 }
 
+const cloneData = (value) => {
+  if (value === null || typeof value === 'undefined') return value
+  try {
+    return structuredClone(value)
+  } catch {
+    try {
+      return JSON.parse(JSON.stringify(value))
+    } catch {
+      return value
+    }
+  }
+}
+
+const getRedisCacheKey = (table) => `${REDIS_CACHE_PREFIX}${table}`
+
+const loadTableFromRedisCache = async (table) => {
+  if (!redisService.isReady()) return undefined
+  const cached = await redisService.get(getRedisCacheKey(table))
+  // redisService.get returns null when key doesn't exist or on error.
+  // We must return undefined in that case so loadAllData falls through
+  // to the actual database query instead of using empty defaults.
+  if (cached === null || cached === undefined) return undefined
+  return cached
+}
+
+const writeTableToRedisCache = async (table, data) => {
+  if (!redisService.isReady()) return false
+  return await redisService.set(getRedisCacheKey(table), data)
+}
+
 const normalizeLegacyKeys = (value) => {
   if (Array.isArray(value)) {
     return value.map(normalizeLegacyKeys)
@@ -199,14 +393,8 @@ const normalizeLegacyKeys = (value) => {
   return normalized
 }
 
-const loadJsonFileDirect = (file, defaultValue = {}) => {
-  try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'))
-    }
-  } catch (err) {
-    console.error(`[DataService] Auto-migrate read error (${path.basename(file)}):`, err.message)
-  }
+// DEPRECATED: JSON file loading removed. DB is the single source of truth.
+const loadJsonFileDirect = (_file, defaultValue = {}) => {
   return defaultValue
 }
 
@@ -229,61 +417,88 @@ const mergeMissingEntries = (currentValue, incomingValue) => {
   return { merged, changed }
 }
 
+// DEPRECATED: JSON auto-migration removed. DB is the single source of truth.
+// If you still have JSON files, use the migrate script to import them.
 const autoMigrateJsonToStorage = async () => {
-  if (!useStorage || !storageService) return
-
-  let migratedTables = 0
-  let migratedEntries = 0
-
-  for (const [file, table] of Object.entries(getFileToTable())) {
-    const jsonData = loadJsonFileDirect(file, {})
-    if (!hasAnyData(jsonData)) continue
-
-    const storageData = storageCache[table] ?? {}
-    const { merged, changed } = mergeMissingEntries(storageData, jsonData)
-    if (!changed) continue
-
-    storageCache[table] = merged
-    await saveToStorage(table, merged)
-    migratedTables += 1
-    migratedEntries += Array.isArray(merged) ? merged.length : Object.keys(merged || {}).length
-  }
-
-  if (migratedTables > 0) {
-    console.log(`[DataService] Auto-migrated JSON -> ${storageService.type}: ${migratedTables} tables, ${migratedEntries} entries`)
-  } else {
-    console.log('[DataService] Auto-migrate: no JSON data changes detected')
-  }
+  // No-op: JSON files are no longer read or migrated at runtime
 }
 
+// JSON STORAGE IS DEPRECATED.
+// 
+// if you're still using JSON files, i'm sorry.
+// i was sorry then too. but now im MORE sorry.
+// 
+// we tried to make JSON work. we really did. 
+// but JSON + multiple server instances = DATA CORRUPTION
+// and data corruption = CUSTOMERS LEAVING
+// customers leaving = ME GETTING FIRED
+// ME GETTING FIRED = BAD
+// 
+// so now we REQUIRE a database. MySQL, MariaDB, PostgreSQL, whatever.
+// just NOT json. please. i BEG you.
+// 
+// if you try to use JSON after this change, the server will REFUSE to start.
+// this is for your own good. you'll thank me later.
+// (you won't. but that's okay.)
+
 // Get storage reference from storageService (initialized by server.js)
+// 
+// this function is called whenever we need database access
+// it gets the storage service that was set up during startup
+// 
+// if you're wondering why this is a function and not just a variable:
+// because the storage service is initialized asynchronously
+// and we need to make sure it's ready before we use it
+// 
+// also we throw if JSON is detected because AGAIN, JSON IS DEPRECATED
+// we will NOT support JSON. stop asking. (nobody asked. im just frustrated.)
 const refreshStorageRef = () => {
   storageService = getStorage()
-  useStorage = storageService && storageService.type !== 'json'
+  if (!storageService || storageService.type === 'json') {
+    throw new Error('[DataService] JSON storage is deprecated. Please configure a database (MySQL/MariaDB, PostgreSQL, etc.) in config.json')
+  }
+  useStorage = true
   return storageService
 }
 
+// Initialize storage - called during server startup
+// 
+// this is where the magic happens
+// we load config, connect to database, load all existing data into memory
+// 
+// the data loading is important because:
+// 1. its faster to read from memory than database every time
+// 2. we don't want to hammer the database with queries
+// 3. honestly mostly reason 1 honestly
+// 
+// if this fails, the server won't start
+// which is GOOD because trying to run with broken storage is a NIGHTMARE
 const initStorage = async ({ forceReinit = false } = {}) => {
   try {
-    config.load()
+    // Config is already loaded by server.js, but call it again to be safe
+    if (!config.config) {
+      config.load()
+    }
     if (forceReinit && resetStorageLayer) {
       await resetStorageLayer()
     }
-    // Get storage from storageService (already initialized by server.js)
     storageService = getStorage()
-    useStorage = storageService && storageService.type !== 'json'
+    
+    // JSON DETECTION - DONT EVEN TRY
+    // i mean it. don't. just don't.
+    if (!storageService || storageService.type === 'json') {
+      throw new Error('[DataService] JSON storage is deprecated. Please configure a database (MySQL/MariaDB, PostgreSQL, etc.) in config.json')
+    }
+    
+    useStorage = true
     storageCache = {}
     
-    if (useStorage) {
-      console.log('[DataService] Using storage layer:', storageService.type)
-      await loadAllData()
-      await autoMigrateJsonToStorage()
-    } else {
-      console.log('[DataService] Using file-based storage (deprecated - migrate to a database)')
-    }
+    console.log('[DataService] Using storage layer:', storageService.type)
+    await loadAllData()
   } catch (err) {
     console.error('[DataService] Storage initialization error:', err.message)
-    useStorage = false
+    console.error('[DataService] Stack:', err.stack)
+    throw err
   }
 }
 
@@ -297,17 +512,50 @@ const isAsyncStorageBackend = (type = '') => {
     type?.startsWith('postgres')
 }
 
+const isEmptyData = (data) => {
+  if (data === null || data === undefined) return true
+  if (Array.isArray(data)) return data.length === 0
+  if (typeof data === 'object') return Object.keys(data).length === 0
+  return false
+}
+
+/**
+ * Load all data from the database into the in-memory cache.
+ * 
+ * Architecture: DB is the SINGLE SOURCE OF TRUTH.
+ * - Redis is a write-through cache for fast reads only
+ * - On startup, we ALWAYS load from DB to ensure consistency
+ * - After loading from DB, we update the Redis cache
+ * - Redis cache misses are expected and not a problem
+ */
 const loadAllData = async () => {
   if (!useStorage || !storageService) return
   
   for (const table of getStorageTables()) {
+    // Skip large tables when we have a pool-based backend - they will be
+    // queried on-demand instead of being loaded entirely into memory.
+    if (LAZY_TABLES.has(table) && supportsDirectQuery()) {
+      console.log(`[DataService] Skipping preload for large table: ${table} (will query on-demand)`)
+      storageCache[table] = {} // keep a minimal cache for incremental updates
+      continue
+    }
+
     try {
-      if (storageService.load) {
-        if (isAsyncStorageBackend(storageService.type)) {
-          storageCache[table] = await storageService.load(table, {})
-        } else {
-          storageCache[table] = storageService.load(table, {})
-        }
+      // ALWAYS load from DB - it is the single source of truth
+      let loaded
+      if (isAsyncStorageBackend(storageService.type)) {
+        loaded = await storageService.load(table, {})
+      } else {
+        loaded = storageService.load(table, {})
+      }
+      
+      storageCache[table] = cloneData(loaded ?? {})
+      
+      // Write to Redis as a cache layer (fire-and-forget, non-blocking)
+      if (!isEmptyData(loaded)) {
+        writeTableToRedisCache(table, loaded).catch(err => {
+          console.warn(`[DataService] Failed to cache ${table} in Redis:`, err.message)
+        })
       }
     } catch (err) {
       console.error(`[DataService] Error loading ${table}:`, err.message)
@@ -317,105 +565,365 @@ const loadAllData = async () => {
 }
 
 const saveToStorage = async (table, data) => {
-  if (!useStorage || !storageService) return
+  if (!useStorage || !storageService) {
+    console.error(`[DataService] Cannot save - no storage configured for table: ${table}`)
+    return false
+  }
   
   try {
+    const payload = cloneData(data)
+    let result
     if (isAsyncStorageBackend(storageService.type)) {
-      await storageService.save(table, data)
+      result = await circuitBreakerManager.execute(`db:save:${table}`, async () => {
+        return await storageService.save(table, payload)
+      }, { failureThreshold: 3, resetTimeout: 15000 })
     } else {
-      storageService.save(table, data)
+      result = storageService.save(table, payload)
     }
+    
+    if (result) {
+      // Update Redis cache (fire-and-forget, don't block on it)
+      writeTableToRedisCache(table, payload).catch(err => {
+        console.warn(`[DataService] Redis cache update failed for ${table}:`, err.message)
+      })
+    }
+    console.log(`[DataService] Saved ${table}: ${Object.keys(payload || {}).length} records`)
+    return result
   } catch (err) {
     console.error(`[DataService] Error saving ${table}:`, err.message)
+    return false
   }
 }
 
 const loadData = (file, defaultValue = {}) => {
-  if (useStorage) {
-    const table = getTableName(file)
-    
-    // Check cache first
-    if (storageCache[table] !== undefined) {
-      return storageCache[table]
-    }
-    
-    // Try to load from individual table first (after distribution)
-    // Fall back to storage_kv if individual table doesn't exist
-    const result = loadFromIndividualTable(table, defaultValue)
-    storageCache[table] = result
-    return result
+  if (!useStorage || !storageService) {
+    throw new Error('[DataService] Database not configured. Please configure MySQL/MariaDB in config.json')
   }
   
-  try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'))
+  const table = getTableName(file)
+  
+  // Return from in-memory cache if populated with actual data.
+  // For LAZY_TABLES (messages, dm_messages, reactions), the cache is {} by design
+  // when skipped during preloading, indicating we should query on-demand.
+  if (storageCache[table] !== undefined) {
+    // If this is a lazy table and the cache is just {} (from skipping preload),
+    // we need to query on-demand
+    if (LAZY_TABLES.has(table) && Object.keys(storageCache[table]).length === 0) {
+      // Query on-demand for lazy tables
+      const result = loadFromIndividualTable(table, defaultValue)
+      // Update cache with the result for future calls
+      storageCache[table] = cloneData(result)
+      return cloneData(result)
     }
-  } catch (err) {
-    console.error(`[Data] Error loading ${file}:`, err.message)
+    return cloneData(storageCache[table])
+  }
+  
+  // For async backends, the cache should have been populated during loadAllData().
+  // If we reach here, it means the table wasn't preloaded. Set default and log a warning.
+  if (isAsyncStorageBackend(storageService.type)) {
+    console.warn(`[DataService] Cache miss for table '${table}' on async backend. This should not happen - data should be preloaded.`)
+    storageCache[table] = cloneData(defaultValue)
+    return cloneData(defaultValue)
+  }
+  
+  // Sync backends (SQLite) - load directly from DB
+  const result = loadFromIndividualTable(table, defaultValue)
+  storageCache[table] = cloneData(result)
+  return cloneData(result)
+}
+
+/**
+ * Load data by reference (no clone). Use ONLY for read-only access patterns
+ * where the caller will NOT mutate the returned object. This avoids the
+ * O(n) structuredClone overhead on large datasets.
+ */
+const loadDataRef = (file, defaultValue = {}) => {
+  if (!useStorage || !storageService) {
+    throw new Error('[DataService] Database not configured.')
+  }
+  const table = getTableName(file)
+  if (storageCache[table] !== undefined) {
+    return storageCache[table]
   }
   return defaultValue
 }
 
+const loadFreshData = async (file, defaultValue = {}) => {
+  const table = getTableName(file)
+
+  if (!useStorage || !storageService) {
+    return loadData(file, defaultValue)
+  }
+
+  if (isAsyncStorageBackend(storageService.type)) {
+    try {
+      const loaded = await storageService.load(table, defaultValue)
+      const normalized = cloneData(loaded ?? defaultValue)
+      storageCache[table] = normalized
+      return cloneData(normalized)
+    } catch (err) {
+      console.error(`[DataService] Error loading fresh ${table}:`, err.message)
+      return cloneData(defaultValue)
+    }
+  }
+
+  return loadData(file, defaultValue)
+}
+
+const isSqliteBackend = () => storageService?.type === 'sqlite' && storageService?.db
+const isMysqlBackend = () => storageService?.type === 'mysql' && storageService?.pool
+const isMariadbBackend = () => storageService?.type === 'mariadb' && storageService?.pool
+const supportsIncrementalFriendStorage = () => useStorage && (isSqliteBackend() || isMysqlBackend() || isMariadbBackend())
+
+const getSqlColumnNameSet = (rows = []) => new Set(
+  (rows || []).map(row => row?.Field || row?.field || row?.COLUMN_NAME || row?.column_name || row).filter(Boolean)
+)
+
+const updateFriendsCache = (userId, friendId, shouldAdd) => {
+  const table = 'friends'
+  const friends = cloneData(storageCache[table] || {})
+  if (!Array.isArray(friends[userId])) friends[userId] = []
+  if (!Array.isArray(friends[friendId])) friends[friendId] = []
+
+  if (shouldAdd) {
+    if (!friends[userId].includes(friendId)) friends[userId].push(friendId)
+    if (!friends[friendId].includes(userId)) friends[friendId].push(userId)
+  } else {
+    friends[userId] = friends[userId].filter(id => id !== friendId)
+    friends[friendId] = friends[friendId].filter(id => id !== userId)
+  }
+
+  storageCache[table] = friends
+  cacheDirty[table] = false
+  return friends
+}
+
+const updateFriendRequestsCache = (mutator) => {
+  const table = 'friend_requests'
+  const requests = cloneData(storageCache[table] || { incoming: {}, outgoing: {} })
+  if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
+  if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
+  mutator(requests)
+  storageCache[table] = requests
+  cacheDirty[table] = false
+  return requests
+}
+
+const executeIncrementalStorageWrite = async ({ sqlite, mysql, mariadb }) => {
+  if (isSqliteBackend()) {
+    sqlite(storageService.db)
+    return true
+  }
+
+  if (isMysqlBackend()) {
+    const conn = await storageService.pool.getConnection()
+    try {
+      await mysql(conn)
+      return true
+    } finally {
+      conn.release()
+    }
+  }
+
+  if (isMariadbBackend()) {
+    const conn = await storageService.pool.getConnection()
+    try {
+      await mariadb(conn)
+      return true
+    } finally {
+      conn.release()
+    }
+  }
+
+  return false
+}
+
+const addFriendRows = async (userId, friendId) => {
+  if (!supportsIncrementalFriendStorage()) return false
+
+  const createdAt = new Date().toISOString()
+  await executeIncrementalStorageWrite({
+    sqlite: (db) => {
+      const columnRows = db.prepare(`PRAGMA table_info(friends)`).all()
+      const availableColumns = getSqlColumnNameSet(columnRows.map(row => row?.name))
+      const insertColumns = availableColumns.has('createdAt')
+        ? ['userId', 'friendId', 'createdAt']
+        : ['userId', 'friendId']
+      const placeholders = insertColumns.map(() => '?').join(', ')
+      const stmt = db.prepare(`INSERT OR IGNORE INTO friends (${insertColumns.join(', ')}) VALUES (${placeholders})`)
+      const forward = insertColumns.includes('createdAt')
+        ? [userId, friendId, createdAt]
+        : [userId, friendId]
+      const reverse = insertColumns.includes('createdAt')
+        ? [friendId, userId, createdAt]
+        : [friendId, userId]
+      stmt.run(forward)
+      stmt.run(reverse)
+    },
+    mysql: async (conn) => {
+      const [columnRows] = await conn.query(`SHOW COLUMNS FROM friends`)
+      const availableColumns = getSqlColumnNameSet(columnRows)
+      const insertColumns = availableColumns.has('createdAt')
+        ? ['userId', 'friendId', 'createdAt']
+        : ['userId', 'friendId']
+      const placeholders = `(${insertColumns.map(() => '?').join(', ')})`
+      const values = insertColumns.includes('createdAt')
+        ? [userId, friendId, createdAt, friendId, userId, createdAt]
+        : [userId, friendId, friendId, userId]
+      await conn.execute(
+        `INSERT IGNORE INTO friends (${insertColumns.join(', ')}) VALUES ${placeholders}, ${placeholders}`,
+        values
+      )
+    },
+    mariadb: async (conn) => {
+      const columnRows = await conn.query(`SHOW COLUMNS FROM friends`)
+      const availableColumns = getSqlColumnNameSet(columnRows)
+      const insertColumns = availableColumns.has('createdAt')
+        ? ['userId', 'friendId', 'createdAt']
+        : ['userId', 'friendId']
+      const placeholders = `(${insertColumns.map(() => '?').join(', ')})`
+      const values = insertColumns.includes('createdAt')
+        ? [userId, friendId, createdAt, friendId, userId, createdAt]
+        : [userId, friendId, friendId, userId]
+      await conn.query(
+        `INSERT IGNORE INTO friends (${insertColumns.join(', ')}) VALUES ${placeholders}, ${placeholders}`,
+        values
+      )
+    }
+  })
+
+  const friends = updateFriendsCache(userId, friendId, true)
+  await writeTableToRedisCache('friends', friends)
+  return true
+}
+
+const removeFriendRows = async (userId, friendId) => {
+  if (!supportsIncrementalFriendStorage()) return false
+
+  await executeIncrementalStorageWrite({
+    sqlite: (db) => {
+      db.prepare('DELETE FROM friends WHERE (userId = ? AND friendId = ?) OR (userId = ? AND friendId = ?)').run(userId, friendId, friendId, userId)
+    },
+    mysql: async (conn) => {
+      await conn.execute(
+        'DELETE FROM friends WHERE (userId = ? AND friendId = ?) OR (userId = ? AND friendId = ?)',
+        [userId, friendId, friendId, userId]
+      )
+    },
+    mariadb: async (conn) => {
+      await conn.query(
+        'DELETE FROM friends WHERE (userId = ? AND friendId = ?) OR (userId = ? AND friendId = ?)',
+        [userId, friendId, friendId, userId]
+      )
+    }
+  })
+
+  const friends = updateFriendsCache(userId, friendId, false)
+  await writeTableToRedisCache('friends', friends)
+  return true
+}
+
+const insertFriendRequestRow = async (request) => {
+  if (!supportsIncrementalFriendStorage()) return false
+
+  const createdAt = request.createdAt || new Date().toISOString()
+  await executeIncrementalStorageWrite({
+    sqlite: (db) => {
+      db.prepare(`
+        INSERT OR REPLACE INTO friend_requests
+        (id, fromUserId, toUserId, createdAt)
+        VALUES (?, ?, ?, ?)
+      `).run(
+        request.id,
+        request.from,
+        request.to,
+        createdAt
+      )
+    },
+    mysql: async (conn) => {
+      await conn.execute(`
+        INSERT INTO friend_requests
+        (id, fromUserId, toUserId, createdAt)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          fromUserId = VALUES(fromUserId),
+          toUserId = VALUES(toUserId),
+          createdAt = VALUES(createdAt)
+      `, [
+        request.id,
+        request.from,
+        request.to,
+        createdAt
+      ])
+    },
+    mariadb: async (conn) => {
+      await conn.query(`
+        INSERT INTO friend_requests
+        (id, fromUserId, toUserId, createdAt)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          fromUserId = VALUES(fromUserId),
+          toUserId = VALUES(toUserId),
+          createdAt = VALUES(createdAt)
+      `, [
+        request.id,
+        request.from,
+        request.to,
+        createdAt
+      ])
+    }
+  })
+
+  const requests = updateFriendRequestsCache((state) => {
+    if (!Array.isArray(state.incoming[request.to])) state.incoming[request.to] = []
+    if (!Array.isArray(state.outgoing[request.from])) state.outgoing[request.from] = []
+    state.incoming[request.to] = state.incoming[request.to].filter(r => r.id !== request.id)
+    state.outgoing[request.from] = state.outgoing[request.from].filter(r => r.id !== request.id)
+    state.incoming[request.to].push({ ...request })
+    state.outgoing[request.from].push({ ...request })
+  })
+  await writeTableToRedisCache('friend_requests', requests)
+  return true
+}
+
+const deleteFriendRequestRow = async (requestId) => {
+  if (!supportsIncrementalFriendStorage()) return false
+
+  await executeIncrementalStorageWrite({
+    sqlite: (db) => {
+      db.prepare('DELETE FROM friend_requests WHERE id = ?').run(requestId)
+    },
+    mysql: async (conn) => {
+      await conn.execute('DELETE FROM friend_requests WHERE id = ?', [requestId])
+    },
+    mariadb: async (conn) => {
+      await conn.query('DELETE FROM friend_requests WHERE id = ?', [requestId])
+    }
+  })
+
+  const requests = updateFriendRequestsCache((state) => {
+    Object.keys(state.incoming).forEach((userId) => {
+      state.incoming[userId] = (state.incoming[userId] || []).filter(r => r.id !== requestId)
+    })
+    Object.keys(state.outgoing).forEach((userId) => {
+      state.outgoing[userId] = (state.outgoing[userId] || []).filter(r => r.id !== requestId)
+    })
+  })
+  await writeTableToRedisCache('friend_requests', requests)
+  return true
+}
+
 // Load from individual table (after distribution) or fall back to storage_kv
+// Load from the database directly via storageService.
+// No JSON file or storage_kv fallbacks - DB is the single source of truth.
 const loadFromIndividualTable = (table, defaultValue = {}) => {
   if (!storageService) {
     return defaultValue
   }
   
   try {
-    // For SQLite, try individual table first
-    if (storageService.type === 'sqlite' && storageService.db) {
-      const db = storageService.db
-      // Check if individual table exists
-      const tableCheck = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table)
-      if (tableCheck) {
-        // Load from individual table
-        const rows = db.prepare(`SELECT * FROM ${table}`).all()
-        const result = {}
-        for (const row of rows) {
-          const id = row.id || row.code || row.serverId || Object.keys(row)[0]
-          if (id) {
-            // Parse JSON fields back
-            const parsed = {}
-            for (const [key, value] of Object.entries(row)) {
-              if (key === 'id' || key === 'code' || key === 'serverId') continue
-              try {
-                parsed[key] = JSON.parse(value)
-              } catch {
-                parsed[key] = value
-              }
-            }
-            result[id] = Object.keys(parsed).length > 0 ? parsed : row
-          }
-        }
-        if (Object.keys(result).length > 0) {
-          console.log(`[Data] Loaded ${table} from individual table (${Object.keys(result).length} records)`)
-          return result
-        }
-      }
-      
-      // Fall back to storage_kv
-      try {
-        const kvStmt = db.prepare('SELECT data FROM storage_kv WHERE id = ?')
-        const kvRow = kvStmt.get(table)
-        if (kvRow?.data) {
-          try {
-            return JSON.parse(kvRow.data)
-          } catch {
-            return defaultValue
-          }
-        }
-      } catch {
-        // storage_kv might not exist after distribution
-      }
-    }
-    
-    // For MySQL/MariaDB, use storage service load which handles distribution automatically
-    if ((storageService.type === 'mysql' || storageService.type === 'mariadb') && storageService.pool) {
-      return storageService.load(table, defaultValue)
-    }
-    
-    // Default: use storage service
+    table = assertKnownStorageTable(table)
+    // All backends use storageService.load() which queries individual tables directly
     return storageService.load(table, defaultValue)
   } catch (err) {
     console.error(`[Data] Error loading ${table}:`, err.message)
@@ -423,40 +931,28 @@ const loadFromIndividualTable = (table, defaultValue = {}) => {
   }
 }
 
-const saveData = (file, data) => {
-  if (useStorage) {
-    const table = getTableName(file)
-    storageCache[table] = data
-    return saveToStorage(table, data)
+const saveData = async (file, data) => {
+  if (!useStorage || !storageService) {
+    throw new Error('[DataService] Database not configured. Cannot save data without a database backend.')
   }
   
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2))
-    return true
-  } catch (err) {
-    console.error(`[Data] Error saving ${file}:`, err.message)
-    return false
+  const table = getTableName(file)
+  const payload = cloneData(data)
+  const saved = await saveToStorage(table, payload)
+  if (saved) {
+    storageCache[table] = payload
+    cacheDirty[table] = false
+  } else {
+    cacheDirty[table] = true
   }
+  return saved
 }
 
 const getTableName = (file) => {
   return FILE_TO_TABLE[file] || file
 }
 
-export const isManagedDataFile = (filePath) => {
-  if (!filePath || typeof filePath !== 'string') return false
-  return getManagedDataFiles().has(path.resolve(filePath))
-}
-
-export const loadManagedDataByFile = (filePath, defaultValue = {}) => {
-  const resolved = path.resolve(filePath)
-  return loadData(resolved, defaultValue)
-}
-
-export const saveManagedDataByFile = async (filePath, data) => {
-  const resolved = path.resolve(filePath)
-  return saveData(resolved, data)
-}
+export { supportsDirectQuery, directQuery }
 
 export const migrateData = async (sourceType, targetConfig) => {
   const results = { success: true, tables: {}, errors: [] }
@@ -480,6 +976,7 @@ export const migrateData = async (sourceType, targetConfig) => {
       [FILES.files]: 'files',
       [FILES.attachments]: 'attachments',
       [FILES.discovery]: 'discovery',
+      [FILES.serverEvents]: 'server_events',
       [FILES.globalBans]: 'global_bans',
       [FILES.serverBans]: 'server_bans',
       [FILES.adminLogs]: 'admin_logs',
@@ -502,8 +999,8 @@ export const migrateData = async (sourceType, targetConfig) => {
 
 export const getStorageInfo = () => {
   return {
-    type: useStorage ? (storageService?.type || 'json') : 'json',
-    provider: storageService?.provider || 'json',
+    type: useStorage ? (storageService?.type || 'unknown') : 'none',
+    provider: storageService?.provider || 'none',
     usingStorage: useStorage
   }
 }
@@ -554,11 +1051,13 @@ export const importAllData = async (data) => {
     files: FILES.files,
     attachments: FILES.attachments,
     discovery: FILES.discovery,
+    server_events: FILES.serverEvents,
     global_bans: FILES.globalBans,
     server_bans: FILES.serverBans,
     admin_logs: FILES.adminLogs,
     system_messages: FILES.systemMessages,
     e2e_true: FILES.e2eTrue,
+    e2e_true_state: FILES.e2eTrue,
     pinned_messages: FILES.pinnedMessages,
     self_volts: FILES.selfVolts,
     federation: FILES.federation,
@@ -611,40 +1110,69 @@ export const importAllData = async (data) => {
 
 export const userService = {
   getUser(userId) {
-    const users = loadData(FILES.users, {})
-    return users[userId] || null
+    const users = loadDataRef(FILES.users, {})
+    const raw = users[userId]
+    if (!raw) return null
+
+    // Shallow copy to avoid mutating the cache reference
+    const user = { ...raw }
+
+    if (typeof user.ageVerification === 'string') {
+      try {
+        user.ageVerification = JSON.parse(user.ageVerification)
+      } catch {
+        if (user.ageVerification === 'adult' || user.ageVerification === 'child') {
+          user.ageVerification = {
+            verified: true,
+            category: user.ageVerification
+          }
+        }
+      }
+    }
+
+    return {
+      ...user,
+      ageVerificationJurisdiction: getAgeVerificationJurisdictionCode(user, user.ageVerification),
+      ageVerification: normalizeAgeVerification(user.ageVerification, user)
+    }
   },
 
-  saveUser(userId, userData) {
+  async saveUser(userId, userData) {
     const users = loadData(FILES.users, {})
+    const existingUser = users[userId]
     users[userId] = {
-      ...users[userId],
+      ...existingUser,
       ...userData,
       id: userId,
+      isAdmin: existingUser?.isAdmin ?? userData.isAdmin ?? 0,
+      isModerator: existingUser?.isModerator ?? userData.isModerator ?? 0,
       updatedAt: new Date().toISOString()
     }
     if (!users[userId].createdAt) {
       users[userId].createdAt = new Date().toISOString()
     }
-    saveData(FILES.users, users)
+    await saveData(FILES.users, users)
     return users[userId]
   },
 
-  updateProfile(userId, updates) {
+  async updateProfile(userId, updates) {
     const users = loadData(FILES.users, {})
-    if (!users[userId]) {
+    const existingUser = users[userId]
+    if (!existingUser) {
       users[userId] = { id: userId, createdAt: new Date().toISOString() }
     }
     users[userId] = {
-      ...users[userId],
+      ...existingUser,
       ...updates,
+      isAdmin: existingUser?.isAdmin ?? users[userId]?.isAdmin ?? updates.isAdmin ?? 0,
+      isModerator: existingUser?.isModerator ?? users[userId]?.isModerator ?? updates.isModerator ?? 0,
       updatedAt: new Date().toISOString()
     }
-    saveData(FILES.users, users)
+    await saveData(FILES.users, users)
     return users[userId]
   },
 
-  setStatus(userId, status, customStatus = null) {
+  async setStatus(userId, status, customStatus = null) {
     const users = loadData(FILES.users, {})
     if (!users[userId]) {
       users[userId] = { id: userId, createdAt: new Date().toISOString() }
@@ -654,63 +1182,126 @@ export const userService = {
       users[userId].customStatus = customStatus
     }
     users[userId].updatedAt = new Date().toISOString()
-    saveData(FILES.users, users)
+    await saveData(FILES.users, users)
     return users[userId]
   },
 
-  setAgeVerification(userId, verification) {
+  async setAgeVerification(userId, verification) {
     const users = loadData(FILES.users, {})
     const now = new Date()
+    const existingUser = users[userId] || { id: userId, createdAt: now.toISOString() }
+    const jurisdictionCode = getAgeVerificationJurisdictionCode(
+      { ageVerificationJurisdiction: verification?.jurisdictionCode || existingUser.ageVerificationJurisdiction },
+      verification
+    )
+    const jurisdiction = getAgeVerificationJurisdiction(jurisdictionCode)
     const category = verification?.category === 'child' ? 'child' : 'adult'
-    const expiresAt = category === 'adult'
-      ? null
-      : (verification?.expiresAt || new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString())
+    const verified = typeof verification?.verified === 'boolean'
+      ? verification.verified
+      : true
+    const selfDeclaredAdult = verification?.selfDeclaredAdult === true
+    const expiresAt = verification?.expiresAt || (category === 'child'
+      ? new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString()
+      : null)
 
     users[userId] = {
-      ...(users[userId] || { id: userId, createdAt: now.toISOString() }),
+      ...existingUser,
+      ageVerificationJurisdiction: jurisdiction.code,
       ageVerification: {
-        verified: true,
+        verified,
         method: verification?.method,
         birthYear: verification?.birthYear || null,
         age: verification?.age || null,
         proofSummary: verification?.proofSummary || {},
         category,
         estimatedAge: verification?.estimatedAge || null,
-        verifiedAt: verification?.verifiedAt || now.toISOString(),
+        verifiedAt: verified ? (verification?.verifiedAt || now.toISOString()) : null,
+        selfAttestedAt: selfDeclaredAdult ? (verification?.selfAttestedAt || now.toISOString()) : null,
         expiresAt,
-        device: verification?.device || null
+        device: verification?.device || null,
+        selfDeclaredAdult,
+        source: verification?.source || (verified ? 'proof' : 'self_attestation'),
+        jurisdictionCode: jurisdiction.code
       },
       updatedAt: now.toISOString()
     }
 
-    saveData(FILES.users, users)
-    return users[userId]
+    await saveData(FILES.users, users)
+    return this.getUser(userId)
+  },
+
+  async setAgeVerificationJurisdiction(userId, jurisdictionCode) {
+    const users = loadData(FILES.users, {})
+    const now = new Date().toISOString()
+    const jurisdiction = getAgeVerificationJurisdiction(jurisdictionCode)
+    const existingUser = users[userId] || { id: userId, createdAt: now }
+
+    users[userId] = {
+      ...existingUser,
+      ageVerificationJurisdiction: jurisdiction.code,
+      updatedAt: now
+    }
+
+    await saveData(FILES.users, users)
+    return this.getUser(userId)
   },
 
   isAgeVerified(userId) {
+    return this.getAgeVerificationStatus(userId).proofVerifiedAdult
+  },
+
+  hasAdultAccess(userId) {
+    return this.getAgeVerificationStatus(userId).adultAccess
+  },
+
+  getAgeVerificationStatus(userId) {
     const profile = this.getUser(userId)
-    const verification = profile?.ageVerification
-    if (!verification?.verified) return false
-    if (verification.category !== 'adult') return false
-    if (verification.expiresAt && new Date(verification.expiresAt) < new Date()) {
-      return false
-    }
-    return true
+    if (!profile) return normalizeAgeVerification(null, {})
+    return profile.ageVerification || normalizeAgeVerification(null, profile)
   },
 
   getAllUsers() {
-    return loadData(FILES.users, {})
+    // Use loadDataRef to avoid O(n) clone, then build result with single pass
+    const users = loadDataRef(FILES.users, {})
+    const result = {}
+    for (const [userId, user] of Object.entries(users)) {
+      if (!user) continue
+      const normalized = { ...user }
+      // Inline age verification normalization (avoid calling getUser which re-clones)
+      if (typeof normalized.ageVerification === 'string') {
+        try {
+          normalized.ageVerification = JSON.parse(normalized.ageVerification)
+        } catch {
+          if (normalized.ageVerification === 'adult' || normalized.ageVerification === 'child') {
+            normalized.ageVerification = {
+              verified: true,
+              category: normalized.ageVerification
+            }
+          }
+        }
+      }
+      result[userId] = normalized
+    }
+    return result
   }
 }
 
 export const friendService = {
   getFriends(userId) {
     const friends = loadData(FILES.friends, {})
-    return friends[userId] || []
+    const userFriends = friends[userId]
+    if (Array.isArray(userFriends)) {
+      return userFriends
+    }
+    return []
   },
 
-  addFriend(userId, friendId) {
-    const friends = loadData(FILES.friends, {})
+  async addFriend(userId, friendId) {
+    if (await addFriendRows(userId, friendId)) {
+      return true
+    }
+
+    const friends = await loadFreshData(FILES.friends, {})
     if (!friends[userId]) friends[userId] = []
     if (!friends[friendId]) friends[friendId] = []
     
@@ -721,25 +1312,36 @@ export const friendService = {
       friends[friendId].push(userId)
     }
     
-    saveData(FILES.friends, friends)
+    await saveData(FILES.friends, friends)
     return true
   },
 
-  removeFriend(userId, friendId) {
-    const friends = loadData(FILES.friends, {})
+  async removeFriend(userId, friendId) {
+    if (await removeFriendRows(userId, friendId)) {
+      return true
+    }
+
+    const friends = await loadFreshData(FILES.friends, {})
     if (friends[userId]) {
       friends[userId] = friends[userId].filter(id => id !== friendId)
     }
     if (friends[friendId]) {
       friends[friendId] = friends[friendId].filter(id => id !== userId)
     }
-    saveData(FILES.friends, friends)
+    await saveData(FILES.friends, friends)
     return true
   },
 
   areFriends(userId1, userId2) {
     const friends = loadData(FILES.friends, {})
-    return friends[userId1]?.includes(userId2) || false
+    const userFriends = friends[userId1]
+    if (Array.isArray(userFriends)) {
+      return userFriends.includes(userId2) || false
+    }
+    if (typeof userFriends === 'object' && userFriends !== null) {
+      return !!userFriends[userId2] || false
+    }
+    return false
   },
   
   getAllFriends() {
@@ -752,14 +1354,30 @@ export const friendRequestService = {
     const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
     const incomingMap = requests?.incoming && typeof requests.incoming === 'object' ? requests.incoming : {}
     const outgoingMap = requests?.outgoing && typeof requests.outgoing === 'object' ? requests.outgoing : {}
+    const hydrateRequest = (request, fallbackFrom, fallbackTo) => {
+      const fromId = request?.from || fallbackFrom || null
+      const toId = request?.to || fallbackTo || null
+      const fromProfile = fromId ? userService.getUser(fromId) : null
+      const toProfile = toId ? userService.getUser(toId) : null
+      return {
+        ...request,
+        from: fromId,
+        to: toId,
+        fromUsername: request?.fromUsername || fromProfile?.customUsername || fromProfile?.username || null,
+        toUsername: request?.toUsername || toProfile?.customUsername || toProfile?.username || null
+      }
+    }
+
+    const incoming = (incomingMap[userId] || []).map(request => hydrateRequest(request, request?.from, userId))
+    const outgoing = (outgoingMap[userId] || []).map(request => hydrateRequest(request, userId, request?.to))
     return {
-      incoming: incomingMap[userId] || [],
-      outgoing: outgoingMap[userId] || []
+      incoming,
+      outgoing
     }
   },
 
-  sendRequest(fromUserId, toUserId, fromUsername, toUsername) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+  async sendRequest(fromUserId, toUserId, fromUsername, toUsername) {
+    const requests = await loadFreshData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
     if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
     if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
@@ -768,25 +1386,35 @@ export const friendRequestService = {
     
     const existingIncoming = requests.incoming[toUserId].find(r => r.from === fromUserId)
     if (existingIncoming) return { error: 'Request already sent' }
+
+    const fromProfile = userService.getUser(fromUserId)
+    const toProfile = userService.getUser(toUserId)
+    const safeFromUsername = fromUsername || fromProfile?.customUsername || fromProfile?.username || null
+    const safeToUsername = toUsername || toProfile?.customUsername || toProfile?.username || null
     
     const request = {
       id: `fr_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       from: fromUserId,
-      fromUsername: fromUsername,
+      fromUsername: safeFromUsername,
       to: toUserId,
-      toUsername: toUsername,
-      createdAt: new Date().toISOString()
+      toUsername: safeToUsername,
+      createdAt: new Date().toISOString(),
+      status: 'pending'
     }
     
     requests.incoming[toUserId].push(request)
-    requests.outgoing[fromUserId].push({ ...request, to: toUserId, toUsername: toUsername })
-    
-    saveData(FILES.friendRequests, requests)
+    requests.outgoing[fromUserId].push({ ...request, to: toUserId, toUsername: safeToUsername })
+
+    if (await insertFriendRequestRow(request)) {
+      return request
+    }
+
+    await saveData(FILES.friendRequests, requests)
     return request
   },
 
-  acceptRequest(userId, requestId) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+  async acceptRequest(userId, requestId) {
+    const requests = await loadFreshData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
     if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
     if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
@@ -799,15 +1427,17 @@ export const friendRequestService = {
     if (requests.outgoing[request.from]) {
       requests.outgoing[request.from] = requests.outgoing[request.from].filter(r => r.id !== requestId)
     }
-    
-    saveData(FILES.friendRequests, requests)
-    friendService.addFriend(userId, request.from)
+
+    if (!(await deleteFriendRequestRow(requestId))) {
+      await saveData(FILES.friendRequests, requests)
+    }
+    await friendService.addFriend(userId, request.from)
     
     return { success: true, friendId: request.from }
   },
 
-  rejectRequest(userId, requestId) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+  async rejectRequest(userId, requestId) {
+    const requests = await loadFreshData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
     if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
     if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
@@ -820,13 +1450,15 @@ export const friendRequestService = {
     if (requests.outgoing[request.from]) {
       requests.outgoing[request.from] = requests.outgoing[request.from].filter(r => r.id !== requestId)
     }
-    
-    saveData(FILES.friendRequests, requests)
+
+    if (!(await deleteFriendRequestRow(requestId))) {
+      await saveData(FILES.friendRequests, requests)
+    }
     return { success: true }
   },
 
-  cancelRequest(userId, requestId) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
+  async cancelRequest(userId, requestId) {
+    const requests = await loadFreshData(FILES.friendRequests, { incoming: {}, outgoing: {} }) || {}
     if (!requests.incoming || typeof requests.incoming !== 'object') requests.incoming = {}
     if (!requests.outgoing || typeof requests.outgoing !== 'object') requests.outgoing = {}
     
@@ -839,8 +1471,10 @@ export const friendRequestService = {
     if (requests.incoming[request.to]) {
       requests.incoming[request.to] = requests.incoming[request.to].filter(r => r.id !== requestId)
     }
-    
-    saveData(FILES.friendRequests, requests)
+
+    if (!(await deleteFriendRequestRow(requestId))) {
+      await saveData(FILES.friendRequests, requests)
+    }
     return { success: true }
   },
   
@@ -850,12 +1484,12 @@ export const friendRequestService = {
 }
 
 export const blockService = {
-  getBlocked(userId) {
+  async getBlocked(userId) {
     const blocked = loadData(FILES.blocked, {})
     return blocked[userId] || []
   },
 
-  blockUser(userId, blockedUserId) {
+  async blockUser(userId, blockedUserId) {
     const blocked = loadData(FILES.blocked, {})
     if (!blocked[userId]) blocked[userId] = []
     
@@ -863,18 +1497,18 @@ export const blockService = {
       blocked[userId].push(blockedUserId)
     }
     
-    friendService.removeFriend(userId, blockedUserId)
+    await friendService.removeFriend(userId, blockedUserId)
     
-    saveData(FILES.blocked, blocked)
+    await saveData(FILES.blocked, blocked)
     return true
   },
 
-  unblockUser(userId, blockedUserId) {
+  async unblockUser(userId, blockedUserId) {
     const blocked = loadData(FILES.blocked, {})
     if (blocked[userId]) {
       blocked[userId] = blocked[userId].filter(id => id !== blockedUserId)
     }
-    saveData(FILES.blocked, blocked)
+    await saveData(FILES.blocked, blocked)
     return true
   },
 
@@ -899,7 +1533,7 @@ export const dmService = {
     return (dms[userId] || []).find(c => c.id === conversationId) || null
   },
 
-  createGroupConversation(ownerId, participantIds = [], groupName = '') {
+  async createGroupConversation(ownerId, participantIds = [], groupName = '') {
     const dms = loadData(FILES.dms, {})
     const uniqueParticipants = Array.from(new Set([ownerId, ...(participantIds || [])].filter(Boolean)))
     if (uniqueParticipants.length < 3) {
@@ -925,11 +1559,11 @@ export const dmService = {
       dms[uid].push({ ...baseConversation })
     }
 
-    saveData(FILES.dms, dms)
+    await saveData(FILES.dms, dms)
     return baseConversation
   },
 
-  getOrCreateConversation(userId1, userId2) {
+  async getOrCreateConversation(userId1, userId2) {
     const dms = loadData(FILES.dms, {})
     
     const participantKey = [userId1, userId2].sort().join(':')
@@ -959,39 +1593,54 @@ export const dmService = {
         dms[userId2].push({ ...newConv, recipientId: userId1 })
       }
       
-      saveData(FILES.dms, dms)
+      await saveData(FILES.dms, dms)
       return newConv
     }
     
     return conv1
   },
 
-  updateLastMessage(conversationId, userId1, userId2) {
+  async updateLastMessage(conversationId, userId1, userId2) {
+    // Try direct DB update first (avoids loading + re-saving entire DMs table)
+    if (supportsDirectQuery()) {
+      const now = new Date().toISOString()
+      await directQuery(
+        `UPDATE dms SET lastMessageAt = ? WHERE id = ?`,
+        [now, conversationId]
+      )
+      // Also update in-memory cache if present
+      const table = getTableName(FILES.dms)
+      const dms = storageCache[table]
+      if (dms) {
+        const usersToCheck = (userId1 || userId2)
+          ? [userId1, userId2].filter(Boolean)
+          : Object.keys(dms)
+        for (const uid of usersToCheck) {
+          if (!Array.isArray(dms[uid])) continue
+          const conv = dms[uid].find(c => c.id === conversationId)
+          if (conv) conv.lastMessageAt = now
+        }
+      }
+      return
+    }
+
+    // Fallback: single-pass iteration over all user keys
     const dms = loadData(FILES.dms, {})
     const now = new Date().toISOString()
 
-    const touchedUsers = new Set()
-    if (userId1) touchedUsers.add(userId1)
-    if (userId2) touchedUsers.add(userId2)
+    // Build the set of user keys to check. If both user IDs are provided,
+    // only check those two. Otherwise scan all keys once.
+    const keysToCheck = (userId1 || userId2)
+      ? [...new Set([userId1, userId2].filter(Boolean))]
+      : Object.keys(dms)
 
-    // For group DMs (or when user ids are missing), update every member copy.
-    if (touchedUsers.size === 0) {
-      Object.keys(dms).forEach(uid => touchedUsers.add(uid))
-    }
-
-    for (const uid of touchedUsers) {
-      if (!dms[uid]) continue
+    for (const uid of keysToCheck) {
+      if (!Array.isArray(dms[uid])) continue
       const conv = dms[uid].find(c => c.id === conversationId)
       if (conv) conv.lastMessageAt = now
     }
 
-    // Final safety pass for any remaining participant copies.
-    Object.keys(dms).forEach(uid => {
-      const conv = dms[uid]?.find(c => c.id === conversationId)
-      if (conv) conv.lastMessageAt = now
-    })
-
-    saveData(FILES.dms, dms)
+    await saveData(FILES.dms, dms)
   },
   
   getAllConversations() {
@@ -1006,15 +1655,63 @@ export const dmMessageService = {
     return convMessages.slice(-limit)
   },
 
-  addMessage(conversationId, message) {
+  async getMessagesForConversation(conversationId, limit = 50, before = null) {
+    if (supportsDirectQuery()) {
+      try {
+        let rows
+        if (before) {
+          const beforeRows = await directQuery(
+            'SELECT `timestamp` FROM dm_messages WHERE id = ? LIMIT 1',
+            [before]
+          )
+          if (beforeRows && beforeRows.length > 0) {
+            const beforeTimestamp = beforeRows[0].timestamp
+            rows = await directQuery(
+              'SELECT * FROM dm_messages WHERE conversationId = ? AND `timestamp` < ? ORDER BY `timestamp` DESC LIMIT ?',
+              [conversationId, beforeTimestamp, limit]
+            )
+          } else {
+            rows = await directQuery(
+              'SELECT * FROM dm_messages WHERE conversationId = ? ORDER BY `timestamp` DESC LIMIT ?',
+              [conversationId, limit]
+            )
+          }
+        } else {
+          rows = await directQuery(
+            'SELECT * FROM dm_messages WHERE conversationId = ? ORDER BY `timestamp` DESC LIMIT ?',
+            [conversationId, limit]
+          )
+        }
+
+        // directQuery returns null on error - fall through to fallback
+        if (rows === null) {
+          console.warn('[dmMessageService] directQuery returned null, falling through to fallback')
+        } else if (rows.length > 0) {
+          return rows.map(normalizeDmMessageRow).reverse()
+        } else {
+          return []
+        }
+      } catch (err) {
+        console.error('[dmMessageService] Direct query getMessagesForConversation failed:', err.message)
+      }
+    }
+
+    return this.getMessages(conversationId, limit)
+  },
+
+  async addMessage(conversationId, message) {
+    if (!conversationId) {
+      console.error('[dataService] addMessage called with invalid conversationId:', conversationId, 'message id:', message?.id)
+      return null
+    }
     const messages = loadData(FILES.dmMessages, {})
     if (!messages[conversationId]) messages[conversationId] = []
     messages[conversationId].push(message)
-    saveData(FILES.dmMessages, messages)
+    await saveData(FILES.dmMessages, messages)
     return message
   },
 
-  editMessage(conversationId, messageId, newContent) {
+  async editMessage(conversationId, messageId, newContent) {
     const messages = loadData(FILES.dmMessages, {})
     if (!messages[conversationId]) return null
     
@@ -1023,19 +1720,19 @@ export const dmMessageService = {
       msg.content = newContent
       msg.edited = true
       msg.editedAt = new Date().toISOString()
-      saveData(FILES.dmMessages, messages)
+      await saveData(FILES.dmMessages, messages)
     }
     return msg
   },
 
-  deleteMessage(conversationId, messageId) {
+  async deleteMessage(conversationId, messageId) {
     const messages = loadData(FILES.dmMessages, {})
     if (!messages[conversationId]) return false
     
     const idx = messages[conversationId].findIndex(m => m.id === messageId)
     if (idx >= 0) {
       messages[conversationId].splice(idx, 1)
-      saveData(FILES.dmMessages, messages)
+      await saveData(FILES.dmMessages, messages)
       return true
     }
     return false
@@ -1047,12 +1744,12 @@ export const dmMessageService = {
 }
 
 export const reactionService = {
-  getReactions(messageId) {
+  async getReactions(messageId) {
     const reactions = loadData(FILES.reactions, {})
     return reactions[messageId] || {}
   },
 
-  addReaction(messageId, userId, emoji) {
+  async addReaction(messageId, userId, emoji) {
     const reactions = loadData(FILES.reactions, {})
     if (!reactions[messageId]) reactions[messageId] = {}
     if (!reactions[messageId][emoji]) reactions[messageId][emoji] = []
@@ -1061,11 +1758,11 @@ export const reactionService = {
       reactions[messageId][emoji].push(userId)
     }
     
-    saveData(FILES.reactions, reactions)
+    await saveData(FILES.reactions, reactions)
     return reactions[messageId]
   },
 
-  removeReaction(messageId, userId, emoji) {
+  async removeReaction(messageId, userId, emoji) {
     const reactions = loadData(FILES.reactions, {})
     if (!reactions[messageId]?.[emoji]) return reactions[messageId] || {}
     
@@ -1074,7 +1771,7 @@ export const reactionService = {
       delete reactions[messageId][emoji]
     }
     
-    saveData(FILES.reactions, reactions)
+    await saveData(FILES.reactions, reactions)
     return reactions[messageId]
   },
   
@@ -1084,9 +1781,15 @@ export const reactionService = {
 }
 
 export const inviteService = {
-  createInvite(serverId, creatorId, options = {}) {
+  normalizeInviteList(value) {
+    if (Array.isArray(value)) return value
+    if (!value || typeof value !== 'object') return []
+    return Object.values(value).filter(invite => invite && typeof invite === 'object')
+  },
+
+  async createInvite(serverId, creatorId, options = {}) {
     const invites = loadData(FILES.serverInvites, {})
-    if (!invites[serverId]) invites[serverId] = []
+    invites[serverId] = this.normalizeInviteList(invites[serverId])
     
     const code = Math.random().toString(36).substr(2, 8).toUpperCase()
     const invite = {
@@ -1100,22 +1803,23 @@ export const inviteService = {
     }
     
     invites[serverId].push(invite)
-    saveData(FILES.serverInvites, invites)
+    await saveData(FILES.serverInvites, invites)
     return invite
   },
 
   getInvite(code) {
     const invites = loadData(FILES.serverInvites, {})
     for (const serverId in invites) {
-      const invite = invites[serverId].find(i => i.code === code)
+      const invite = this.normalizeInviteList(invites[serverId]).find(i => i.code === code)
       if (invite) return invite
     }
     return null
   },
 
-  useInvite(code) {
+  async useInvite(code) {
     const invites = loadData(FILES.serverInvites, {})
     for (const serverId in invites) {
+      invites[serverId] = this.normalizeInviteList(invites[serverId])
       const invite = invites[serverId].find(i => i.code === code)
       if (invite) {
         if (invite.maxUses && invite.uses >= invite.maxUses) {
@@ -1125,20 +1829,21 @@ export const inviteService = {
           return { error: 'Invite expired' }
         }
         invite.uses++
-        saveData(FILES.serverInvites, invites)
+        await saveData(FILES.serverInvites, invites)
         return { serverId: invite.serverId }
       }
     }
     return { error: 'Invite not found' }
   },
 
-  deleteInvite(code) {
+  async deleteInvite(code) {
     const invites = loadData(FILES.serverInvites, {})
     for (const serverId in invites) {
+      invites[serverId] = this.normalizeInviteList(invites[serverId])
       const idx = invites[serverId].findIndex(i => i.code === code)
       if (idx >= 0) {
         invites[serverId].splice(idx, 1)
-        saveData(FILES.serverInvites, invites)
+        await saveData(FILES.serverInvites, invites)
         return true
       }
     }
@@ -1147,7 +1852,7 @@ export const inviteService = {
 
   getServerInvites(serverId) {
     const invites = loadData(FILES.serverInvites, {})
-    return invites[serverId] || []
+    return this.normalizeInviteList(invites[serverId])
   },
   
   getAllInvites() {
@@ -1165,18 +1870,18 @@ export const serverService = {
     return servers[serverId] || null
   },
 
-  createServer(serverData) {
+  async createServer(serverData) {
     const servers = loadData(FILES.servers, {})
     servers[serverData.id] = {
       ...serverData,
       createdAt: serverData.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString()
     }
-    saveData(FILES.servers, servers)
+    await saveData(FILES.servers, servers)
     return servers[serverData.id]
   },
 
-  updateServer(serverId, updates) {
+  async updateServer(serverId, updates) {
     const servers = loadData(FILES.servers, {})
     if (!servers[serverId]) return null
     
@@ -1185,25 +1890,50 @@ export const serverService = {
       ...updates,
       updatedAt: new Date().toISOString()
     }
-    saveData(FILES.servers, servers)
+    await saveData(FILES.servers, servers)
     return servers[serverId]
   },
 
-  deleteServer(serverId) {
+  async deleteServer(serverId) {
     const servers = loadData(FILES.servers, {})
     delete servers[serverId]
-    saveData(FILES.servers, servers)
+    await saveData(FILES.servers, servers)
     
     const channels = loadData(FILES.channels, {})
     const serverChannels = Object.keys(channels).filter(ch => channels[ch].serverId === serverId)
     serverChannels.forEach(chId => delete channels[chId])
-    saveData(FILES.channels, channels)
+    await saveData(FILES.channels, channels)
     
     return true
   },
 
   getAllServers() {
     return loadData(FILES.servers, {})
+  },
+
+  getAllCategoriesGrouped() {
+    const categories = loadData(FILES.categories, {})
+    const grouped = {}
+    const values = Array.isArray(categories) ? categories : Object.values(categories || {})
+    for (const category of values) {
+      if (!category?.serverId) continue
+      if (!grouped[category.serverId]) grouped[category.serverId] = []
+      grouped[category.serverId].push(category)
+    }
+    return grouped
+  },
+
+  async updateCategory(categoryId, updates) {
+    const categories = loadData(FILES.categories, {})
+    if (!categories[categoryId]) return null
+    
+    categories[categoryId] = {
+      ...categories[categoryId],
+      ...updates,
+      updatedAt: new Date().toISOString()
+    }
+    await saveData(FILES.categories, categories)
+    return categories[categoryId]
   }
 }
 
@@ -1251,7 +1981,7 @@ export const channelService = {
     return channels[channelId] || null
   },
 
-  createChannel(channelData) {
+  async createChannel(channelData) {
     const raw = loadData(FILES.channels, {})
     if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
       // Legacy format: add to the server's array
@@ -1264,7 +1994,7 @@ export const channelService = {
       } else {
         raw[serverId].push(newChannel)
       }
-      saveData(FILES.channels, raw)
+      await saveData(FILES.channels, raw)
       return newChannel
     }
     // Flat format
@@ -1272,11 +2002,11 @@ export const channelService = {
       ...channelData,
       createdAt: channelData.createdAt || new Date().toISOString()
     }
-    saveData(FILES.channels, raw)
+    await saveData(FILES.channels, raw)
     return raw[channelData.id]
   },
 
-  updateChannel(channelId, updates) {
+  async updateChannel(channelId, updates) {
     const raw = loadData(FILES.channels, {})
     if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
       // Legacy format: find and update in the server arrays
@@ -1285,7 +2015,7 @@ export const channelService = {
         const idx = channelList.findIndex(c => c.id === channelId)
         if (idx >= 0) {
           channelList[idx] = { ...channelList[idx], ...updates }
-          saveData(FILES.channels, raw)
+          await saveData(FILES.channels, raw)
           return channelList[idx]
         }
       }
@@ -1294,11 +2024,14 @@ export const channelService = {
     // Flat format
     if (!raw[channelId]) return null
     raw[channelId] = { ...raw[channelId], ...updates }
-    saveData(FILES.channels, raw)
+    await saveData(FILES.channels, raw)
     return raw[channelId]
   },
 
-  deleteChannel(channelId) {
+  async deleteChannel(channelId) {
+    if (supportsDirectQuery()) {
+      await directQuery(`DELETE FROM channels WHERE id = ?`, [channelId])
+    }
     const raw = loadData(FILES.channels, {})
     if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
       // Legacy format: remove from the server arrays
@@ -1307,7 +2040,7 @@ export const channelService = {
         const idx = channelList.findIndex(c => c.id === channelId)
         if (idx >= 0) {
           channelList.splice(idx, 1)
-          saveData(FILES.channels, raw)
+          await saveData(FILES.channels, raw)
           return true
         }
       }
@@ -1315,7 +2048,7 @@ export const channelService = {
     }
     // Flat format
     delete raw[channelId]
-    saveData(FILES.channels, raw)
+    await saveData(FILES.channels, raw)
     return true
   },
 
@@ -1335,57 +2068,291 @@ export const channelService = {
   
   getAllChannels() {
     return loadData(FILES.channels, {})
+  },
+
+  getAllChannelsGrouped() {
+    const channels = this.getAllChannels()
+    const grouped = {}
+    const values = Array.isArray(channels) ? channels : Object.values(channels || {})
+    for (const channel of values) {
+      if (!channel?.serverId) continue
+      if (!grouped[channel.serverId]) grouped[channel.serverId] = []
+      grouped[channel.serverId].push(channel)
+    }
+    return grouped
   }
 }
 
 export const messageService = {
-  getMessage(messageId) {
+  async getMessage(messageId) {
+    // Try direct DB query first (avoids loading entire messages table)
+    if (supportsDirectQuery()) {
+      try {
+        const rows = await directQuery(
+          `SELECT * FROM messages WHERE id = ? LIMIT 1`,
+          [messageId]
+        )
+        // directQuery returns null on error - fall through to fallback
+        if (rows === null) {
+          console.warn('[messageService] directQuery returned null for getMessage, falling through to fallback')
+        } else if (rows.length > 0) {
+          return normalizeMessageRow(rows[0])
+        } else {
+          return null
+        }
+      } catch (err) {
+        console.error('[messageService] Direct query getMessage failed:', err.message)
+      }
+    }
+    // Fallback to cache
     const messages = loadData(FILES.messages, {})
     return messages[messageId] || null
   },
 
-  getChannelMessages(channelId, limit = 50, before = null) {
-    const messages = loadData(FILES.messages, {})
-    let channelMessages = Object.values(messages)
-      .filter(m => m.channelId === channelId)
-      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    async getChannelMessages(channelId, limit = 50, before = null) {
+      const cacheKey = `messages:${channelId}:${limit}:${before || 'none'}`
+      
+      return globalCoalescer.coalesce(cacheKey, async () => {
+        if (supportsDirectQuery()) {
+          try {
+            const timeColumn = await resolveMessageTimeColumn()
+            const quotedTimeCol = '`' + timeColumn + '`'
+            let rows
+            if (before) {
+              rows = await directQuery(
+                `SELECT * FROM messages WHERE channelId = ? AND ${quotedTimeCol} < ? ORDER BY ${quotedTimeCol} DESC LIMIT ?`,
+                [channelId, before, limit]
+              )
+            } else {
+              rows = await directQuery(
+                `SELECT * FROM messages WHERE channelId = ? ORDER BY ${quotedTimeCol} DESC LIMIT ?`,
+                [channelId, limit]
+              )
+            }
+            if (rows === null) {
+              console.warn(`[messageService] directQuery returned null for channel ${channelId}`)
+            } else if (rows.length > 0) {
+              return rows.map(normalizeMessageRow).reverse()
+            } else {
+              return []
+            }
+          } catch (err) {
+            console.error('[messageService] Direct query getChannelMessages failed:', err.message)
+          }
+        }
+        const messages = loadData(FILES.messages, {})
+        let channelMessages = Object.values(messages)
+          .filter(m => m.channelId === channelId)
+          .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+        
+        if (before) {
+          channelMessages = channelMessages.filter(m => new Date(m.createdAt) < new Date(before))
+        }
+        
+        return channelMessages.slice(-limit)
+      })
+    },
+
+  async createMessage(messageData) {
+    // Ensure userId and authorId are always synced
+    const userIdentifier = messageData.userId || messageData.authorId || null
+    const message = {
+      ...messageData,
+      userId: userIdentifier,
+      authorId: userIdentifier,
+      createdAt: messageData.createdAt || new Date().toISOString(),
+      timestamp: messageData.timestamp || messageData.createdAt || new Date().toISOString()
+    }
     
-    if (before) {
-      const beforeIndex = channelMessages.findIndex(m => m.id === before)
-      if (beforeIndex > 0) {
-        channelMessages = channelMessages.slice(0, beforeIndex)
+    // Try direct DB insert first for speed and reliability
+    if (supportsDirectQuery()) {
+      try {
+        const result = await directQuery(
+          `INSERT INTO messages (id, channelId, userId, authorId, content, type, \`timestamp\`, username, avatar, bot, encrypted, iv, epoch, edited, editedAt, replyTo, attachments, mentions, embeds, storage, ui)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE content = VALUES(content), edited = VALUES(edited), editedAt = VALUES(editedAt), ui = VALUES(ui)`,
+          [
+            message.id,
+            message.channelId,
+            userIdentifier,
+            userIdentifier,
+            message.content || null,
+            message.type || 'message',
+            message.timestamp,
+            message.username || null,
+            message.avatar || null,
+            message.bot ? 1 : 0,
+            message.encrypted ? 1 : 0,
+            message.iv || null,
+            message.epoch ?? null,
+            message.edited ? 1 : 0,
+            message.editedAt || null,
+            message.replyTo ? (typeof message.replyTo === 'string' ? message.replyTo : JSON.stringify(message.replyTo)) : null,
+            JSON.stringify(Array.isArray(message.attachments) ? message.attachments : []),
+            JSON.stringify(Array.isArray(message.mentions) ? message.mentions : []),
+            JSON.stringify(Array.isArray(message.embeds) ? message.embeds : []),
+            message.storage ? JSON.stringify(message.storage) : null,
+            message.ui ? JSON.stringify(message.ui) : null
+          ]
+        )
+        if (result !== null) {
+          // Update in-memory cache
+          const table = getTableName(FILES.messages)
+          if (!storageCache[table]) storageCache[table] = {}
+          storageCache[table][message.id] = message
+          return message
+        }
+      } catch (err) {
+        console.error('[messageService] Direct insert createMessage failed:', err.message)
       }
     }
     
-    return channelMessages.slice(-limit)
+    // Fallback: update in-memory cache and persist via saveData
+    const table = getTableName(FILES.messages)
+    if (!storageCache[table]) storageCache[table] = {}
+    storageCache[table][message.id] = message
+    await saveData(FILES.messages, storageCache[table])
+    return message
   },
 
-  createMessage(messageData) {
-    const messages = loadData(FILES.messages, {})
-    messages[messageData.id] = {
-      ...messageData,
-      createdAt: messageData.createdAt || new Date().toISOString()
+  async editMessage(messageId, newContent) {
+    // Try direct DB update first
+    if (supportsDirectQuery()) {
+      const editedAt = new Date().toISOString()
+      const result = await directQuery(
+        `UPDATE messages SET content = ?, edited = 1, editedAt = ? WHERE id = ?`,
+        [newContent, editedAt, messageId]
+      )
+      if (result === null) {
+        // directQuery failed (circuit breaker, connection error) - fall through to fallback
+        console.warn('[messageService] directQuery returned null for editMessage, falling through to fallback')
+      } else if (result.affectedRows > 0) {
+        // Update cache if entry exists there
+        const table = getTableName(FILES.messages)
+        if (storageCache[table]?.[messageId]) {
+          storageCache[table][messageId].content = newContent
+          storageCache[table][messageId].edited = true
+          storageCache[table][messageId].editedAt = editedAt
+        }
+        return { id: messageId, content: newContent, edited: true, editedAt }
+      } else {
+        // Query succeeded but no rows affected - message doesn't exist
+        return null
+      }
     }
-    saveData(FILES.messages, messages)
-    return messages[messageData.id]
-  },
-
-  editMessage(messageId, newContent) {
+    // Fallback
     const messages = loadData(FILES.messages, {})
     if (!messages[messageId]) return null
     
     messages[messageId].content = newContent
     messages[messageId].edited = true
     messages[messageId].editedAt = new Date().toISOString()
-    saveData(FILES.messages, messages)
+    await saveData(FILES.messages, messages)
     return messages[messageId]
   },
 
-  deleteMessage(messageId) {
+  async deleteMessage(messageId) {
+    // Try direct DB delete first
+    if (supportsDirectQuery()) {
+      await directQuery(`DELETE FROM messages WHERE id = ?`, [messageId])
+      // Remove from cache if present
+      const table = getTableName(FILES.messages)
+      if (storageCache[table]?.[messageId]) {
+        delete storageCache[table][messageId]
+      }
+      return true
+    }
+    // Fallback
     const messages = loadData(FILES.messages, {})
     delete messages[messageId]
-    saveData(FILES.messages, messages)
+    await saveData(FILES.messages, messages)
     return true
+  },
+
+  async deleteMessagesByChannelIds(channelIds) {
+    if (!channelIds || channelIds.length === 0) return
+    const placeholders = channelIds.map(() => '?').join(', ')
+    if (supportsDirectQuery()) {
+      await directQuery(`DELETE FROM messages WHERE channelId IN (${placeholders})`, channelIds)
+      const table = getTableName(FILES.messages)
+      if (storageCache[table]) {
+        for (const messageId of Object.keys(storageCache[table])) {
+          const msg = storageCache[table][messageId]
+          if (msg && channelIds.includes(msg.channelId)) {
+            delete storageCache[table][messageId]
+          }
+        }
+      }
+      return
+    }
+    const messages = loadData(FILES.messages, {})
+    const filtered = {}
+    for (const [key, value] of Object.entries(messages)) {
+      if (Array.isArray(value)) {
+        filtered[key] = value.filter(m => !channelIds.includes(m.channelId))
+      } else if (value?.channelId && !channelIds.includes(value.channelId)) {
+        filtered[key] = value
+      }
+    }
+    await saveData(FILES.messages, filtered)
+  },
+
+  async saveMessages(messagesByChannel) {
+    const allMessages = []
+    for (const [channelId, messages] of Object.entries(messagesByChannel)) {
+      for (const msg of messages) {
+        allMessages.push({ ...msg, channelId })
+      }
+    }
+
+    if (!supportsDirectQuery()) {
+      console.warn('[messageService] saveMessages: supportsDirectQuery is false, not saving to DB')
+      return false
+    }
+
+    if (allMessages.length > 0) {
+      try {
+        for (const msg of allMessages) {
+          const userIdentifier = msg.userId || msg.authorId || null
+          const result = await directQuery(
+            `INSERT INTO messages (id, channelId, userId, authorId, content, type, \`timestamp\`, username, avatar, bot, encrypted, iv, epoch, edited, editedAt, replyTo, attachments, mentions, embeds, storage, ui)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE content = VALUES(content), edited = VALUES(edited), editedAt = VALUES(editedAt), ui = VALUES(ui), attachments = VALUES(attachments), embeds = VALUES(embeds)`,
+            [
+              msg.id,
+              msg.channelId,
+              userIdentifier,
+              userIdentifier,
+              msg.content || null,
+              msg.type || 'message',
+              msg.timestamp,
+              msg.username || null,
+              msg.avatar || null,
+              msg.bot ? 1 : 0,
+              msg.encrypted ? 1 : 0,
+              msg.iv || null,
+              msg.epoch ?? null,
+              msg.edited ? 1 : 0,
+              msg.editedAt || null,
+              msg.replyTo ? (typeof msg.replyTo === 'string' ? msg.replyTo : JSON.stringify(msg.replyTo)) : null,
+              JSON.stringify(Array.isArray(msg.attachments) ? msg.attachments : []),
+              JSON.stringify(Array.isArray(msg.mentions) ? msg.mentions : []),
+              JSON.stringify(Array.isArray(msg.embeds) ? msg.embeds : []),
+              msg.storage ? JSON.stringify(msg.storage) : null,
+              msg.ui ? JSON.stringify(msg.ui) : null
+            ]
+          )
+          if (result === null) {
+            console.error('[messageService] Failed to insert message:', msg.id)
+          }
+        }
+        console.log(`[messageService] Saved ${allMessages.length} messages to DB`)
+        return true
+      } catch (err) {
+        console.error('[messageService] Bulk saveMessages failed:', err.message)
+      }
+    }
+    return false
   },
   
   getAllMessages() {
@@ -1393,26 +2360,70 @@ export const messageService = {
   }
 }
 
+/**
+ * Normalize a raw DB message row into the canonical format expected by the app.
+ * Handles column aliasing (timestamp -> createdAt, userId -> authorId, etc.)
+ */
+const normalizeMessageRow = (row) => {
+  if (!row || typeof row !== 'object') return row
+  const msg = { ...row }
+  // Alias mappings
+  if (msg.timestamp !== undefined && msg.createdAt === undefined) msg.createdAt = msg.timestamp
+  if (msg.createdAt !== undefined && msg.timestamp === undefined) msg.timestamp = msg.createdAt
+  if (msg.userId !== undefined && msg.authorId === undefined) msg.authorId = msg.userId
+  if (msg.authorId !== undefined && msg.userId === undefined) msg.userId = msg.authorId
+  if (msg.mentions_json !== undefined && msg.mentions === undefined) msg.mentions = msg.mentions_json
+  if (msg.storage_json !== undefined && msg.storage === undefined) msg.storage = msg.storage_json
+  // Parse JSON fields
+  for (const field of ['mentions', 'attachments', 'embeds', 'storage', 'ui']) {
+    if (typeof msg[field] === 'string') {
+      try { msg[field] = JSON.parse(msg[field]) } catch { /* keep string */ }
+    }
+  }
+  return msg
+}
+
+const normalizeDmMessageRow = (row) => {
+  if (!row || typeof row !== 'object') return row
+  const msg = { ...row }
+  for (const field of ['mentions_json', 'storage_json', 'replyTo', 'attachments', 'ui']) {
+    if (typeof msg[field] === 'string') {
+      try { msg[field] = JSON.parse(msg[field]) } catch { /* keep string */ }
+    }
+  }
+  if (msg.mentions === undefined && msg.mentions_json !== undefined) msg.mentions = msg.mentions_json
+  if (msg.storage === undefined && msg.storage_json !== undefined) msg.storage = msg.storage_json
+  if (msg.timestamp === undefined && msg.createdAt !== undefined) msg.timestamp = msg.createdAt
+  if (msg.createdAt === undefined && msg.timestamp !== undefined) msg.createdAt = msg.timestamp
+  if (msg.replyTo === undefined) msg.replyTo = null
+  if (!Array.isArray(msg.attachments)) msg.attachments = []
+  if (!Array.isArray(msg.mentions)) msg.mentions = []
+  msg.bot = msg.bot === true || msg.bot === 1 || msg.bot === '1'
+  msg.encrypted = msg.encrypted === true || msg.encrypted === 1 || msg.encrypted === '1'
+  msg.edited = msg.edited === true || msg.edited === 1 || msg.edited === '1'
+  return msg
+}
+
 export const fileService = {
-  getFile(fileId) {
+  async getFile(fileId) {
     const files = loadData(FILES.files, {})
     return files[fileId] || null
   },
 
-  saveFile(fileData) {
+  async saveFile(fileData) {
     const files = loadData(FILES.files, {})
     files[fileData.id] = {
       ...fileData,
       createdAt: fileData.createdAt || new Date().toISOString()
     }
-    saveData(FILES.files, files)
+    await saveData(FILES.files, files)
     return files[fileData.id]
   },
 
-  deleteFile(fileId) {
+  async deleteFile(fileId) {
     const files = loadData(FILES.files, {})
     delete files[fileId]
-    saveData(FILES.files, files)
+    await saveData(FILES.files, files)
     return true
   },
   
@@ -1427,20 +2438,20 @@ export const attachmentService = {
     return attachments[messageId] || []
   },
 
-  addAttachment(messageId, attachment) {
+  async addAttachment(messageId, attachment) {
     const attachments = loadData(FILES.attachments, {})
     if (!attachments[messageId]) attachments[messageId] = []
     attachments[messageId].push(attachment)
-    saveData(FILES.attachments, attachments)
+    await saveData(FILES.attachments, attachments)
     return attachments[messageId]
   },
 
-  removeAttachment(messageId, attachmentId) {
+  async removeAttachment(messageId, attachmentId) {
     const attachments = loadData(FILES.attachments, {})
     if (!attachments[messageId]) return false
     
     attachments[messageId] = attachments[messageId].filter(a => a.id !== attachmentId)
-    saveData(FILES.attachments, attachments)
+    await saveData(FILES.attachments, attachments)
     return true
   },
   
@@ -1452,9 +2463,70 @@ export const attachmentService = {
 export const discoveryService = {
   _load() {
     const data = loadData(FILES.discovery, {})
-    if (!data.submissions) data.submissions = []
-    if (!data.approved) data.approved = []
-    return data
+    return this._parseDiscoveryData(data)
+  },
+
+  async _loadFresh() {
+    // Try direct DB query first for fresh data
+    if (supportsDirectQuery()) {
+      try {
+        const rows = await directQuery('SELECT * FROM discovery')
+        if (rows && rows.length > 0) {
+          const entries = rows.map(row => {
+            const entry = { ...row }
+            // Parse JSON fields if any
+            for (const field of ['icon', 'description']) {
+              if (typeof entry[field] === 'string') {
+                try { entry[field] = JSON.parse(entry[field]) } catch { /* keep string */ }
+              }
+            }
+            return entry
+          })
+          // Update cache so subsequent _load() calls see the data
+          const table = getTableName(FILES.discovery)
+          const cacheObj = {}
+          for (const entry of entries) {
+            if (entry.id) cacheObj[entry.id] = entry
+          }
+          storageCache[table] = cacheObj
+          return this._parseDiscoveryData(cacheObj)
+        }
+      } catch (err) {
+        console.error('[discoveryService] Direct query _loadFresh failed:', err.message)
+      }
+    }
+    // Fall back to loadFreshData (async DB load)
+    try {
+      const freshData = await loadFreshData(FILES.discovery, {})
+      return this._parseDiscoveryData(freshData)
+    } catch {
+      return this._load()
+    }
+  },
+
+  _parseDiscoveryData(data) {
+    if (Array.isArray(data)) {
+      return {
+        submissions: data.filter(entry => entry?.status !== 'approved'),
+        approved: data.filter(entry => entry?.status === 'approved')
+      }
+    }
+
+    if (data && typeof data === 'object' && Array.isArray(data.submissions) && Array.isArray(data.approved)) {
+      return data
+    }
+
+    if (data && typeof data === 'object') {
+      const flatEntries = Object.values(data).filter(entry => entry && typeof entry === 'object' && entry.serverId)
+      if (flatEntries.length > 0) {
+        return {
+          submissions: flatEntries.filter(entry => entry?.status !== 'approved'),
+          approved: flatEntries.filter(entry => entry?.status === 'approved')
+        }
+      }
+    }
+
+    return { submissions: [], approved: [] }
   },
 
   getDiscoveryEntry(serverId) {
@@ -1462,7 +2534,7 @@ export const discoveryService = {
     return data.approved.find(s => s.serverId === serverId) || null
   },
 
-  addToDiscovery(serverId, entryData) {
+  async addToDiscovery(serverId, entryData) {
     const data = this._load()
     const existing = data.approved.findIndex(s => s.serverId === serverId)
     const entry = {
@@ -1475,15 +2547,15 @@ export const discoveryService = {
     } else {
       data.approved.push(entry)
     }
-    saveData(FILES.discovery, data)
+    await saveData(FILES.discovery, data)
     return entry
   },
 
-  removeFromDiscovery(serverId) {
+  async removeFromDiscovery(serverId) {
     const data = this._load()
     data.approved = data.approved.filter(s => s.serverId !== serverId)
     data.submissions = data.submissions.filter(s => s.serverId !== serverId)
-    saveData(FILES.discovery, data)
+    await saveData(FILES.discovery, data)
     return { success: true }
   },
 
@@ -1499,9 +2571,34 @@ export const discoveryService = {
     return [...cats].map(c => ({ id: c, name: c.charAt(0).toUpperCase() + c.slice(1) }))
   },
 
-  getApprovedServers(limit = 50, offset = 0, category = null, search = null) {
-    const data = this._load()
-    let list = data.approved.filter(s => s.status === 'approved')
+  async getApprovedServers(limit = 50, offset = 0, category = null, search = null) {
+    let data = this._load()
+    
+    // If cache returned no approved entries, try loading fresh from DB
+    if (data.approved.length === 0 && data.submissions.length === 0 && supportsDirectQuery()) {
+      data = await this._loadFresh()
+    }
+    
+    let list = data.approved.filter(s => !s.status || s.status === 'approved')
+
+    const servers = loadData(FILES.servers, [])
+    const serverMap = Array.isArray(servers) 
+      ? servers.reduce((acc, s) => { acc[s.id] = s; return acc }, {})
+      : servers
+
+    list = list.map(entry => {
+      const server = serverMap[entry.serverId]
+      if (server) {
+        return {
+          ...entry,
+          name: entry.name || server.name,
+          icon: entry.icon || server.icon,
+          description: entry.description || server.description,
+          memberCount: server.members?.length || 0
+        }
+      }
+      return entry
+    })
 
     if (category) {
       list = list.filter(s => s.category === category)
@@ -1520,7 +2617,7 @@ export const discoveryService = {
     }
   },
 
-  submitServer(serverId, description, category, userId) {
+  async submitServer(serverId, description, category, userId) {
     const data = this._load()
     const existing = data.submissions.find(s => s.serverId === serverId && s.status === 'pending')
     if (existing) {
@@ -1547,7 +2644,7 @@ export const discoveryService = {
       status: 'pending'
     }
     data.submissions.push(submission)
-    saveData(FILES.discovery, data)
+    await saveData(FILES.discovery, data)
     return submission
   },
 
@@ -1556,7 +2653,7 @@ export const discoveryService = {
     return data.submissions.filter(s => s.status === 'pending')
   },
 
-  approveSubmission(submissionId) {
+  async approveSubmission(submissionId) {
     const data = this._load()
     const idx = data.submissions.findIndex(s => s.id === submissionId)
     if (idx === -1) return { error: 'Submission not found' }
@@ -1566,11 +2663,11 @@ export const discoveryService = {
     submission.approvedAt = new Date().toISOString()
     data.submissions.splice(idx, 1)
     data.approved.push(submission)
-    saveData(FILES.discovery, data)
+    await saveData(FILES.discovery, data)
     return submission
   },
 
-  rejectSubmission(submissionId) {
+  async rejectSubmission(submissionId) {
     const data = this._load()
     const idx = data.submissions.findIndex(s => s.id === submissionId)
     if (idx === -1) return { error: 'Submission not found' }
@@ -1579,7 +2676,7 @@ export const discoveryService = {
     submission.status = 'rejected'
     submission.rejectedAt = new Date().toISOString()
     data.submissions.splice(idx, 1)
-    saveData(FILES.discovery, data)
+    await saveData(FILES.discovery, data)
     return { success: true }
   },
 
@@ -1601,27 +2698,101 @@ export const discoveryService = {
   }
 }
 
+export const serverEventService = {
+  _load() {
+    const data = loadData(FILES.serverEvents, {})
+    if (Array.isArray(data)) {
+      return data.reduce((acc, event) => {
+        if (event?.id) acc[event.id] = event
+        return acc
+      }, {})
+    }
+    if (data && typeof data === 'object') return data
+    return {}
+  },
+
+  _sort(events = []) {
+    return [...events].sort((a, b) => {
+      const aTime = new Date(a.startAt || a.createdAt || 0).getTime()
+      const bTime = new Date(b.startAt || b.createdAt || 0).getTime()
+      return aTime - bTime
+    })
+  },
+
+  getServerEvents(serverId) {
+    const data = this._load()
+    return this._sort(Object.values(data).filter(event => event?.serverId === serverId))
+  },
+
+  getUpcomingEvents(serverIds = [], limit = 20) {
+    const allowed = new Set((serverIds || []).filter(Boolean))
+    const now = Date.now()
+    const data = Object.values(this._load()).filter(event => {
+      if (!event?.serverId || !event?.startAt) return false
+      if (allowed.size > 0 && !allowed.has(event.serverId)) return false
+      return new Date(event.startAt).getTime() >= now
+    })
+    return this._sort(data).slice(0, limit)
+  },
+
+  getEvent(eventId) {
+    return this._load()[eventId] || null
+  },
+
+  async createEvent(eventData) {
+    const data = this._load()
+    data[eventData.id] = {
+      ...eventData,
+      createdAt: eventData.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+    await saveData(FILES.serverEvents, data)
+    return data[eventData.id]
+  },
+
+  async updateEvent(eventId, updates) {
+    const data = this._load()
+    if (!data[eventId]) return null
+    data[eventId] = {
+      ...data[eventId],
+      ...updates,
+      updatedAt: new Date().toISOString()
+    }
+    await saveData(FILES.serverEvents, data)
+    return data[eventId]
+  },
+
+  async deleteEvent(eventId) {
+    const data = this._load()
+    const existing = data[eventId] || null
+    if (!existing) return null
+    delete data[eventId]
+    await saveData(FILES.serverEvents, data)
+    return existing
+  }
+}
+
 export const globalBanService = {
   isBanned(userId) {
     const bans = loadData(FILES.globalBans, {})
     return bans[userId] || null
   },
 
-  banUser(userId, banData) {
+  async banUser(userId, banData) {
     const bans = loadData(FILES.globalBans, {})
     bans[userId] = {
       ...banData,
       userId,
       bannedAt: new Date().toISOString()
     }
-    saveData(FILES.globalBans, bans)
+    await saveData(FILES.globalBans, bans)
     return bans[userId]
   },
 
-  unbanUser(userId) {
+  async unbanUser(userId) {
     const bans = loadData(FILES.globalBans, {})
     delete bans[userId]
-    saveData(FILES.globalBans, bans)
+    await saveData(FILES.globalBans, bans)
     return true
   },
   
@@ -1631,7 +2802,7 @@ export const globalBanService = {
 }
 
 export const adminLogService = {
-  log(action, userId, targetId, details = {}) {
+  async log(action, userId, targetId, details = {}) {
     const logs = loadData(FILES.adminLogs, {})
     const logId = `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     
@@ -1643,7 +2814,7 @@ export const adminLogService = {
       details,
       createdAt: new Date().toISOString()
     }
-    saveData(FILES.adminLogs, logs)
+    await saveData(FILES.adminLogs, logs)
     return logs[logId]
   },
 
@@ -1665,7 +2836,7 @@ export const serverBanService = {
     return bans[serverId] || null
   },
 
-  banServer(serverId, reason, bannedBy) {
+  async banServer(serverId, reason, bannedBy) {
     const bans = loadData(FILES.serverBans, {})
     bans[serverId] = {
       serverId,
@@ -1673,14 +2844,14 @@ export const serverBanService = {
       bannedBy,
       bannedAt: new Date().toISOString()
     }
-    saveData(FILES.serverBans, bans)
+    await saveData(FILES.serverBans, bans)
     return bans[serverId]
   },
 
-  unbanServer(serverId) {
+  async unbanServer(serverId) {
     const bans = loadData(FILES.serverBans, {})
     delete bans[serverId]
-    saveData(FILES.serverBans, bans)
+    await saveData(FILES.serverBans, bans)
     return true
   },
 
@@ -1690,6 +2861,10 @@ export const serverBanService = {
 }
 
 export const adminService = {
+  _isTruthyFlag(value) {
+    return value === true || value === 1 || value === '1' || value === 'true'
+  },
+
   getStats() {
     const users = loadData(FILES.users, {})
     const servers = loadData(FILES.servers, {})
@@ -1697,13 +2872,37 @@ export const adminService = {
     const messages = loadData(FILES.messages, {})
     const dms = loadData(FILES.dms, {})
     const globalBans = loadData(FILES.globalBans, {})
+
+    const countCollection = (value) => {
+      if (!value) return 0
+      if (Array.isArray(value)) return value.length
+      if (typeof value !== 'object') return 0
+      const vals = Object.values(value)
+      if (vals.some(v => Array.isArray(v))) {
+        return vals.reduce((sum, v) => sum + (Array.isArray(v) ? v.length : (v && typeof v === 'object' ? 1 : 0)), 0)
+      }
+      return Object.keys(value).length
+    }
+
+    const countUniqueConversations = (dmsState) => {
+      if (!dmsState || typeof dmsState !== 'object') return 0
+      const seen = new Set()
+      for (const list of Object.values(dmsState)) {
+        if (!Array.isArray(list)) continue
+        for (const convo of list) {
+          if (convo?.id) seen.add(convo.id)
+        }
+      }
+      if (seen.size > 0) return seen.size
+      return Object.keys(dmsState).length
+    }
     
     return {
-      totalUsers: Object.keys(users).length,
-      totalServers: Object.keys(servers).length,
-      totalChannels: Object.keys(channels).length,
-      totalMessages: Object.keys(messages).length,
-      totalDms: Object.keys(dms).length,
+      totalUsers: countCollection(users),
+      totalServers: countCollection(servers),
+      totalChannels: countCollection(channels),
+      totalMessages: countCollection(messages),
+      totalDms: countUniqueConversations(dms),
       totalBans: Object.keys(globalBans).length,
       timestamp: new Date().toISOString()
     }
@@ -1712,13 +2911,13 @@ export const adminService = {
   isAdmin(userId) {
     const user = userService.getUser(userId)
     const role = user?.adminRole || user?.role
-    return role === 'admin' || role === 'owner' || user?.isAdmin === true
+    return role === 'admin' || role === 'owner' || this._isTruthyFlag(user?.isAdmin)
   },
 
   isModerator(userId) {
     const user = userService.getUser(userId)
     const role = user?.adminRole || user?.role
-    return role === 'admin' || role === 'owner' || role === 'moderator' || user?.isAdmin === true || user?.isModerator === true
+    return role === 'admin' || role === 'owner' || role === 'moderator' || this._isTruthyFlag(user?.isAdmin) || this._isTruthyFlag(user?.isModerator)
   },
 
   getUserRole(userId) {
@@ -1739,27 +2938,25 @@ export const adminService = {
   },
 
   getAllUsers() {
-    const users = loadData(FILES.users, {})
-    return Object.values(users)
+    return Object.values(userService.getAllUsers())
   },
 
-  resetUserPassword(userId) {
+  async resetUserPassword(userId) {
     const tempPassword = Math.random().toString(36).slice(-8)
     const user = userService.getUser(userId)
     if (!user) return { success: false, error: 'User not found' }
-    
-    import('bcrypt').then(({ default: bcrypt }) => {
-      const tempHash = bcrypt.hashSync(tempPassword, 10)
-      userService.updateProfile(userId, { passwordHash: tempHash })
-    })
-    
+
+    const { default: bcrypt } = await import('bcrypt')
+    const tempHash = bcrypt.hashSync(tempPassword, 10)
+    await userService.updateProfile(userId, { passwordHash: tempHash })
+
     return { success: true, tempPassword }
   },
 
-  deleteUser(userId) {
+  async deleteUser(userId) {
     const users = loadData(FILES.users, {})
     delete users[userId]
-    saveData(FILES.users, users)
+    await saveData(FILES.users, users)
     
     const friends = loadData(FILES.friends, {})
     if (friends[userId]) {
@@ -1767,7 +2964,7 @@ export const adminService = {
       Object.keys(friends).forEach((uid) => {
         friends[uid] = friends[uid].filter(fId => fId !== userId)
       })
-      saveData(FILES.friends, friends)
+      await saveData(FILES.friends, friends)
     }
     
     return { success: true }
@@ -1794,7 +2991,7 @@ export const systemMessageService = {
    * @param {object}   [opts.meta]     Extra data (e.g. version, releaseUrl)
    * @returns {object[]} Array of created message objects
    */
-  send(opts) {
+  async send(opts) {
     const { category, title, body, icon, severity = 'info', recipients, dedupeKey, meta } = opts
     const data = loadData(FILES.systemMessages, {})
     const created = []
@@ -1822,7 +3019,7 @@ export const systemMessageService = {
       created.push({ userId, ...msg })
     }
 
-    saveData(FILES.systemMessages, data)
+    await saveData(FILES.systemMessages, data)
     return created
   },
 
@@ -1840,39 +3037,39 @@ export const systemMessageService = {
   },
 
   /** Mark one message as read */
-  markRead(userId, messageId) {
+  async markRead(userId, messageId) {
     const data = loadData(FILES.systemMessages, {})
     if (!data[userId]) return false
     const msg = data[userId].find(m => m.id === messageId)
     if (!msg) return false
     msg.read = true
-    saveData(FILES.systemMessages, data)
+    await saveData(FILES.systemMessages, data)
     return true
   },
 
   /** Mark all messages for a user as read */
-  markAllRead(userId) {
+  async markAllRead(userId) {
     const data = loadData(FILES.systemMessages, {})
     if (!data[userId]) return
     data[userId].forEach(m => { m.read = true })
-    saveData(FILES.systemMessages, data)
+    await saveData(FILES.systemMessages, data)
   },
 
   /** Delete a system message */
-  delete(userId, messageId) {
+  async delete(userId, messageId) {
     const data = loadData(FILES.systemMessages, {})
     if (!data[userId]) return false
     const before = data[userId].length
     data[userId] = data[userId].filter(m => m.id !== messageId)
-    saveData(FILES.systemMessages, data)
+    await saveData(FILES.systemMessages, data)
     return data[userId].length < before
   },
 
   /** Delete all system messages for a user */
-  clearAll(userId) {
+  async clearAll(userId) {
     const data = loadData(FILES.systemMessages, {})
     data[userId] = []
-    saveData(FILES.systemMessages, data)
+    await saveData(FILES.systemMessages, data)
   }
 }
 
@@ -1894,7 +3091,7 @@ export const callLogService = {
    * @param {string} [opts.endedBy] - User who ended the call
    * @param {string} [opts.endedAt] - ISO timestamp when call ended
    */
-  logCall(opts) {
+  async logCall(opts) {
     const { callId, conversationId, callerId, recipientId, type, status, duration, endedBy, endedAt } = opts
     const logs = loadData(FILES.callLogs, {})
     
@@ -1924,7 +3121,7 @@ export const callLogService = {
       logs[conversationId].push(logEntry)
     }
     
-    saveData(FILES.callLogs, logs)
+    await saveData(FILES.callLogs, logs)
     return logEntry
   },
 
@@ -1978,7 +3175,7 @@ export const callLogService = {
   /**
    * Update an existing call log
    */
-  updateCall(callId, updates) {
+  async updateCall(callId, updates) {
     const logs = loadData(FILES.callLogs, {})
     for (const convId of Object.keys(logs)) {
       const idx = logs[convId].findIndex(l => l.callId === callId)
@@ -1988,7 +3185,7 @@ export const callLogService = {
           ...updates,
           updatedAt: new Date().toISOString()
         }
-        saveData(FILES.callLogs, logs)
+        await saveData(FILES.callLogs, logs)
         return logs[convId][idx]
       }
     }
@@ -2006,32 +3203,578 @@ export const callLogService = {
 // Note: Storage initialization is handled by server.js calling initStorageAndDistribute()
 // Do not initialize here to avoid race conditions
 
+export const initActivityTables = async () => {
+  const pool = getDbPool()
+  if (!pool) return
+  
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS activity_apps (
+        id VARCHAR(255) PRIMARY KEY,
+        client_id VARCHAR(255) UNIQUE NOT NULL,
+        client_secret VARCHAR(255) NOT NULL,
+        owner_id VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        redirect_uris TEXT,
+        scopes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_owner_id (owner_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `)
+    
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS activity_public (
+        id VARCHAR(255) PRIMARY KEY,
+        owner_id VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        icon VARCHAR(100),
+        category VARCHAR(100),
+        launch_url TEXT,
+        visibility VARCHAR(50) DEFAULT 'public',
+        is_builtin_client TINYINT(1) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_owner_id (owner_id),
+        INDEX idx_visibility (visibility)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `)
+    
+    // OAuth authorization codes - temporary codes for OAuth flow
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS activity_oauth_codes (
+        code VARCHAR(255) PRIMARY KEY,
+        client_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL,
+        scope TEXT,
+        redirect_uri TEXT,
+        context_type VARCHAR(50),
+        context_id VARCHAR(255),
+        session_id VARCHAR(255),
+        app_id VARCHAR(255),
+        expires_at BIGINT NOT NULL,
+        INDEX idx_client_id (client_id),
+        INDEX idx_user_id (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `)
+    
+    // OAuth access tokens - long-lived tokens for API access
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS activity_oauth_tokens (
+        access_token VARCHAR(255) PRIMARY KEY,
+        app_id VARCHAR(255) NOT NULL,
+        client_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL,
+        scope TEXT,
+        context_type VARCHAR(50),
+        context_id VARCHAR(255),
+        session_id VARCHAR(255),
+        created_at BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        INDEX idx_app_id (app_id),
+        INDEX idx_client_id (client_id),
+        INDEX idx_user_id (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `)
+  } catch (err) {
+    console.error('[Activity] Failed to initialize tables:', err.message)
+  }
+}
+
+export const moderationReportService = {
+  _loadReports() {
+    return loadData(FILES.reports, {})
+  },
+
+  async _saveReports(reports) {
+    await saveData(FILES.reports, reports)
+  },
+
+  create(data) {
+    const reports = this._loadReports()
+    const id = data.id || `report_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    reports[id] = {
+      ...data,
+      id,
+      status: 'pending',
+      createdAt: data.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      actions: []
+    }
+    this._saveReports(reports)
+    return reports[id]
+  },
+
+  getById(id) {
+    const reports = this._loadReports()
+    return reports[id] || null
+  },
+
+  getByIdForReporter(id, reporterId) {
+    const report = this.getById(id)
+    if (!report) return null
+    if (report.reporterId !== reporterId) return null
+    return report
+  },
+
+  list({ status = null, limit = 100, offset = 0 }) {
+    const reports = this._loadReports()
+    let list = Object.values(reports)
+    if (status) {
+      list = list.filter(r => r.status === status)
+    }
+    return list
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(offset, offset + limit)
+  },
+
+  listByReporter(reporterId, { status = null, limit = 100, offset = 0 }) {
+    const reports = this._loadReports()
+    let list = Object.values(reports).filter(r => r.reporterId === reporterId)
+    if (status) {
+      list = list.filter(r => r.status === status)
+    }
+    return list
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(offset, offset + limit)
+  },
+
+  resolve(id, { resolvedBy, resolution = 'resolved' }) {
+    const reports = this._loadReports()
+    if (!reports[id]) return null
+    reports[id].status = resolution
+    reports[id].resolvedBy = resolvedBy
+    reports[id].resolvedAt = new Date().toISOString()
+    reports[id].updatedAt = new Date().toISOString()
+    this._saveReports(reports)
+    return reports[id]
+  },
+
+  appendAction(id, action) {
+    const reports = this._loadReports()
+    if (!reports[id]) return null
+    if (!reports[id].actions) reports[id].actions = []
+    reports[id].actions.push({
+      ...action,
+      createdAt: new Date().toISOString()
+    })
+    reports[id].updatedAt = new Date().toISOString()
+    this._saveReports(reports)
+    return reports[id]
+  },
+
+  countRecentByReporter(reporterId, hours = 24) {
+    const reports = this._loadReports()
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString()
+    return Object.values(reports).filter(r => 
+      r.reporterId === reporterId && r.createdAt >= cutoff
+    ).length
+  },
+
+  findOpenDuplicateForReporter(reporterId, { contextType, contextId }) {
+    const reports = this._loadReports()
+    return Object.values(reports).find(r => 
+      r.reporterId === reporterId && 
+      r.status === 'pending' &&
+      r.contextType === contextType && 
+      r.contextId === contextId
+    ) || null
+  }
+}
+
+const generateId = () => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15)
+
+const getDbPool = () => {
+  const storage = getStorage()
+  return storage?.pool || null
+}
+
+const DEFAULT_ACTIVITIES = [
+  { id: 'builtin:our-vids', key: 'our-vids', name: 'OurVids', description: 'Synchronized video watching with queue and voting.', category: 'Media', icon: 'video', participantCap: 64, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://our-vids' },
+  { id: 'builtin:ready-check', key: 'ready-check', name: 'Ready Check', description: 'Fast ready confirmations for groups.', category: 'Utility', icon: 'check', participantCap: 128, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://ready-check' },
+  { id: 'builtin:soundboard-cues', key: 'soundboard-cues', name: 'Soundboard Cues', description: 'Trigger and share reactive sound cues.', category: 'Music', icon: 'audio', participantCap: 64, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://soundboard-cues' },
+  { id: 'builtin:sequencer', key: 'sequencer', name: 'Sequencer', description: 'Simple 8-step beat sequencer.', category: 'Music', icon: 'grid', participantCap: 32, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://sequencer' },
+  { id: 'builtin:colabcreate', key: 'colabcreate', name: 'ColabCreate', description: 'Full collaborative DAW.', category: 'Music', icon: 'daw', participantCap: 16, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://colabcreate' },
+  { id: 'builtin:sketch-duel', key: 'sketch-duel', name: 'Sketch Duel', description: 'Fast timed doodle battles.', category: 'Creative', icon: 'sketch', participantCap: 8, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://sketch-duel' },
+  { id: 'builtin:collaborative-drawing', key: 'collaborative-drawing', name: 'Drawing Board', description: 'Real-time collaborative drawing.', category: 'Creative', icon: 'draw', participantCap: 16, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://collaborative-drawing' },
+  { id: 'builtin:pixel-art', key: 'pixel-art', name: 'Pixel Art Board', description: 'Shared pixel canvas.', category: 'Creative', icon: 'pixels', participantCap: 32, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://pixel-art' },
+  { id: 'builtin:poker-night', key: 'poker-night', name: 'Poker Night', description: 'Texas Hold\'em poker with friends.', category: 'Games', icon: 'poker', participantCap: 8, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://poker-night' },
+  { id: 'builtin:chess-arena', key: 'chess-arena', name: 'Chess Arena', description: 'Multiplayer chess.', category: 'Games', icon: 'board', participantCap: 16, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://chess-arena' },
+  { id: 'builtin:tic-tac-toe', key: 'tic-tac-toe', name: 'Tic Tac Toe', description: 'Classic multiplayer grid duel.', category: 'Games', icon: 'tic-tac-toe', participantCap: 8, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://tic-tac-toe' },
+  { id: 'builtin:connect-four', key: 'connect-four', name: 'Connect Four', description: 'Drop-disc strategy game.', category: 'Games', icon: 'connect-four', participantCap: 8, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://connect-four' }
+]
+
+export const activityAppService = {
+  async listByUser(userId) {
+    const pool = getDbPool()
+    if (!pool) return []
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_apps WHERE owner_id = ?', [userId])
+      if (!rows || !Array.isArray(rows)) return []
+      return rows.map(row => ({
+        id: row.id,
+        clientId: row.client_id,
+        clientSecret: row.client_secret,
+        ownerId: row.owner_id,
+        name: row.name,
+        description: row.description,
+        redirectUris: row.redirect_uris ? JSON.parse(row.redirect_uris) : [],
+        scopes: row.scopes ? JSON.parse(row.scopes) : [],
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }))
+    } catch (err) {
+      console.error('[Activity] listByUser error:', err.message)
+      return []
+    }
+  },
+
+  async getById(appId) {
+    const pool = getDbPool()
+    if (!pool) return null
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_apps WHERE id = ?', [appId])
+      if (!rows || !Array.isArray(rows) || !rows[0]) return null
+      const row = rows[0]
+      return {
+        id: row.id,
+        clientId: row.client_id,
+        clientSecret: row.client_secret,
+        ownerId: row.owner_id,
+        name: row.name,
+        description: row.description,
+        redirectUris: row.redirect_uris ? JSON.parse(row.redirect_uris) : [],
+        scopes: row.scopes ? JSON.parse(row.scopes) : [],
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }
+    } catch (err) {
+      console.error('[Activity] getById error:', err.message)
+      return null
+    }
+  },
+
+  async getByClientId(clientId) {
+    const pool = getDbPool()
+    if (!pool) return null
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_apps WHERE client_id = ?', [clientId])
+      if (!rows[0]) return null
+      const row = rows[0]
+      return {
+        id: row.id,
+        clientId: row.client_id,
+        clientSecret: row.client_secret,
+        ownerId: row.owner_id,
+        name: row.name,
+        description: row.description,
+        redirectUris: row.redirect_uris ? JSON.parse(row.redirect_uris) : [],
+        scopes: row.scopes ? JSON.parse(row.scopes) : [],
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }
+    } catch (err) {
+      console.error('[Activity] getByClientId error:', err.message)
+      return null
+    }
+  },
+
+  async create(ownerId, data) {
+    const pool = getDbPool()
+    if (!pool) return null
+    const appId = generateId()
+    const clientId = generateId()
+    const clientSecret = generateId() + generateId()
+    try {
+      await pool.execute(
+        `INSERT INTO activity_apps (id, client_id, client_secret, owner_id, name, description, redirect_uris, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [appId, clientId, clientSecret, ownerId, data.name || 'My Activity', data.description || '', JSON.stringify(data.redirectUris || []), JSON.stringify(data.scopes || ['activities:read', 'activities:join'])]
+      )
+      return {
+        id: appId,
+        clientId,
+        clientSecret,
+        ownerId,
+        name: data.name || 'My Activity',
+        description: data.description || '',
+        redirectUris: data.redirectUris || [],
+        scopes: data.scopes || ['activities:read', 'activities:join']
+      }
+    } catch (err) {
+      console.error('[Activity] create error:', err.message)
+      return null
+    }
+  },
+
+  async rotateSecret(ownerId, appId) {
+    const pool = getDbPool()
+    if (!pool) return null
+    const newSecret = generateId() + generateId()
+    try {
+      const [result] = await pool.execute(
+        'UPDATE activity_apps SET client_secret = ? WHERE id = ? AND owner_id = ?',
+        [newSecret, appId, ownerId]
+      )
+      return result.affectedRows > 0 ? { clientSecret: newSecret } : null
+    } catch (err) {
+      console.error('[Activity] rotateSecret error:', err.message)
+      return null
+    }
+  },
+
+  async delete(ownerId, appId) {
+    const pool = getDbPool()
+    if (!pool) return false
+    try {
+      const [result] = await pool.execute(
+        'DELETE FROM activity_apps WHERE id = ? AND owner_id = ?',
+        [appId, ownerId]
+      )
+      return result.affectedRows > 0
+    } catch (err) {
+      console.error('[Activity] delete error:', err.message)
+      return false
+    }
+  }
+}
+
+export const activityPublicService = {
+  async listAll() {
+    const pool = getDbPool()
+    if (!pool) return []
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_public WHERE visibility = ?', ['public'])
+      if (!rows || !Array.isArray(rows)) return []
+      return rows.map(row => ({
+        id: row.id,
+        ownerId: row.owner_id,
+        name: row.name,
+        description: row.description,
+        icon: row.icon,
+        category: row.category,
+        launchUrl: row.launch_url,
+        visibility: row.visibility,
+        isBuiltinClient: Boolean(row.is_builtin_client),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }))
+    } catch (err) {
+      console.error('[Activity] listAll error:', err.message)
+      return []
+    }
+  },
+
+  async getById(activityId) {
+    const pool = getDbPool()
+    if (!pool) return null
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_public WHERE id = ?', [activityId])
+      if (!rows || !Array.isArray(rows) || !rows[0]) return null
+      const row = rows[0]
+      return {
+        id: row.id,
+        ownerId: row.owner_id,
+        name: row.name,
+        description: row.description,
+        icon: row.icon,
+        category: row.category,
+        launchUrl: row.launch_url,
+        visibility: row.visibility,
+        isBuiltinClient: Boolean(row.is_builtin_client),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }
+    } catch (err) {
+      console.error('[Activity] getById error:', err.message)
+      return null
+    }
+  },
+
+  async create(ownerId, data) {
+    const pool = getDbPool()
+    if (!pool) return null
+    const activityId = generateId()
+    try {
+      await pool.execute(
+        `INSERT INTO activity_public (id, owner_id, name, description, icon, category, launch_url, visibility, is_builtin_client) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [activityId, ownerId, data.name || 'My Activity', data.description || '', data.icon || 'puzzle', data.category || 'Games', data.launchUrl || '', 'public', 0]
+      )
+      return {
+        id: activityId,
+        ownerId,
+        name: data.name || 'My Activity',
+        description: data.description || '',
+        icon: data.icon || 'puzzle',
+        category: data.category || 'Games',
+        launchUrl: data.launchUrl || '',
+        visibility: 'public',
+        isBuiltinClient: false
+      }
+    } catch (err) {
+      console.error('[Activity] create public error:', err.message)
+      return null
+    }
+  },
+
+  async delete(ownerId, activityId) {
+    const pool = getDbPool()
+    if (!pool) return false
+    try {
+      const [result] = await pool.execute(
+        'DELETE FROM activity_public WHERE id = ? AND owner_id = ?',
+        [activityId, ownerId]
+      )
+      return result.affectedRows > 0
+    } catch (err) {
+      console.error('[Activity] delete public error:', err.message)
+      return false
+    }
+  }
+}
+
+export const activityOAuthService = {
+  async createAuthorizationCode({ clientId, userId, scope, redirectUri, contextType, contextId, sessionId, appId }) {
+    const pool = getDbPool()
+    if (!pool) return null
+    const code = generateId() + generateId()
+    const expiresAt = Date.now() + 10 * 60 * 1000
+    try {
+      await pool.execute(
+        `INSERT INTO activity_oauth_codes (code, client_id, user_id, scope, redirect_uri, context_type, context_id, session_id, app_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [code, clientId, userId, scope, redirectUri, contextType, contextId, sessionId, appId, expiresAt]
+      )
+      return code
+    } catch (err) {
+      console.error('[Activity] createAuthorizationCode error:', err.message)
+      return null
+    }
+  },
+
+  async exchangeCode({ clientId, clientSecret, code, redirectUri }) {
+    const pool = getDbPool()
+    if (!pool) return { error: 'server_error' }
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_oauth_codes WHERE code = ?', [code])
+      const codeData = rows[0]
+      if (!codeData) return { error: 'invalid_code' }
+      if (Date.now() > codeData.expires_at) {
+        await pool.execute('DELETE FROM activity_oauth_codes WHERE code = ?', [code])
+        return { error: 'code_expired' }
+      }
+      if (codeData.client_id !== clientId) return { error: 'invalid_client' }
+      if (codeData.redirect_uri !== redirectUri) return { error: 'invalid_redirect_uri' }
+
+      const app = await activityAppService.getByClientId(clientId)
+      if (!app || app.clientSecret !== clientSecret) return { error: 'invalid_client' }
+
+      await pool.execute('DELETE FROM activity_oauth_codes WHERE code = ?', [code])
+
+      const accessToken = generateId() + generateId() + generateId()
+      const refreshToken = generateId() + generateId() + generateId()
+      const now = Date.now()
+      const expiresAt = now + 24 * 60 * 60 * 1000
+
+      await pool.execute(
+        `INSERT INTO activity_oauth_tokens (access_token, app_id, client_id, user_id, scope, context_type, context_id, session_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [accessToken, app.id, clientId, codeData.user_id, codeData.scope, codeData.context_type, codeData.context_id, codeData.session_id, now, expiresAt]
+      )
+
+      return {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        token_type: 'Bearer',
+        expires_in: 86400,
+        scope: codeData.scope
+      }
+    } catch (err) {
+      console.error('[Activity] exchangeCode error:', err.message)
+      return { error: 'server_error' }
+    }
+  },
+
+  async introspectAccessToken(accessToken) {
+    const pool = getDbPool()
+    if (!pool) return { active: false }
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_oauth_tokens WHERE access_token = ?', [accessToken])
+      const tokenData = rows[0]
+      if (!tokenData) return { active: false }
+      if (Date.now() > tokenData.expires_at) {
+        await pool.execute('DELETE FROM activity_oauth_tokens WHERE access_token = ?', [accessToken])
+        return { active: false }
+      }
+      return {
+        active: true,
+        app_id: tokenData.app_id,
+        client_id: tokenData.client_id,
+        user_id: tokenData.user_id,
+        scope: tokenData.scope,
+        context_type: tokenData.context_type,
+        context_id: tokenData.context_id,
+        session_id: tokenData.session_id,
+        exp: Math.floor(tokenData.expires_at / 1000)
+      }
+    } catch (err) {
+      console.error('[Activity] introspectAccessToken error:', err.message)
+      return { active: false }
+    }
+  }
+}
+
+export const activityService = {
+  async listCatalog() {
+    const publicActivities = await activityPublicService.listAll()
+    return [...DEFAULT_ACTIVITIES, ...publicActivities]
+  },
+
+  async listPublicActivities() {
+    return activityPublicService.listAll()
+  },
+
+  async listMyApps(userId) {
+    return activityAppService.listByUser(userId)
+  },
+
+  async createApp(userId, data) {
+    return activityAppService.create(userId, data)
+  },
+
+  async rotateClientSecret(userId, appId) {
+    return activityAppService.rotateSecret(userId, appId)
+  },
+
+  async createPublicActivity(userId, data) {
+    return activityPublicService.create(userId, data)
+  },
+
+  async getAppByClientId(clientId) {
+    return activityAppService.getByClientId(clientId)
+  },
+
+  async createAuthorizationCode(data) {
+    return activityOAuthService.createAuthorizationCode(data)
+  },
+
+  async exchangeAuthorizationCode(data) {
+    return activityOAuthService.exchangeCode(data)
+  },
+
+  async introspectAccessToken(token) {
+    return activityOAuthService.introspectAccessToken(token)
+  }
+}
+
 export default {
   initStorage,
-  FILES,
-  migrateData,
-  getStorageInfo,
-  reloadData,
-  reinitializeStorage,
-  exportAllData,
-  importAllData,
+  initActivityTables,
   userService,
-  friendService,
-  friendRequestService,
-  blockService,
-  dmService,
-  dmMessageService,
-  reactionService,
-  inviteService,
   serverService,
   channelService,
   messageService,
-  fileService,
-  attachmentService,
-  discoveryService,
-  globalBanService,
-  adminLogService,
-  adminService,
-  serverBanService,
-  callLogService
+  dmService,
+  inviteService,
+  getStorageInfo,
+  FILES
 }

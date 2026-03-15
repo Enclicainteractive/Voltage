@@ -33,7 +33,7 @@ const JSON_FILE_TO_TABLE = {
   'server-bans.json': 'server_bans',
   'admin-logs.json': 'admin_logs',
   'system-messages.json': 'system_messages',
-  'e2e-true.json': 'e2e_true',
+  'e2e-true.json': 'e2e_true_state',
   'pinned-messages.json': 'pinned_messages',
   'self-volts.json': 'self_volts',
   'federation.json': 'federation',
@@ -266,7 +266,7 @@ router.post('/migrate', async (req, res) => {
       
       const importResults = await dataService.importAllData(exportData)
       if (!importResults.success) {
-        const importErr = (importResults.errors || []).join('; ') || 'Unknown import failure'
+         const importErr = Array.isArray(importResults.errors) ? importResults.errors.join('; ') : 'Unknown import failure'
         throw new Error(`Import failed: ${importErr}`)
       }
       results.steps[results.steps.length - 1].status = 'completed'

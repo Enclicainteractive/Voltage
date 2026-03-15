@@ -4,16 +4,46 @@ import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import config from '../config/config.js'
 import { userService } from '../services/dataService.js'
+import { validateRequestSecurity, sanitizeBody } from '../middleware/requestSecurity.js'
+import securityLogger from '../services/securityLogger.js'
+import inputValidator from '../middleware/inputValidation.js'
 
 const router = express.Router()
 
+const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
+
 const getAvatarUrl = (userId) => {
-  const imageServerUrl = config.getImageServerUrl()
-  return `${imageServerUrl}/api/images/users/${userId}/profile`
+  const safeUserId = String(userId || '')
+  if (!safeUserId) return null
+  const baseUrl = safeUserId.startsWith('u_')
+    ? (config.getServerUrl() || config.getImageServerUrl())
+    : config.getImageServerUrl()
+  return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
+}
+
+const resolveUserAvatar = (userId, profile = null) => {
+  const explicit = profile?.imageUrl || profile?.imageurl || profile?.avatarUrl || profile?.avatarURL || profile?.avatar || null
+  if (isExternalImage(explicit)) return explicit
+  return getAvatarUrl(userId)
 }
 
 const generateUserId = () => {
   return `u_${crypto.randomBytes(16).toString('hex')}`
+}
+
+const toTruthyFlag = (value) => value === true || value === 1 || value === '1' || value === 'true'
+const BIRTHDATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
+
+const normalizeBirthDate = (value) => {
+  if (!value) return null
+  if (typeof value !== 'string' || !BIRTHDATE_PATTERN.test(value)) return null
+  const parsed = new Date(`${value}T00:00:00Z`)
+  if (Number.isNaN(parsed.getTime())) return null
+  const now = new Date()
+  if (parsed > now) return null
+  const ageYears = now.getUTCFullYear() - parsed.getUTCFullYear()
+  if (ageYears > 120) return null
+  return value
 }
 
 const normalizeUsername = (username) => {
@@ -67,6 +97,14 @@ const parseUsername = (usernameInput) => {
 
 router.post('/register', async (req, res) => {
   try {
+    const securityCheck = validateRequestSecurity(req.body)
+    if (!securityCheck.valid) {
+      securityLogger.logSecurityEvent('HONEYPOT_TRIGGERED', { ip: req.ip, endpoint: '/register' })
+      return res.status(400).json({ error: securityCheck.error })
+    }
+    
+    const body = sanitizeBody(req.body)
+    
     if (!config.isLocalAuthEnabled()) {
       return res.status(403).json({ error: 'Local registration is disabled' })
     }
@@ -75,10 +113,20 @@ router.post('/register', async (req, res) => {
       return res.status(403).json({ error: 'Registration is closed' })
     }
     
-    const { email, password, username } = req.body
+    const { email, password, username, birthDate } = body
     
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' })
+    }
+
+    const normalizedEmail = inputValidator.normalizeEmail(email)
+    if (!normalizedEmail) {
+      return res.status(400).json({ error: 'Invalid email format' })
+    }
+
+    const normalizedBirthDate = normalizeBirthDate(birthDate)
+    if (!normalizedBirthDate) {
+      return res.status(400).json({ error: 'A valid birth date is required' })
     }
     
     const minLength = config.config.auth.local.minPasswordLength || 8
@@ -99,7 +147,7 @@ router.post('/register', async (req, res) => {
     }
     
     const existingUsers = userService.getAllUsers()
-    const existingByEmail = Object.values(existingUsers).find(u => u.email?.toLowerCase() === email.toLowerCase())
+    const existingByEmail = Object.values(existingUsers).find(u => u.email?.toLowerCase() === normalizedEmail.toLowerCase())
     if (existingByEmail) {
       return res.status(400).json({ error: 'Email already registered' })
     }
@@ -118,24 +166,29 @@ router.post('/register', async (req, res) => {
       id: userId,
       username: parsedUsername.username,
       displayName: parsedUsername.username,
-      email: email.toLowerCase(),
+      email: normalizedEmail.toLowerCase(),
       passwordHash: hashedPassword,
       authProvider: 'local',
+      birthDate: normalizedBirthDate,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     }
     
-    userService.saveUser(userId, userData)
+    await userService.saveUser(userId, userData)
     
     const token = jwt.sign(
       {
         userId: userId,
+        id: userId,
+        sub: userId,
         username: parsedUsername.username,
-        email: email.toLowerCase(),
-        host: parsedUsername.host
+        email: normalizedEmail.toLowerCase(),
+        host: parsedUsername.host,
+        adminRole: userData.adminRole || userData.role || null,
+        isAdmin: toTruthyFlag(userData.isAdmin),
+        isModerator: toTruthyFlag(userData.isModerator)
       },
-      config.config.security.jwtSecret,
-      { expiresIn: config.config.security.jwtExpiry || '7d' }
+      config.config.security.jwtSecret
     )
     
     console.log(`[Auth] New local user registered: ${parsedUsername.username}@${parsedUsername.host}`)
@@ -145,8 +198,9 @@ router.post('/register', async (req, res) => {
         id: userId,
         username: parsedUsername.username,
         displayName: parsedUsername.username,
-        email: email.toLowerCase(),
-        avatar: null
+        email: normalizedEmail.toLowerCase(),
+        avatar: null,
+        birthDate: normalizedBirthDate
       },
       access_token: token,
       token_type: 'Bearer',
@@ -160,11 +214,19 @@ router.post('/register', async (req, res) => {
 
 router.post('/login', async (req, res) => {
   try {
+    const securityCheck = validateRequestSecurity(req.body)
+    if (!securityCheck.valid) {
+      securityLogger.logSecurityEvent('HONEYPOT_TRIGGERED', { ip: req.ip, endpoint: '/login' })
+      return res.status(400).json({ error: securityCheck.error })
+    }
+    
+    const body = sanitizeBody(req.body)
+    
     if (!config.isLocalAuthEnabled()) {
       return res.status(403).json({ error: 'Local authentication is disabled' })
     }
     
-    const { username, password, email } = req.body
+    const { username, password, email } = body
     
     const loginIdentifier = username || email
     if (!loginIdentifier || !password) {
@@ -172,6 +234,7 @@ router.post('/login', async (req, res) => {
     }
     
     const parsed = parseUsername(loginIdentifier)
+    const normalizedLogin = email ? inputValidator.normalizeEmail(loginIdentifier) : loginIdentifier
     
     if (!parsed.isLocal) {
       return res.status(400).json({ error: 'Please use the correct server for this user' })
@@ -180,30 +243,37 @@ router.post('/login', async (req, res) => {
     const allUsers = userService.getAllUsers()
     const user = Object.values(allUsers).find(
       u => (u.username?.toLowerCase() === parsed.username.toLowerCase()) ||
-           (u.email?.toLowerCase() === loginIdentifier.toLowerCase())
+           (u.email?.toLowerCase() === normalizedLogin.toLowerCase())
     )
     
     if (!user || !user.passwordHash) {
+      securityLogger.logLogin(null, req.ip, false)
       return res.status(401).json({ error: 'Invalid credentials' })
     }
     
     const validPassword = await bcrypt.compare(password, user.passwordHash)
     if (!validPassword) {
+      securityLogger.logLogin(user.id, req.ip, false)
       return res.status(401).json({ error: 'Invalid credentials' })
     }
     
     const token = jwt.sign(
       {
         userId: user.id,
+        id: user.id,
+        sub: user.id,
         username: user.username,
         email: user.email,
-        host: config.getHost()
+        host: config.getHost(),
+        adminRole: user.adminRole || user.role || null,
+        isAdmin: toTruthyFlag(user.isAdmin),
+        isModerator: toTruthyFlag(user.isModerator)
       },
-      config.config.security.jwtSecret,
-      { expiresIn: config.config.security.jwtExpiry || '7d' }
+      config.config.security.jwtSecret
     )
     
     console.log(`[Auth] Local user logged in: ${user.username}`)
+    securityLogger.logLogin(user.id, req.ip, true)
     
     res.json({
       user: {
@@ -211,7 +281,11 @@ router.post('/login', async (req, res) => {
         username: user.username,
         displayName: user.displayName || user.username,
         email: user.email,
-        avatar: getAvatarUrl(user.id)
+        birthDate: user.birthDate || null,
+        ageVerification: user.ageVerification || null,
+        ageVerificationJurisdiction: user.ageVerificationJurisdiction || null,
+        imageUrl: user.imageUrl || user.imageurl || user.avatarUrl || user.avatarURL || (isExternalImage(user.avatar) ? user.avatar : null),
+        avatar: resolveUserAvatar(user.id, user)
       },
       access_token: token,
       token_type: 'Bearer',
@@ -235,9 +309,10 @@ router.post('/forgot-password', async (req, res) => {
       return res.status(400).json({ error: 'Email is required' })
     }
     
+    const normalizedEmail = inputValidator.normalizeEmail(email)
     const allUsers = userService.getAllUsers()
     const user = Object.values(allUsers).find(
-      u => u.email?.toLowerCase() === email.toLowerCase() && u.authProvider === 'local'
+      u => u.email?.toLowerCase() === normalizedEmail.toLowerCase() && u.authProvider === 'local'
     )
     
     if (!user) {
@@ -247,7 +322,7 @@ router.post('/forgot-password', async (req, res) => {
     const resetToken = crypto.randomBytes(32).toString('hex')
     const resetExpiry = Date.now() + 3600000
     
-    userService.updateProfile(user.id, {
+    await userService.updateProfile(user.id, {
       resetToken,
       resetExpiry
     })
@@ -289,7 +364,7 @@ router.post('/reset-password', async (req, res) => {
     
     const hashedPassword = await bcrypt.hash(password, config.config.security.bcryptRounds || 12)
     
-    userService.updateProfile(user.id, {
+    await userService.updateProfile(user.id, {
       passwordHash: hashedPassword,
       resetToken: null,
       resetExpiry: null
@@ -313,12 +388,13 @@ router.get('/me', async (req, res) => {
   }
   
   try {
-    const decoded = jwt.decode(token)
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || config.config.security?.jwtSecret || 'volt_super_secret_key_change_in_production')
     if (!decoded) {
       return res.status(401).json({ error: 'Invalid token' })
     }
     
-    const user = userService.getUser(decoded.userId)
+    const tokenUserId = decoded.userId || decoded.id || decoded.sub || decoded.user?.id
+    const user = userService.getUser(tokenUserId)
     if (!user) {
       return res.status(404).json({ error: 'User not found' })
     }
@@ -328,7 +404,11 @@ router.get('/me', async (req, res) => {
       username: user.username,
       displayName: user.displayName,
       email: user.email,
-      avatar: getAvatarUrl(user.id)
+      birthDate: user.birthDate || null,
+      ageVerification: user.ageVerification || null,
+      ageVerificationJurisdiction: user.ageVerificationJurisdiction || null,
+      imageUrl: user.imageUrl || user.imageurl || user.avatarUrl || user.avatarURL || (isExternalImage(user.avatar) ? user.avatar : null),
+      avatar: resolveUserAvatar(user.id, user)
     })
   } catch (_error) {
     res.status(500).json({ error: 'Failed to get user info' })

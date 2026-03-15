@@ -158,10 +158,10 @@ const DEFAULT_CONFIG = {
       provider: 'enclica',
       enclica: {
         clientId: process.env.ENCLICA_CLIENT_ID || 'app_54f92e4d526840789998b4cca492aea1',
-        authUrl: process.env.ENCLICA_AUTH_URL || 'https://voltchatapp.enclicainteractive.com/oauth/authorize',
-        tokenUrl: process.env.ENCLICA_TOKEN_URL || 'https://voltchatapp.enclicainteractive.com/api/oauth/token',
-        userInfoUrl: process.env.ENCLICA_USER_INFO_URL || 'https://voltchatapp.enclicainteractive.com/api/user/me',
-        revokeUrl: process.env.ENCLICA_REVOKE_URL || 'https://voltchatapp.enclicainteractive.com/api/oauth/revoke'
+        authUrl: process.env.ENCLICA_AUTH_URL || 'https://api.enclicainteractive.com/oauth/authorize',
+        tokenUrl: process.env.ENCLICA_TOKEN_URL || 'https://api.enclicainteractive.com/api/oauth/token',
+        userInfoUrl: process.env.ENCLICA_USER_INFO_URL || 'https://api.enclicainteractive.com/api/user/me',
+        revokeUrl: process.env.ENCLICA_REVOKE_URL || 'https://api.enclicainteractive.com/api/oauth/revoke'
       }
     }
   },

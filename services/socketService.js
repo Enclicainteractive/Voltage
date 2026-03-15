@@ -1,31 +1,16 @@
 import { v4 as uuidv4 } from 'uuid'
-import { addMessage, editMessage, deleteMessage, findChannelById } from '../routes/channelRoutes.js'
-import { dmMessageService, dmService, userService, reactionService, channelService, callLogService, blockService } from './dataService.js'
+import { addMessage, editMessage, deleteMessage, bulkDeleteMessages, findChannelById } from '../routes/channelRoutes.js'
+import { FILES, dmMessageService, dmService, userService, reactionService, channelService, callLogService, blockService, serverService } from './dataService.js'
 import { e2eService, userKeyService } from './e2eService.js'
 import { e2eTrueService } from './e2eTrueService.js'
 import { botService } from './botService.js'
 import { federationService } from './federationService.js'
 import * as crypto from './cryptoService.js'
 import config from '../config/config.js'
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const SERVERS_FILE = path.join(DATA_DIR, 'servers.json')
-
-const loadData = (file, defaultValue = []) => {
-  try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'))
-    }
-  } catch (err) {
-    console.error(`[Data] Error loading ${file}:`, err.message)
-  }
-  return defaultValue
-}
+import wsManager from './wsManager.js'
+import messageBus from './messageBus.js'
+import { normalizeAgeVerification } from '../utils/ageVerificationPolicy.js'
+import wsSecurity from './wsSecurity.js'
 
 const onlineUsers = new Map()
 const userSockets = new Map()
@@ -34,7 +19,12 @@ const voiceChannels = new Map()
 const voiceChannelUsers = new Map()
 const webrtcPeers = new Map()
 const voiceHeartbeats = new Map()
+const pendingVoiceDisconnects = new Map()
 const messageTimestamps = new Map()
+const activitySessions = new Map()
+const activitySessionsByContext = new Map()
+const activitySessionParticipants = new Map()
+const activitySessionPeerIndex = new Map()
 
 // DM Call state - must be at module scope so all socket connections share the same state
 // Active DM calls: callId -> { callerId, recipientId, conversationId, status, startTime, type }
@@ -55,7 +45,169 @@ let consensusMonitorStarted = false
 
 const HEARTBEAT_TIMEOUT_MS = 20000
 const HEARTBEAT_CHECK_INTERVAL_MS = 5000
+const TRANSIENT_SOCKET_DISCONNECT_GRACE_MS = 15000
 let heartbeatMonitorStarted = false
+
+const normalizeHost = (value) => federationService.normalizeHost?.(value) || String(value || '').toLowerCase()
+const extractRemoteOriginId = (userId) => String(userId || '').split('@')[0]
+const buildFederatedAddress = (username, host) => {
+  const safeUsername = String(username || '').trim()
+  const safeHost = String(host || '').trim().toLowerCase()
+  return safeUsername && safeHost ? `${safeUsername}:${safeHost}` : safeUsername || safeHost || ''
+}
+
+const buildFederatedUserPayload = (user, profile = null) => ({
+  id: user?.id,
+  username: user?.username || user?.email || profile?.username || null,
+  displayName: profile?.displayName || user?.displayName || user?.username || null,
+  customUsername: profile?.customUsername || null,
+  avatar: profile?.avatar || profile?.imageUrl || user?.avatar || null,
+  imageUrl: profile?.imageUrl || profile?.avatar || user?.avatar || null,
+  avatarHost: profile?.avatarHost || config.getImageServerUrl(),
+  host: normalizeHost(profile?.host || user?.host || config.getHost()),
+  status: profile?.status || 'online',
+  customStatus: profile?.customStatus || null,
+  address: buildFederatedAddress(profile?.customUsername || profile?.username || user?.username || user?.email, profile?.host || user?.host || config.getHost())
+})
+
+const relayEventToPeerHost = (targetHost, type, payload) => {
+  const normalizedHost = normalizeHost(targetHost)
+  const localHost = normalizeHost(config.getHost())
+  if (!normalizedHost || normalizedHost === localHost) return false
+  const peer = federationService.getPeerByHost?.(normalizedHost)
+  if (!peer || peer.status !== 'connected') return false
+  federationService.queueRelayMessage?.(peer.id, { type, payload })
+  return true
+}
+
+const relayEventToConnectedPeers = (type, payload) => {
+  const peers = federationService.getConnectedPeers?.() || []
+  peers.forEach((peer) => {
+    federationService.queueRelayMessage?.(peer.id, { type, payload })
+  })
+}
+
+const getActivityContextKey = (contextType, contextId) => `${String(contextType || 'voice')}:${String(contextId || '')}`
+
+const ensureActivityContextSet = (contextType, contextId) => {
+  const key = getActivityContextKey(contextType, contextId)
+  if (!activitySessionsByContext.has(key)) {
+    activitySessionsByContext.set(key, new Set())
+  }
+  return activitySessionsByContext.get(key)
+}
+
+const ensureActivityParticipants = (sessionId) => {
+  if (!activitySessionParticipants.has(sessionId)) {
+    activitySessionParticipants.set(sessionId, new Map())
+  }
+  return activitySessionParticipants.get(sessionId)
+}
+
+const ensureActivityPeerIndex = (sessionId) => {
+  if (!activitySessionPeerIndex.has(sessionId)) {
+    activitySessionPeerIndex.set(sessionId, new Map())
+  }
+  return activitySessionPeerIndex.get(sessionId)
+}
+
+const removeActivitySession = (sessionId) => {
+  const session = activitySessions.get(sessionId)
+  if (!session) return null
+  const contextSet = activitySessionsByContext.get(getActivityContextKey(session.contextType, session.contextId))
+  contextSet?.delete(sessionId)
+  if (contextSet && contextSet.size === 0) {
+    activitySessionsByContext.delete(getActivityContextKey(session.contextType, session.contextId))
+  }
+  activitySessions.delete(sessionId)
+  activitySessionParticipants.delete(sessionId)
+  activitySessionPeerIndex.delete(sessionId)
+  return session
+}
+
+const serializeActivitySession = (sessionId) => {
+  const session = activitySessions.get(sessionId)
+  if (!session) return null
+  const participantsMap = ensureActivityParticipants(sessionId)
+  const participants = Array.from(participantsMap.values()).map((participant) => ({
+    userId: participant.userId,
+    username: participant.username,
+    avatar: participant.avatar,
+    peerId: participant.peerId || null,
+    joinedAt: participant.joinedAt
+  }))
+
+  return {
+    id: session.id,
+    sessionId: session.id,
+    activityId: session.activityId,
+    activityName: session.activityName,
+    contextType: session.contextType,
+    contextId: session.contextId,
+    ownerId: session.ownerId,
+    hostId: session.ownerId,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+    participantCount: participants.length,
+    participants,
+    state: session.state || {},
+    p2p: session.p2p || { enabled: true, preferred: true },
+    sound: session.sound || { enabled: true, volume: 0.8 }
+  }
+}
+
+const getSerializedActivitySessionsForContext = (contextType, contextId) => {
+  const sessionIds = activitySessionsByContext.get(getActivityContextKey(contextType, contextId))
+  if (!sessionIds) return []
+  return Array.from(sessionIds)
+    .map((sessionId) => serializeActivitySession(sessionId))
+    .filter(Boolean)
+    .sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime())
+}
+
+const emitActivityContext = (io, contextType, contextId, event, payload) => {
+  if (!contextId) return
+
+  if (contextType === 'voice') {
+    const participants = voiceChannelUsers.get(contextId) || []
+    const sent = new Set()
+    participants.forEach((participant) => {
+      const targetUserId = participant?.id || participant?.userId
+      const socketId = targetUserId ? userSockets.get(targetUserId) : null
+      if (socketId && !sent.has(socketId)) {
+        io.to(socketId).emit(event, payload)
+        sent.add(socketId)
+      }
+    })
+    io.to(`channel:${contextId}`).emit(event, payload)
+    return
+  }
+
+  if (contextType === 'call') {
+    for (const call of activeDMCalls.values()) {
+      if (call?.conversationId !== contextId) continue
+      const ids = new Set([
+        call.callerId,
+        call.recipientId,
+        ...(Array.isArray(call.participantIds) ? call.participantIds : [])
+      ].filter(Boolean))
+      ids.forEach((targetUserId) => {
+        const socketId = userSockets.get(targetUserId)
+        if (socketId) io.to(socketId).emit(event, payload)
+      })
+      io.to(`dm:${contextId}`).emit(event, payload)
+      break
+    }
+  }
+}
+
+const emitActivitySessionsForContext = (io, contextType, contextId) => {
+  emitActivityContext(io, contextType, contextId, 'activity:sessions', {
+    contextType,
+    contextId,
+    sessions: getSerializedActivitySessionsForContext(contextType, contextId)
+  })
+}
 
 const buildDMReplyReference = (conversationId, replyTo) => {
   if (!replyTo) return null
@@ -94,7 +246,8 @@ const convertEmojiFormat = (content, serverId) => {
   if (!content || !serverId) return content
   
   // Load server emojis
-  const servers = loadData(SERVERS_FILE, [])
+  const serversData = serverService.getAllServers()
+  const servers = Array.isArray(serversData) ? serversData : Object.values(serversData || {})
   const server = servers.find(s => s.id === serverId)
   if (!server?.emojis?.length) return content
   
@@ -165,6 +318,42 @@ const getIceServers = () => {
 
 const clearVoiceHeartbeat = (userId) => {
   voiceHeartbeats.delete(userId)
+}
+
+const cancelPendingVoiceDisconnect = (userId) => {
+  const pending = pendingVoiceDisconnects.get(userId)
+  if (!pending) return
+  clearTimeout(pending.timer)
+  pendingVoiceDisconnects.delete(userId)
+}
+
+const scheduleVoiceDisconnectCleanup = (io, channelId, userId, reason = 'disconnect') => {
+  cancelPendingVoiceDisconnect(userId)
+
+  const timer = setTimeout(() => {
+    pendingVoiceDisconnects.delete(userId)
+
+    const socketId = userSockets.get(userId)
+    if (socketId) {
+      console.log(`[Voice] Skipping delayed cleanup for ${userId}; socket already restored`)
+      return
+    }
+
+    const heartbeat = voiceHeartbeats.get(userId)
+    if (heartbeat && heartbeat.channelId === channelId && Date.now() - heartbeat.lastHeartbeat <= HEARTBEAT_TIMEOUT_MS) {
+      console.log(`[Voice] Skipping delayed cleanup for ${userId}; heartbeat is still fresh`)
+      return
+    }
+
+    console.log(`[Voice] Finalizing delayed cleanup for ${userId} in ${channelId} (${reason})`)
+    cleanupVoiceUser(io, channelId, userId, reason)
+  }, TRANSIENT_SOCKET_DISCONNECT_GRACE_MS)
+
+  pendingVoiceDisconnects.set(userId, {
+    channelId,
+    reason,
+    timer
+  })
 }
 
 const cleanupVoiceUser = (io, channelId, userId, reason = 'leave') => {
@@ -384,6 +573,16 @@ export const isUserOnline = (userId) => {
   return onlineUsers.has(userId)
 }
 
+export const isUserInActiveCall = (contextId, userId) => {
+  if (!contextId || !userId) return false
+  for (const users of voiceChannelUsers.values()) {
+    if (users.some(u => u.id === userId || u.userId === userId)) {
+      return true
+    }
+  }
+  return false
+}
+
 export const emitToUser = (io, userId, event, data) => {
   const socketId = userSockets.get(userId)
   if (socketId) {
@@ -402,10 +601,30 @@ const isChannelAgeRestricted = (channelId) => {
 // Supports: @everyone, @here, @username, @username:host (federated)
 const parseMentions = (content) => {
   const mentions = { users: [], usernames: [], federated: [], everyone: false, here: false }
-  const mentionRegex = /@([a-zA-Z0-9_]+)/g
+  const mentionRegex = /@([a-zA-Z0-9_]+(?::[a-zA-Z0-9.-]+)?)/g
   let match
   let count = 0
   const maxMentions = 100
+
+  // Build username index ONCE before the loop instead of cloning all users per mention
+  let usersByUsername = null
+  const getUserIndex = () => {
+    if (usersByUsername) return usersByUsername
+    usersByUsername = new Map()
+    const allUsers = userService.getAllUsers() || {}
+    for (const user of Object.values(allUsers)) {
+      if (user.username) {
+        usersByUsername.set(user.username.toLowerCase(), user)
+      }
+      if (user.email) {
+        const emailPrefix = user.email.toLowerCase().split('@')[0]
+        if (emailPrefix && !usersByUsername.has(emailPrefix)) {
+          usersByUsername.set(emailPrefix, user)
+        }
+      }
+    }
+    return usersByUsername
+  }
 
   while ((match = mentionRegex.exec(content)) !== null) {
     if (++count > maxMentions) break
@@ -423,12 +642,10 @@ const parseMentions = (content) => {
         if (!mentions.federated.includes(federatedId)) {
           mentions.federated.push(federatedId)
         }
-        const users = Object.values(userService.getAllUsers() || {})
-        const mentionedUser = users.find(u =>
-          u.username?.toLowerCase() === user.toLowerCase() &&
-          (u.host === host || u.federatedHost === host)
-        )
-        if (mentionedUser) {
+        // Look up federated user via index, then check host
+        const index = getUserIndex()
+        const mentionedUser = index.get(user.toLowerCase())
+        if (mentionedUser && (mentionedUser.host === host || mentionedUser.federatedHost === host)) {
           if (!mentions.users.includes(mentionedUser.id)) {
             mentions.users.push(mentionedUser.id)
           }
@@ -439,11 +656,8 @@ const parseMentions = (content) => {
       }
     } else {
       // Local mention: @username
-      const users = Object.values(userService.getAllUsers() || {})
-      const mentionedUser = users.find(u => 
-        u.username?.toLowerCase() === nameLower || 
-        u.email?.toLowerCase().startsWith(nameLower)
-      )
+      const index = getUserIndex()
+      const mentionedUser = index.get(nameLower)
       if (mentionedUser) {
         if (!mentions.users.includes(mentionedUser.id)) {
           mentions.users.push(mentionedUser.id)
@@ -462,6 +676,7 @@ const parseMentions = (content) => {
 const sendMentionNotifications = (io, senderSocket, channelId, message, mentions) => {
   const serverId = senderSocket.currentServer
   const notifyPayloadBase = {
+    serverId,
     channelId,
     messageId: message.id,
     senderId: message.userId,
@@ -552,31 +767,49 @@ export const setupSocketHandlers = (io) => {
   startHeartbeatMonitor(io)
   startConsensusMonitor(io)
 
-  io.on('connection', (socket) => {
+  // Apply WebSocket security middleware (connection validation, rate limiting)
+  io.use((socket, next) => {
+    try {
+      wsSecurity.validateConnection(socket, next)
+    } catch (err) {
+      console.error('[Socket] WS security validation error:', err.message)
+      next() // Don't block on security errors
+    }
+  })
+
+  io.on('connection', async (socket) => {
+    socket.on('error', (err) => {
+      console.error('[Socket] Socket error:', err.message)
+    })
+
     // -------------------------------------------------------------------------
     // BOT connection path
     // -------------------------------------------------------------------------
     if (socket.botId) {
-      const bot = botService.getBot(socket.botId)
+      console.log('[Socket] Bot connecting, botId:', socket.botId)
+      const bot = await botService.getBot(socket.botId)
+      console.log('[Socket] Bot loaded from service:', bot ? bot.name : 'NOT FOUND', 'servers:', bot?.servers)
       if (!bot) {
         socket.disconnect(true)
         return
       }
 
-      botService.setBotStatus(bot.id, 'online')
+      const botServers = Array.isArray(bot.servers) ? bot.servers : []
+      console.log('[Socket] Bot servers array:', botServers)
+      await botService.setBotStatus(bot.id, 'online')
       botSockets.set(bot.id, socket.id)
 
       // Join bot's unique room for direct notifications
       socket.join(`bot:${bot.id}`)
 
-      for (const serverId of bot.servers) {
+      for (const serverId of botServers) {
         socket.join(`server:${serverId}`)
       }
 
       socket.emit('bot:ready', {
         botId:   bot.id,
         name:    bot.name,
-        servers: bot.servers
+        servers: botServers
       })
 
       // Broadcast the bot's online presence with any persisted customStatus
@@ -587,40 +820,46 @@ export const setupSocketHandlers = (io) => {
         isBot:        true
       })
 
-      console.log(`[Socket] Bot ready: ${bot.name} (${bot.id}), servers: ${bot.servers.length}`)
+      console.log(`[Socket] Bot ready: ${bot.name} (${bot.id}), servers: ${botServers.length}`)
 
       // Allow the bot to send messages via socket (used by Wire's REST fallback)
-      socket.on('bot:send-message', (data) => {
-        if (!botService.hasPermission(bot.id, 'messages:send')) return
-        const { channelId, content, embeds } = data
+      socket.on('bot:send-message', async (data) => {
+        try {
+          if (!await botService.hasPermission(bot.id, 'messages:send')) return
+          const { channelId, content, embeds, ui } = data
 
-        const channel = channelService.getChannel(channelId)
-        const serverId = channel?.serverId
-        if (serverId && !bot.servers.includes(serverId)) {
-          socket.emit('bot:error', { error: 'Bot not in this server' })
-          return
-        }
-
-        const cdnConfig = config.getCdnConfig()
-        const message = {
-          id: uuidv4(),
-          channelId,
-          userId: bot.id,
-          username: bot.name,
-          avatar: bot.avatar,
-          content: content || '',
-          embeds: embeds || [],
-          bot: true,
-          timestamp: new Date().toISOString(),
-          attachments: [],
-          storage: {
-            cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
-            storageNode: config.getHost(),
-            serverUrl: config.getServerUrl()
+          const channel = channelService.getChannel(channelId)
+          const serverId = channel?.serverId
+          if (serverId && !botServers.includes(serverId)) {
+            socket.emit('bot:error', { error: 'Bot not in this server' })
+            return
           }
+
+          const cdnConfig = config.getCdnConfig()
+          const message = {
+            id: uuidv4(),
+            channelId,
+            userId: bot.id,
+            username: bot.name,
+            avatar: bot.avatar,
+            content: content || '',
+            embeds: embeds || [],
+            ui: ui || null,
+            bot: true,
+            timestamp: new Date().toISOString(),
+            attachments: [],
+            storage: {
+              cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
+              storageNode: config.getHost(),
+              serverUrl: config.getServerUrl()
+            }
+          }
+          await addMessage(channelId, message)
+          io.to(`channel:${channelId}`).emit('message:new', message)
+        } catch (err) {
+          console.error('[Socket] bot:send-message failed:', err.message)
+          socket.emit('bot:error', { error: 'Failed to send message' })
         }
-        addMessage(channelId, message)
-        io.to(`channel:${channelId}`).emit('message:new', message)
       })
 
       // -----------------------------------------------------------------------
@@ -638,7 +877,7 @@ export const setupSocketHandlers = (io) => {
         
         const channel = channelService.getChannel(channelId)
         const serverId = channel?.serverId
-        if (serverId && !bot.servers.includes(serverId)) {
+        if (serverId && !botServers.includes(serverId)) {
           socket.emit('bot:error', { error: 'Bot not in this server' })
           return
         }
@@ -653,7 +892,7 @@ export const setupSocketHandlers = (io) => {
 
         const channel = channelService.getChannel(channelId)
         const serverId = channel?.serverId
-        if (serverId && !bot.servers.includes(serverId)) {
+        if (serverId && !botServers.includes(serverId)) {
           socket.emit('bot:error', { error: 'Bot not in this server' })
           return
         }
@@ -718,11 +957,15 @@ export const setupSocketHandlers = (io) => {
       })
 
       socket.on('voice:heartbeat', (data = {}) => {
-        const { channelId } = data
-        if (!channelId) return
-        const users = voiceChannelUsers.get(channelId)
-        if (users?.some(u => u.id === botUserId)) {
-          markVoiceHeartbeat(botUserId, channelId)
+        try {
+          const { channelId } = data
+          if (!channelId) return
+          const users = voiceChannelUsers.get(channelId)
+          if (users?.some(u => u.id === botUserId)) {
+            markVoiceHeartbeat(botUserId, channelId)
+          }
+        } catch (err) {
+          console.error('[Socket] Error in bot voice:heartbeat:', err.message)
         }
       })
 
@@ -731,7 +974,7 @@ export const setupSocketHandlers = (io) => {
 
         const channel = channelService.getChannel(channelId)
         const serverId = channel?.serverId
-        if (serverId && !bot.servers.includes(serverId)) {
+        if (serverId && !botServers.includes(serverId)) {
           socket.emit('bot:error', { error: 'Bot not in this server' })
           return
         }
@@ -749,7 +992,7 @@ export const setupSocketHandlers = (io) => {
         if (channelId) {
           const channel = channelService.getChannel(channelId)
           const serverId = channel?.serverId
-          if (serverId && !bot.servers.includes(serverId)) {
+          if (serverId && !botServers.includes(serverId)) {
             return
           }
         }
@@ -764,7 +1007,7 @@ export const setupSocketHandlers = (io) => {
         if (channelId) {
           const channel = channelService.getChannel(channelId)
           const serverId = channel?.serverId
-          if (serverId && !bot.servers.includes(serverId)) {
+          if (serverId && !botServers.includes(serverId)) {
             return
           }
         }
@@ -779,7 +1022,7 @@ export const setupSocketHandlers = (io) => {
         if (channelId) {
           const channel = channelService.getChannel(channelId)
           const serverId = channel?.serverId
-          if (serverId && !bot.servers.includes(serverId)) {
+          if (serverId && !botServers.includes(serverId)) {
             return
           }
         }
@@ -821,10 +1064,10 @@ export const setupSocketHandlers = (io) => {
 
       // Wire can emit this to update status + customStatus instantly via the
       // already-open WebSocket without a REST round-trip.
-      socket.on('bot:status-change', (data = {}) => {
+      socket.on('bot:status-change', async (data = {}) => {
         const { status, customStatus } = data
         const newStatus = status || 'online'
-        botService.setBotStatus(bot.id, newStatus, customStatus)
+        await botService.setBotStatus(bot.id, newStatus, customStatus)
         io.emit('user:status', {
           userId:       bot.id,
           status:       newStatus,
@@ -833,34 +1076,37 @@ export const setupSocketHandlers = (io) => {
         })
       })
 
+      
+
       // Listen for bot removal from servers - immediately disconnect from that server
-      socket.on('bot:remove-from-server', (data) => {
+      socket.on('bot:remove-from-server', async (data) => {
         const { serverId } = data
         if (!serverId) return
         
         // Reload bot data to get fresh server list
-        const freshBot = botService.getBot(bot.id)
+        const freshBot = await botService.getBot(bot.id)
         if (!freshBot) {
           socket.disconnect(true)
           return
         }
 
         // If bot was removed from server, make them leave the server room
-        if (!freshBot.servers.includes(serverId)) {
+        const freshBotServers = Array.isArray(freshBot.servers) ? freshBot.servers : []
+        if (!freshBotServers.includes(serverId)) {
           socket.leave(`server:${serverId}`)
           console.log(`[Socket] Bot ${bot.name} removed from server ${serverId}, left server room`)
         }
 
         // If bot is not in any servers, disconnect them entirely
-        if (freshBot.servers.length === 0) {
+        if (freshBotServers.length === 0) {
           console.log(`[Socket] Bot ${bot.name} not in any servers, disconnecting`)
           socket.emit('bot:kicked', { reason: 'Removed from all servers' })
           socket.disconnect(true)
         }
       })
 
-      socket.on('disconnect', () => {
-        botService.setBotStatus(bot.id, 'offline')
+      socket.on('disconnect', async () => {
+        await botService.setBotStatus(bot.id, 'offline')
         botSockets.delete(bot.id)
         // Clean up voice presence if the bot was in a channel
         if (socket.currentVoiceChannel) {
@@ -887,7 +1133,12 @@ export const setupSocketHandlers = (io) => {
     // USER connection path
     // -------------------------------------------------------------------------
     const userId = socket.user.id
-     console.log(`User connected: ${userId}`)
+    console.log(`User connected: ${userId}`)
+
+    cancelPendingVoiceDisconnect(userId)
+
+    wsManager.addConnection(socket)
+    messageBus.publishSessionEvent('connect', userId, socket.id)
 
     // Join user's personal room for mentions/notifications
     socket.join(`user:${userId}`)
@@ -937,109 +1188,378 @@ export const setupSocketHandlers = (io) => {
       customStatus: persistedCustomStatus
     })
 
+    const localUserPayload = buildFederatedUserPayload(socket.user, {
+      ...persistedUser,
+      status: persistedStatus,
+      customStatus: persistedCustomStatus
+    })
+    relayEventToConnectedPeers('user:upsert', localUserPayload)
+    relayEventToConnectedPeers('user:presence', { user: localUserPayload })
+
     socket.on('server:join', (serverId) => {
-      socket.join(`server:${serverId}`)
-      socket.currentServer = serverId
+      try {
+        socket.join(`server:${serverId}`)
+        socket.currentServer = serverId
+      } catch (err) {
+        console.error('[Socket] Error in server:join:', err.message)
+      }
     })
 
     socket.on('channel:join', (channelId) => {
-      if (socket.currentChannel) {
-        socket.leave(`channel:${socket.currentChannel}`)
+      try {
+        if (socket.currentChannel) {
+          socket.leave(`channel:${socket.currentChannel}`)
+        }
+        socket.join(`channel:${channelId}`)
+        socket.currentChannel = channelId
+      } catch (err) {
+        console.error('[Socket] Error in channel:join:', err.message)
       }
-      socket.join(`channel:${channelId}`)
-      socket.currentChannel = channelId
     })
 
-    socket.on('message:send', (data) => {
-      if (isChannelAgeRestricted(data.channelId) && !userService.isAgeVerified(userId)) {
-        socket.emit('message:error', { channelId: data.channelId, code: 'AGE_VERIFICATION_REQUIRED', error: 'Age verification required for this channel' })
-        return
-      }
-
-      const channel = findChannelById(data.channelId)
-      const slowMode = channel?.slowMode || 0
-      
-      if (slowMode > 0) {
-        const key = `${userId}:${data.channelId}`
-        const lastMessageTime = messageTimestamps.get(key) || 0
-        const now = Date.now()
-        const timeSinceLastMessage = now - lastMessageTime
-        
-        if (timeSinceLastMessage < slowMode * 1000) {
-          const remainingTime = Math.ceil((slowMode * 1000 - timeSinceLastMessage) / 1000)
-          socket.emit('message:error', { 
-            channelId: data.channelId, 
-            code: 'SLOWMODE', 
-            error: `Slowmode is active. You can send another message in ${remainingTime} seconds.` 
-          })
+    socket.on('activity:get-sessions', ({ contextType = 'voice', contextId } = {}) => {
+      try {
+        if (!contextId) {
+          socket.emit('activity:error', { error: 'Missing activity context' })
           return
         }
-        
-        messageTimestamps.set(key, now)
+
+        socket.emit('activity:sessions', {
+          contextType,
+          contextId,
+          sessions: getSerializedActivitySessionsForContext(contextType, contextId)
+        })
+      } catch (err) {
+        console.error('[Socket] Error in activity:get-sessions:', err.message)
+        socket.emit('activity:error', { error: 'Internal error' })
       }
+    })
 
-      // Parse mentions from content
-      const mentions = parseMentions(data.content)
+    socket.on('activity:create-session', (data = {}) => {
+      try {
+        const { contextType = 'voice', contextId, activityId, activityDefinition = null, p2p, sound } = data
+        if (!contextId || !activityId) {
+          socket.emit('activity:error', { error: 'Missing activity id or context' })
+          return
+        }
 
-      // Build CDN/storage metadata for the message
-      const cdnConfig = config.getCdnConfig()
-      const storageInfo = {
-        cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
-        storageNode: config.getHost(),
-        serverUrl: config.getServerUrl()
-      }
-
-      const message = {
-        id: uuidv4(),
-        channelId: data.channelId,
-        userId: userId,
-        username: socket.user.username || socket.user.email,
-        avatar: socket.user.avatar,
-        content: data.content,
-        mentions: mentions,
-        timestamp: new Date().toISOString(),
-        attachments: data.attachments || [],
-        replyTo: typeof data.replyTo === 'string' ? data.replyTo : null,
-        storage:         storageInfo,
-        encrypted: data.encrypted || false,
-        iv: data.iv || null,
-        epoch: data.epoch || null
-      }
-
-      // Convert local emoji references to global format for cross-server compatibility
-      const channelServerId = channel?.serverId
-      if (channelServerId) {
-        message.content = convertEmojiFormat(data.content, channelServerId)
-      }
-
-      addMessage(data.channelId, message)
-      io.to(`channel:${data.channelId}`).emit('message:new', message)
-
-      // Send notifications for mentions
-      sendMentionNotifications(io, socket, data.channelId, message, mentions)
-
-      // Only deliver message to bots that are in THIS specific server
-      if (channelServerId) {
-        for (const [botId, botSocketId] of botSockets.entries()) {
-          const botSocket = io.sockets.sockets.get(botSocketId)
-          if (!botSocket) continue
-          const bot = botService.getBot(botId)
-          if (!bot) continue
-          
-          // ONLY deliver if bot is actually in this server
-          if (bot.servers.includes(channelServerId)) {
-            botSocket.emit('message:new', {
-              ...message,
-              serverId: channelServerId
-            })
-            // Also deliver via webhook if configured
-            botService.deliverWebhookEvent(botId, 'MESSAGE_CREATE', {
-              message,
-              serverId: channelServerId,
-              channelId: data.channelId
-            })
+        const sessionId = uuidv4()
+        const activityName = activityDefinition?.name || String(activityId).replace(/^builtin:/, '').replace(/[-_]/g, ' ') || 'Activity'
+        const now = new Date().toISOString()
+        const session = {
+          id: sessionId,
+          activityId,
+          activityName,
+          contextType,
+          contextId,
+          ownerId: userId,
+          createdAt: now,
+          updatedAt: now,
+          state: {},
+          p2p: {
+            enabled: p2p?.enabled !== false,
+            preferred: p2p?.preferred !== false
+          },
+          sound: {
+            enabled: sound?.enabled !== false,
+            volume: Number(sound?.volume ?? 0.8)
           }
         }
+
+        activitySessions.set(sessionId, session)
+        ensureActivityContextSet(contextType, contextId).add(sessionId)
+        ensureActivityParticipants(sessionId).set(userId, {
+          userId,
+          username: socket.user.username || socket.user.email,
+          avatar: socket.user.avatar,
+          joinedAt: now,
+          peerId: null
+        })
+
+        socket.join(`activity:${sessionId}`)
+        const serialized = serializeActivitySession(sessionId)
+        emitActivityContext(io, contextType, contextId, 'activity:session-created', {
+          contextType,
+          contextId,
+          session: serialized
+        })
+        emitActivitySessionsForContext(io, contextType, contextId)
+      } catch (err) {
+        console.error('[Socket] Error in activity:create-session:', err.message)
+        socket.emit('activity:error', { error: 'Internal error' })
+      }
+    })
+
+    socket.on('activity:join-session', ({ sessionId } = {}) => {
+      try {
+        const session = sessionId ? activitySessions.get(sessionId) : null
+        if (!session) {
+          socket.emit('activity:error', { error: 'Activity session not found' })
+          return
+        }
+
+        const participants = ensureActivityParticipants(sessionId)
+        const existing = participants.get(userId)
+        participants.set(userId, {
+          userId,
+          username: socket.user.username || socket.user.email,
+          avatar: socket.user.avatar,
+          joinedAt: existing?.joinedAt || new Date().toISOString(),
+          peerId: existing?.peerId || null
+        })
+        session.updatedAt = new Date().toISOString()
+        socket.join(`activity:${sessionId}`)
+
+        socket.emit('activity:state-updated', {
+          sessionId,
+          contextType: session.contextType,
+          contextId: session.contextId,
+          updatedBy: session.ownerId,
+          state: session.state || {}
+        })
+
+        emitActivitySessionsForContext(io, session.contextType, session.contextId)
+      } catch (err) {
+        console.error('[Socket] Error in activity:join-session:', err.message)
+        socket.emit('activity:error', { error: 'Internal error' })
+      }
+    })
+
+    socket.on('activity:leave-session', ({ sessionId } = {}) => {
+      try {
+        const session = sessionId ? activitySessions.get(sessionId) : null
+        if (!session) return
+
+        const participants = ensureActivityParticipants(sessionId)
+        participants.delete(userId)
+        const peerIndex = ensureActivityPeerIndex(sessionId)
+        for (const [peerId, targetUserId] of peerIndex.entries()) {
+          if (targetUserId === userId) {
+            peerIndex.delete(peerId)
+          }
+        }
+
+        socket.leave(`activity:${sessionId}`)
+
+        if (participants.size === 0) {
+          const removedSession = removeActivitySession(sessionId)
+          if (removedSession) {
+            emitActivityContext(io, removedSession.contextType, removedSession.contextId, 'activity:session-ended', {
+              sessionId,
+              contextType: removedSession.contextType,
+              contextId: removedSession.contextId,
+              reason: 'empty'
+            })
+            emitActivitySessionsForContext(io, removedSession.contextType, removedSession.contextId)
+          }
+          return
+        }
+
+        session.updatedAt = new Date().toISOString()
+        emitActivitySessionsForContext(io, session.contextType, session.contextId)
+      } catch (err) {
+        console.error('[Socket] Error in activity:leave-session:', err.message)
+      }
+    })
+
+    socket.on('activity:update-state', ({ sessionId, patch } = {}) => {
+      try {
+        const session = sessionId ? activitySessions.get(sessionId) : null
+        if (!session) {
+          socket.emit('activity:error', { error: 'Activity session not found' })
+          return
+        }
+
+        const participants = ensureActivityParticipants(sessionId)
+        if (!participants.has(userId)) {
+          socket.emit('activity:error', { error: 'You are not in this activity session' })
+          return
+        }
+
+        session.state = {
+          ...(session.state || {}),
+          ...(patch && typeof patch === 'object' ? patch : {})
+        }
+        session.updatedAt = new Date().toISOString()
+
+        io.to(`activity:${sessionId}`).emit('activity:state-updated', {
+          sessionId,
+          contextType: session.contextType,
+          contextId: session.contextId,
+          updatedBy: userId,
+          state: session.state
+        })
+      } catch (err) {
+        console.error('[Socket] Error in activity:update-state:', err.message)
+        socket.emit('activity:error', { error: 'Internal error' })
+      }
+    })
+
+    socket.on('activity:p2p-announce', ({ sessionId, peerId } = {}) => {
+      try {
+        const session = sessionId ? activitySessions.get(sessionId) : null
+        if (!session || !peerId) return
+        const participants = ensureActivityParticipants(sessionId)
+        const participant = participants.get(userId)
+        if (!participant) return
+
+        participant.peerId = peerId
+        participants.set(userId, participant)
+        ensureActivityPeerIndex(sessionId).set(peerId, userId)
+
+        const peers = Array.from(participants.values())
+          .filter((entry) => entry.peerId && entry.userId !== userId)
+          .map((entry) => ({
+            userId: entry.userId,
+            peerId: entry.peerId,
+            username: entry.username,
+            avatar: entry.avatar
+          }))
+
+        socket.emit('activity:p2p-peers', { sessionId, peers })
+        socket.to(`activity:${sessionId}`).emit('activity:p2p-peers', {
+          sessionId,
+          peers: [{
+            userId,
+            peerId,
+            username: participant.username,
+            avatar: participant.avatar
+          }]
+        })
+        emitActivitySessionsForContext(io, session.contextType, session.contextId)
+      } catch (err) {
+        console.error('[Socket] Error in activity:p2p-announce:', err.message)
+      }
+    })
+
+    socket.on('activity:p2p-signal', ({ sessionId, toPeerId, fromPeerId, signal } = {}) => {
+      try {
+        const session = sessionId ? activitySessions.get(sessionId) : null
+        if (!session || !toPeerId) return
+        const targetUserId = ensureActivityPeerIndex(sessionId).get(toPeerId)
+        if (!targetUserId) return
+        emitToUser(io, targetUserId, 'activity:p2p-signal', {
+          sessionId,
+          fromPeerId,
+          signal
+        })
+      } catch (err) {
+        console.error('[Socket] Error in activity:p2p-signal:', err.message)
+      }
+    })
+
+    socket.on('activity:p2p-leave', ({ sessionId, peerId } = {}) => {
+      try {
+        const session = sessionId ? activitySessions.get(sessionId) : null
+        if (!session || !peerId) return
+        const participants = ensureActivityParticipants(sessionId)
+        const participant = participants.get(userId)
+        if (participant) {
+          participant.peerId = null
+          participants.set(userId, participant)
+        }
+        ensureActivityPeerIndex(sessionId).delete(peerId)
+        emitActivitySessionsForContext(io, session.contextType, session.contextId)
+      } catch (err) {
+        console.error('[Socket] Error in activity:p2p-leave:', err.message)
+      }
+    })
+
+    socket.on('message:send', async (data) => {
+      try {
+        const profile = userService.getUser(userId)
+        const adultAccess = normalizeAgeVerification(profile?.ageVerification, profile || {}).adultAccess
+        if (isChannelAgeRestricted(data.channelId) && !adultAccess) {
+          socket.emit('message:error', { channelId: data.channelId, code: 'AGE_VERIFICATION_REQUIRED', error: 'Age verification required for this channel' })
+          return
+        }
+
+        const channel = findChannelById(data.channelId)
+        const slowMode = channel?.slowMode || 0
+        
+        if (slowMode > 0) {
+          const key = `${userId}:${data.channelId}`
+          const lastMessageTime = messageTimestamps.get(key) || 0
+          const now = Date.now()
+          const timeSinceLastMessage = now - lastMessageTime
+          
+          if (timeSinceLastMessage < slowMode * 1000) {
+            const remainingTime = Math.ceil((slowMode * 1000 - timeSinceLastMessage) / 1000)
+            socket.emit('message:error', { 
+              channelId: data.channelId, 
+              code: 'SLOWMODE', 
+              error: `Slowmode is active. You can send another message in ${remainingTime} seconds.` 
+            })
+            return
+          }
+          
+          messageTimestamps.set(key, now)
+        }
+
+        const mentions = parseMentions(data.content)
+        const cdnConfig = config.getCdnConfig()
+        const storageInfo = {
+          cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
+          storageNode: config.getHost(),
+          serverUrl: config.getServerUrl()
+        }
+
+        const message = {
+          id: uuidv4(),
+          channelId: data.channelId,
+          userId: userId,
+          username: socket.user.username || socket.user.email,
+          avatar: socket.user.avatar,
+          content: data.content,
+          mentions: mentions,
+          timestamp: new Date().toISOString(),
+          attachments: data.attachments || [],
+          replyTo: typeof data.replyTo === 'string' ? data.replyTo : null,
+          storage: storageInfo,
+          encrypted: data.encrypted || false,
+          iv: data.iv || null,
+          epoch: data.epoch || null
+        }
+
+        const channelServerId = channel?.serverId
+        if (channelServerId) {
+          message.content = convertEmojiFormat(data.content, channelServerId)
+        }
+
+        void addMessage(data.channelId, message).catch(err => {
+          console.error('[Socket] Failed to persist message:', err.message)
+        })
+        io.to(`channel:${data.channelId}`).emit('message:new', message)
+
+        sendMentionNotifications(io, socket, data.channelId, message, mentions)
+
+        if (channelServerId) {
+          for (const [botId, botSocketId] of botSockets.entries()) {
+            const botSocket = io.sockets.sockets.get(botSocketId)
+            if (!botSocket) continue
+            const bot = await botService.getBot(botId)
+            if (!bot) continue
+            
+            if (Array.isArray(bot.servers) && bot.servers.includes(channelServerId)) {
+              botSocket.emit('message:new', {
+                ...message,
+                serverId: channelServerId
+              })
+              botService.deliverWebhookEvent(botId, 'MESSAGE_CREATE', {
+                message,
+                serverId: channelServerId,
+                channelId: data.channelId
+              })
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[Socket] message:send failed:', err.message)
+        socket.emit('message:error', {
+          channelId: data?.channelId,
+          code: 'SEND_FAILED',
+          error: 'Failed to send message'
+        })
       }
     })
 
@@ -1057,8 +1577,114 @@ export const setupSocketHandlers = (io) => {
         socket.emit('voice:participants', { channelId, participants, iceServers: getIceServers() })
       })
 
+    // Handle UI component interactions (buttons, inputs, selects, canvas)
+    socket.on('ui:buttonClick', async (data) => {
+        const { messageId, channelId, componentId, componentType, action, label, value } = data
+        // Relay to all bots in the channel's server
+        const channel = channelService.getChannel(channelId)
+
+        console.log(channelId);
+        const serverId = channel?.serverId
+        if (!serverId) return
+
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (!botSocket) continue
+          const bot = await botService.getBot(botId)
+          if (!bot || !bot.servers.includes(serverId)) continue
+
+          botSocket.emit('ui:buttonClick', {
+            messageId,
+            channelId,
+            componentId,
+            componentType,
+            action,
+            label,
+            value,
+            userId
+          })
+        }
+      })
+
+      socket.on('ui:inputSubmit', async (data) => {
+        const { messageId, channelId, componentId, componentType, action, value } = data
+        const channel = channelService.getChannel(channelId)
+        console.log('[BotUI] inputSubmit channelId:', channelId, 'channel:', channel)
+        const serverId = channel?.serverId
+        if (!serverId) return
+
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (!botSocket) continue
+          const bot = await botService.getBot(botId)
+          if (!bot || !bot.servers.includes(serverId)) continue
+
+          botSocket.emit('ui:inputSubmit', {
+            messageId,
+            channelId,
+            componentId,
+            componentType,
+            action,
+            value,
+            userId
+          })
+        }
+      })
+
+      socket.on('ui:selectChange', async (data) => {
+        const { messageId, channelId, componentId, componentType, action, value } = data
+        const channel = channelService.getChannel(channelId)
+        console.log('[BotUI] selectChange channelId:', channelId, 'channel:', channel)
+        const serverId = channel?.serverId
+        if (!serverId) return
+
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (!botSocket) continue
+          const bot = await botService.getBot(botId)
+          if (!bot || !bot.servers.includes(serverId)) continue
+
+          botSocket.emit('ui:selectChange', {
+            messageId,
+            channelId,
+            componentId,
+            componentType,
+            action,
+            value,
+            userId
+          })
+        }
+      })
+
+      socket.on('ui:canvasClick', async (data) => {
+        const { messageId, channelId, componentId, componentType, action, x, y } = data
+        const channel = channelService.getChannel(channelId)
+        console.log('[BotUI] canvasClick channelId:', channelId, 'channel:', channel, 'x:', x, 'y:', y)
+        const serverId = channel?.serverId
+        if (!serverId) return
+
+        for (const [botId, botSocketId] of botSockets.entries()) {
+          const botSocket = io.sockets.sockets.get(botSocketId)
+          if (!botSocket) continue
+          const bot = await botService.getBot(botId)
+          if (!bot || !bot.servers.includes(serverId)) continue
+
+          botSocket.emit('ui:canvasClick', {
+            messageId,
+            channelId,
+            componentId,
+            componentType,
+            action,
+            x,
+            y,
+            userId
+          })
+        }
+      })
+
     socket.on('voice:join', (data) => {
       const { channelId, peerId } = data
+      cancelPendingVoiceDisconnect(userId)
       
       console.log(`[Voice] User ${userId} joining channel ${channelId}`)
       
@@ -1265,21 +1891,26 @@ export const setupSocketHandlers = (io) => {
       }
     })
 
-    socket.on('status:change', (data) => {
+    socket.on('status:change', async (data) => {
       const { status, customStatus } = typeof data === 'string' ? { status: data } : data
       const user = onlineUsers.get(userId)
       if (user) {
-        user.status = status
+        // Never allow setting status to 'offline' via socket - use disconnect for that
+        const safeStatus = (!status || status === 'offline') ? 'online' : status
+        user.status = safeStatus
         if (customStatus !== undefined) user.customStatus = customStatus
-        userService.setStatus(userId, status, customStatus)
-        io.emit('user:status', { userId, status, customStatus })
+        const updatedProfile = await userService.setStatus(userId, safeStatus, customStatus)
+        io.emit('user:status', { userId, status: safeStatus, customStatus })
+        const localUserPayload = buildFederatedUserPayload(socket.user, updatedProfile)
+        relayEventToConnectedPeers('user:upsert', localUserPayload)
+        relayEventToConnectedPeers('user:presence', { user: localUserPayload })
       }
     })
 
     // Message editing via socket
-    socket.on('message:edit', (data) => {
+    socket.on('message:edit', async (data) => {
       const { messageId, channelId, content } = data
-      const updated = editMessage(channelId, messageId, userId, content)
+      const updated = await editMessage(channelId, messageId, userId, content)
       if (updated) {
         io.to(`channel:${channelId}`).emit('message:edited', updated)
         
@@ -1290,7 +1921,7 @@ export const setupSocketHandlers = (io) => {
           for (const [botId, botSocketId] of botSockets.entries()) {
             const botSocket = io.sockets.sockets.get(botSocketId)
             if (!botSocket) continue
-            const bot = botService.getBot(botId)
+            const bot = await botService.getBot(botId)
             if (bot?.servers.includes(channelServerId)) {
               botSocket.emit('message:edited', updated)
             }
@@ -1300,11 +1931,15 @@ export const setupSocketHandlers = (io) => {
     })
 
     // Message deletion via socket
-    socket.on('message:delete', (data) => {
+    socket.on('message:delete', async (data) => {
       const { messageId, channelId } = data
-      const result = deleteMessage(channelId, messageId, userId)
+      const result = await deleteMessage(channelId, messageId, userId)
       if (result.success) {
-        io.to(`channel:${channelId}`).emit('message:deleted', { messageId, channelId })
+        io.to(`channel:${channelId}`).emit('message:deleted', {
+          messageId,
+          channelId,
+          message: result.message
+        })
         
         // Only deliver to bots in THIS server
         const channel = channelService.getChannel(channelId)
@@ -1313,12 +1948,72 @@ export const setupSocketHandlers = (io) => {
           for (const [botId, botSocketId] of botSockets.entries()) {
             const botSocket = io.sockets.sockets.get(botSocketId)
             if (!botSocket) continue
-            const bot = botService.getBot(botId)
+            const bot = await botService.getBot(botId)
             if (bot?.servers.includes(channelServerId)) {
-              botSocket.emit('message:deleted', { messageId, channelId })
+              botSocket.emit('message:deleted', {
+                messageId,
+                channelId,
+                message: result.message
+              })
             }
           }
         }
+      }
+    })
+
+    // Bulk message deletion via socket (requires manage_messages or admin)
+    socket.on('messages:bulk-delete', async (data) => {
+      try {
+        const { channelId, messageIds } = data || {}
+        if (!channelId || !Array.isArray(messageIds) || messageIds.length === 0) {
+          socket.emit('messages:bulk-delete-error', { error: 'channelId and messageIds array required' })
+          return
+        }
+        if (messageIds.length > 100) {
+          socket.emit('messages:bulk-delete-error', { error: 'Cannot bulk delete more than 100 messages at once' })
+          return
+        }
+
+        const result = await bulkDeleteMessages(channelId, messageIds, userId)
+        if (!result.success) {
+          socket.emit('messages:bulk-delete-error', { error: result.error })
+          return
+        }
+
+        if (result.deleted.length > 0) {
+          io.to(`channel:${channelId}`).emit('messages:bulk-deleted', {
+            channelId,
+            messageIds: result.deleted,
+            deletedBy: userId
+          })
+
+          // Notify bots in this server
+          const channel = channelService.getChannel(channelId)
+          const channelServerId = channel?.serverId
+          if (channelServerId) {
+            for (const [botId, botSocketId] of botSockets.entries()) {
+              const botSocket = io.sockets.sockets.get(botSocketId)
+              if (!botSocket) continue
+              const bot = await botService.getBot(botId)
+              if (bot?.servers.includes(channelServerId)) {
+                botSocket.emit('messages:bulk-deleted', {
+                  channelId,
+                  messageIds: result.deleted,
+                  deletedBy: userId
+                })
+              }
+            }
+          }
+        }
+
+        socket.emit('messages:bulk-delete-result', {
+          channelId,
+          deleted: result.deleted,
+          errors: result.errors
+        })
+      } catch (err) {
+        console.error('[Socket] messages:bulk-delete failed:', err.message)
+        socket.emit('messages:bulk-delete-error', { error: 'Failed to bulk delete messages' })
       }
     })
 
@@ -1331,53 +2026,69 @@ export const setupSocketHandlers = (io) => {
       socket.currentDM = conversationId
     })
 
-    socket.on('dm:send', (data) => {
-      const { conversationId, content, recipientId } = data
-      const conversation = dmService.getConversationForUser(userId, conversationId)
-      if (!conversation) return
+    socket.on('dm:send', async (data) => {
+      try {
+        const { conversationId, content, recipientId } = data
+        const conversation = dmService.getConversationForUser(userId, conversationId)
+        if (!conversation) return
 
-      const cdnConfig = config.getCdnConfig()
-      const storageInfo = {
-        cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
-        storageNode: config.getHost(),
-        serverUrl: config.getServerUrl()
-      }
+        const cdnConfig = config.getCdnConfig()
+        const storageInfo = {
+          cdn: cdnConfig?.enabled ? cdnConfig.provider : 'local',
+          storageNode: config.getHost(),
+          serverUrl: config.getServerUrl()
+        }
 
-      const message = {
-        id: uuidv4(),
-        conversationId,
-        userId: userId,
-        username: socket.user.username || socket.user.email,
-        avatar: socket.user.avatar,
-        content,
-        timestamp: new Date().toISOString(),
-        attachments: data.attachments || [],
-        replyTo: buildDMReplyReference(conversationId, data.replyTo),
-        storage: storageInfo,
-        encrypted: data.encrypted || false,
-        iv: data.iv || null,
-        epoch: data.epoch || null
-      }
-
-      dmMessageService.addMessage(conversationId, message)
-      dmService.updateLastMessage(conversationId, userId, recipientId)
-      
-      io.to(`dm:${conversationId}`).emit('dm:new', message)
-
-      const participantIds = Array.isArray(conversation.participants)
-        ? conversation.participants.filter(id => id !== userId)
-        : (recipientId ? [recipientId] : [])
-      participantIds.forEach(targetId => {
-        emitToAllUserDevices(io, targetId, 'dm:notification', {
+        const message = {
+          id: uuidv4(),
           conversationId,
-          message,
-          from: {
-            id: userId,
-            username: socket.user.username,
-            avatar: socket.user.avatar
+          userId: userId,
+          username: socket.user.username || socket.user.email,
+          avatar: socket.user.avatar,
+          content,
+          timestamp: new Date().toISOString(),
+          attachments: data.attachments || [],
+          replyTo: buildDMReplyReference(conversationId, data.replyTo),
+          storage: storageInfo,
+          encrypted: data.encrypted || false,
+          iv: data.iv || null,
+          epoch: data.epoch || null
+        }
+
+        await dmMessageService.addMessage(conversationId, message)
+        await dmService.updateLastMessage(conversationId, userId, recipientId)
+        
+        io.to(`dm:${conversationId}`).emit('dm:new', message)
+
+        const participantIds = Array.isArray(conversation.participants)
+          ? conversation.participants.filter(id => id !== userId)
+          : (recipientId ? [recipientId] : [])
+        participantIds.forEach(targetId => {
+          emitToAllUserDevices(io, targetId, 'dm:notification', {
+            conversationId,
+            message,
+            from: {
+              id: userId,
+              username: socket.user.username,
+              avatar: socket.user.avatar
+            }
+          })
+
+          const targetProfile = userService.getUser(targetId)
+          const targetHost = normalizeHost(targetProfile?.host)
+          const localHost = normalizeHost(config.getHost())
+          if (targetHost && targetHost !== localHost) {
+            relayEventToPeerHost(targetHost, 'dm:message', {
+              toUserId: targetProfile?.remoteUserId || extractRemoteOriginId(targetId),
+              from: buildFederatedUserPayload(socket.user, userService.getUser(userId)),
+              message
+            })
           }
         })
-      })
+      } catch (err) {
+        console.error('[Socket] dm:send failed:', err.message)
+        socket.emit('dm:error', { conversationId: data?.conversationId, error: 'Failed to send message' })
+      }
     })
 
     socket.on('dm:typing', (data) => {
@@ -1428,7 +2139,7 @@ export const setupSocketHandlers = (io) => {
     }
 
     // Helper: end active call and notify both parties
-    const endActiveCall = (io, callId, endedBy, reason = 'ended') => {
+    const endActiveCall = async (io, callId, endedBy, reason = 'ended') => {
       const call = activeDMCalls.get(callId)
       if (!call) return null
 
@@ -1505,8 +2216,8 @@ export const setupSocketHandlers = (io) => {
       }
 
       // Save call message to DM messages
-      dmMessageService.addMessage(call.conversationId, callMessage)
-      dmService.updateLastMessage(call.conversationId, call.callerId, primaryRecipientId)
+      await dmMessageService.addMessage(call.conversationId, callMessage)
+      await dmService.updateLastMessage(call.conversationId, call.callerId, primaryRecipientId)
 
       // Broadcast call message to DM room
       io.to(`dm:${call.conversationId}`).emit('dm:new', callMessage)
@@ -1670,12 +2381,12 @@ export const setupSocketHandlers = (io) => {
       console.log(`[Call] ${userId} -> [${recipients.join(',')}]: ${type} call initiated (${callId})`)
 
       // Set timeout for missed call
-      setTimeout(() => {
+      setTimeout(async () => {
         const call = activeDMCalls.get(callId)
         if (call && call.status === 'ringing') {
           // Call still ringing after timeout = missed
           recipients.forEach(rid => cleanupPendingCall(rid, callId))
-          endActiveCall(io, callId, recipients[0], 'missed')
+          await endActiveCall(io, callId, recipients[0], 'missed')
           
           // Notify caller of missed call
           emitToAllUserDevices(io, userId, 'call:missed', {
@@ -1750,7 +2461,7 @@ export const setupSocketHandlers = (io) => {
     })
 
     // Decline incoming call
-    socket.on('call:decline', (data) => {
+    socket.on('call:decline', async (data) => {
       const { callId } = data
       const call = activeDMCalls.get(callId)
 
@@ -1766,13 +2477,13 @@ export const setupSocketHandlers = (io) => {
       }
 
       recipients.forEach(rid => cleanupPendingCall(rid, callId))
-      endActiveCall(io, callId, userId, 'declined')
+      await endActiveCall(io, callId, userId, 'declined')
 
       console.log(`[Call] ${callId} declined by ${userId}`)
     })
 
     // End active call
-    socket.on('call:end', (data) => {
+    socket.on('call:end', async (data) => {
       const { callId } = data
       const call = activeDMCalls.get(callId)
 
@@ -1793,13 +2504,13 @@ export const setupSocketHandlers = (io) => {
 
       const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
       recipients.forEach(rid => cleanupPendingCall(rid, callId))
-      endActiveCall(io, callId, userId, 'ended')
+      await endActiveCall(io, callId, userId, 'ended')
 
       console.log(`[Call] ${callId} ended by ${userId}`)
     })
 
     // Cancel outgoing call (caller hangs up before answer)
-    socket.on('call:cancel', (data) => {
+    socket.on('call:cancel', async (data) => {
       const { callId } = data
       const call = activeDMCalls.get(callId)
 
@@ -1815,7 +2526,7 @@ export const setupSocketHandlers = (io) => {
 
       const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
       recipients.forEach(rid => cleanupPendingCall(rid, callId))
-      endActiveCall(io, callId, userId, 'cancelled')
+      await endActiveCall(io, callId, userId, 'cancelled')
 
       console.log(`[Call] ${callId} cancelled by caller ${userId}`)
     })
@@ -1913,7 +2624,7 @@ export const setupSocketHandlers = (io) => {
     })
 
     // Clean up calls on disconnect
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
       // End any active calls this user is in
       for (const [callId, call] of activeDMCalls.entries()) {
         if (getCallParticipants(call).includes(userId)) {
@@ -1922,7 +2633,7 @@ export const setupSocketHandlers = (io) => {
           }
           const recipients = Array.isArray(call.recipientIds) ? call.recipientIds : [call.recipientId]
           recipients.forEach(rid => cleanupPendingCall(rid, callId))
-          endActiveCall(io, callId, userId, 'disconnected')
+          await endActiveCall(io, callId, userId, 'disconnected')
         }
       }
 
@@ -1931,9 +2642,9 @@ export const setupSocketHandlers = (io) => {
     })
 
     // Reaction handlers
-    socket.on('reaction:add', (data) => {
+    socket.on('reaction:add', async (data) => {
       const { messageId, emoji, channelId } = data
-      const reactions = reactionService.addReaction(messageId, userId, emoji)
+      const reactions = await reactionService.addReaction(messageId, userId, emoji)
       const reactionPayload = { messageId, reactions, action: 'add', userId, emoji }
       io.to(`channel:${channelId}`).emit('reaction:updated', reactionPayload)
       
@@ -1944,7 +2655,7 @@ export const setupSocketHandlers = (io) => {
         for (const [botId, botSocketId] of botSockets.entries()) {
           const botSocket = io.sockets.sockets.get(botSocketId)
           if (!botSocket) continue
-          const bot = botService.getBot(botId)
+          const bot = await botService.getBot(botId)
           if (bot?.servers.includes(channelServerId)) {
             botSocket.emit('reaction:updated', reactionPayload)
           }
@@ -1952,9 +2663,9 @@ export const setupSocketHandlers = (io) => {
       }
     })
 
-    socket.on('reaction:remove', (data) => {
+    socket.on('reaction:remove', async (data) => {
       const { messageId, emoji, channelId } = data
-      const reactions = reactionService.removeReaction(messageId, userId, emoji)
+      const reactions = await reactionService.removeReaction(messageId, userId, emoji)
       const reactionPayload = { messageId, reactions, action: 'remove', userId, emoji }
       io.to(`channel:${channelId}`).emit('reaction:updated', reactionPayload)
       
@@ -1965,7 +2676,7 @@ export const setupSocketHandlers = (io) => {
         for (const [botId, botSocketId] of botSockets.entries()) {
           const botSocket = io.sockets.sockets.get(botSocketId)
           if (!botSocket) continue
-          const bot = botService.getBot(botId)
+          const bot = await botService.getBot(botId)
           if (bot?.servers.includes(channelServerId)) {
             botSocket.emit('reaction:updated', reactionPayload)
           }
@@ -2196,13 +2907,43 @@ export const setupSocketHandlers = (io) => {
     socket.on('disconnect', (reason) => {
       console.log(`User disconnected: ${userId}, reason: ${reason}`)
 
-      // Immediately clean up voice channel presence on disconnect
-      // This ensures other users don't have to wait for heartbeat timeout
-      // when someone's browser crashes or network drops
+      for (const [sessionId, participants] of activitySessionParticipants.entries()) {
+        if (!participants.has(userId)) continue
+        const session = activitySessions.get(sessionId)
+        participants.delete(userId)
+        const peerIndex = ensureActivityPeerIndex(sessionId)
+        for (const [peerId, targetUserId] of peerIndex.entries()) {
+          if (targetUserId === userId) peerIndex.delete(peerId)
+        }
+        if (!session) continue
+
+        if (participants.size === 0) {
+          const removedSession = removeActivitySession(sessionId)
+          if (removedSession) {
+            emitActivityContext(io, removedSession.contextType, removedSession.contextId, 'activity:session-ended', {
+              sessionId,
+              contextType: removedSession.contextType,
+              contextId: removedSession.contextId,
+              reason: 'disconnect'
+            })
+            emitActivitySessionsForContext(io, removedSession.contextType, removedSession.contextId)
+          }
+        } else {
+          session.updatedAt = new Date().toISOString()
+          emitActivitySessionsForContext(io, session.contextType, session.contextId)
+        }
+      }
+
       if (socket.currentVoiceChannel) {
         const channelId = socket.currentVoiceChannel
-        console.log(`[Voice] User ${userId} disconnected from channel ${channelId}, cleaning up immediately`)
-        cleanupVoiceUser(io, channelId, userId, 'disconnect')
+        if (reason === 'client namespace disconnect') {
+          console.log(`[Voice] User ${userId} intentionally disconnected from channel ${channelId}, cleaning up immediately`)
+          cancelPendingVoiceDisconnect(userId)
+          cleanupVoiceUser(io, channelId, userId, 'disconnect')
+        } else {
+          console.log(`[Voice] User ${userId} disconnected from channel ${channelId} (${reason}), delaying cleanup for ${TRANSIENT_SOCKET_DISCONNECT_GRACE_MS}ms`)
+          scheduleVoiceDisconnectCleanup(io, channelId, userId, `disconnect:${reason || 'unknown'}`)
+        }
       }
       
       // Leave all rooms
@@ -2227,6 +2968,13 @@ export const setupSocketHandlers = (io) => {
         disconnectedAt: new Date().toISOString()
       })
 
+      relayEventToConnectedPeers('user:presence', {
+        user: buildFederatedUserPayload(socket.user, {
+          ...userService.getUser(userId),
+          status: 'offline'
+        })
+      })
+
       // Notify server members
       if (socket.currentServer) {
         io.to(`server:${socket.currentServer}`).emit('member:offline', {
@@ -2244,4 +2992,8 @@ export const getOnlineUsers = () => {
 
 export const getUserSocket = (userId) => {
   return userSockets.get(userId)
+}
+
+export const getBotSockets = () => {
+  return botSockets
 }

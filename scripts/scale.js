@@ -286,7 +286,473 @@ WantedBy=multi-user.target
     log('   - Sync via API keys', 'reset')
     log('   - Enable federation in config', 'reset')
 
+    log('\n6. Multi-Process Architecture (NEW)', 'yellow')
+    log('   - Split services into separate apps', 'reset')
+    log('   - If one service crashes, others stay up', 'reset')
+    log('   - Run: npm run scale:split to generate configs', 'reset')
+
     log('\n')
+  }
+
+  async split() {
+    log('\n⚡ Volt Multi-Process Setup', 'cyan')
+    log('===========================\n', 'cyan')
+
+    const services = [
+      { name: 'api', port: 5000, desc: 'Main API Server', routes: ['user', 'server', 'channel', 'message', 'dm', 'upload', 'invite', 'discovery', 'admin', 'auth', 'push', 'migration', 'bots', 'system', 'automod', 'notifications', 'safety', 'activities', 'theme', 'gif'] },
+      { name: 'websocket', port: 5001, desc: 'WebSocket Server', routes: [] },
+      { name: 'federation', port: 5002, desc: 'Federation Server', routes: ['federation'] },
+      { name: 'cdn', port: 5003, desc: 'CDN/Uploads Server', routes: ['upload'] },
+      { name: 'worker', port: 5004, desc: 'Background Worker', routes: [] }
+    ]
+
+    log('Creating separate service configurations...\n', 'blue')
+
+    const projectRoot = PROJECT_ROOT
+
+    const nginxConfig = this.generateMultiServiceNginxConfig(services)
+    fs.writeFileSync(path.join(projectRoot, 'nginx-multi.conf'), nginxConfig)
+    log('✓ Created nginx-multi.conf', 'green')
+
+    const systemdServices = this.generateMultiServiceSystemd(services)
+    for (const [name, content] of Object.entries(systemdServices)) {
+      fs.writeFileSync(path.join(projectRoot, name), content)
+      log(`✓ Created ${name}`, 'green')
+    }
+
+    const pm2Config = this.generatePm2Config(services)
+    fs.writeFileSync(path.join(projectRoot, 'ecosystem.config.js'), pm2Config)
+    log('✓ Created ecosystem.config.js (for PM2)', 'green')
+
+    const dockerCompose = this.generateMultiServiceDockerCompose(services)
+    fs.writeFileSync(path.join(projectRoot, 'docker-compose.multi.yml'), dockerCompose)
+    log('✓ Created docker-compose.multi.yml', 'green')
+
+    const serviceEntrypoints = this.generateServiceEntrypoints(services)
+    const microservicesDir = path.join(projectRoot, 'microservices')
+    if (!fs.existsSync(microservicesDir)) {
+      fs.mkdirSync(microservicesDir, { recursive: true })
+    }
+    for (const [name, content] of Object.entries(serviceEntrypoints)) {
+      fs.writeFileSync(path.join(microservicesDir, `${name}.js`), content)
+      log(`✓ Created microservices/${name}.js`, 'green')
+    }
+
+    log('\n📋 Service Architecture:', 'yellow')
+    log('------------------------\n', 'yellow')
+    for (const svc of services) {
+      log(`  ${svc.name.padEnd(12)} :${svc.port}  - ${svc.desc}`, 'reset')
+    }
+
+    log('\n🚀 Quick Start Options:', 'yellow')
+    log('-----------------------\n', 'yellow')
+    log('1. Using PM2 (recommended for single server):', 'reset')
+    log('   npm install -g pm2', 'dim')
+    log('   pm2 start ecosystem.config.js', 'dim')
+    log('   pm2 logs', 'dim')
+
+    log('\n2. Using systemd (recommended for production):', 'reset')
+    log('   sudo cp *.service /etc/systemd/system/', 'dim')
+    log('   sudo systemctl daemon-reload', 'dim')
+    log('   sudo systemctl start voltage-api', 'dim')
+    log('   sudo systemctl enable voltage-api voltage-websocket voltage-federation', 'dim')
+
+    log('\n3. Using Docker:', 'reset')
+    log('   docker-compose -f docker-compose.multi.yml up -d', 'dim')
+
+    log('\n4. Using nginx:', 'reset')
+    log('   nginx -c $(pwd)/nginx-multi.conf', 'dim')
+    log('   (or include nginx-multi.conf in your nginx.conf)', 'dim')
+
+    log('\n⚠️  Notes:', 'yellow')
+    log('----------\n', 'yellow')
+    log('- All services share the same database and Redis', 'reset')
+    log('- API and WebSocket require sticky sessions', 'reset')
+    log('- Federation needs its own API key in .env', 'reset')
+    log('- Worker handles background jobs (notifications, etc.)', 'reset')
+
+    log('\n')
+  }
+
+  generateMultiServiceNginxConfig(services) {
+    let upstreamBlock = ''
+    let locationBlock = ''
+
+    for (const svc of services) {
+      upstreamBlock += `
+upstream voltage_${svc.name} {
+  server 127.0.0.1:${svc.port};
+}
+`
+      if (svc.name === 'api') {
+        locationBlock += `
+  location / {
+    proxy_pass http://voltage_api;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection 'upgrade';
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_cache_bypass $http_upgrade;
+  }
+
+  location /api {
+    proxy_pass http://voltage_api;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  location /uploads {
+    proxy_pass http://voltage_cdn;
+    proxy_set_header Host $host;
+  }
+`
+      }
+
+      if (svc.name === 'websocket') {
+        locationBlock += `
+  location /socket.io {
+    proxy_pass http://voltage_websocket;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 86400;
+  }
+`
+      }
+
+      if (svc.name === 'federation') {
+        locationBlock += `
+  location /federation {
+    proxy_pass http://voltage_federation;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+`
+      }
+    }
+
+    return `worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+
+events {
+  worker_connections 1024;
+}
+
+http {
+  include /etc/nginx/mime.types;
+  default_type application/octet-stream;
+
+  log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                  '$status $body_bytes_sent "$http_referer" '
+                  '"$http_user_agent" "$http_x_forwarded_for"';
+
+  access_log /var/log/nginx/access.log main;
+
+  sendfile on;
+  tcp_nopush on;
+  tcp_nodelay on;
+  keepalive_timeout 65;
+  types_hash_max_size 2048;
+
+${upstreamBlock}
+  server {
+    listen 80;
+    server_name localhost;
+
+${locationBlock}
+  }
+}
+`
+  }
+
+  generateMultiServiceSystemd(servicesList) {
+    const systemdServices = {}
+
+    for (const svc of servicesList) {
+      systemdServices[`voltage-${svc.name}.service`] = `[Unit]
+Description=Volt ${svc.desc}
+After=network.target
+
+[Service]
+Type=simple
+User=volt
+WorkingDirectory=${PROJECT_ROOT}
+ExecStart=/usr/bin/node ${PROJECT_ROOT}/microservices/${svc.name}.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=VOLT_SERVICE=${svc.name}
+
+[Install]
+WantedBy=multi-user.target
+`
+    }
+
+    return systemdServices
+  }
+
+  generatePm2Config(services) {
+    const apps = services.map(svc => ({
+      name: `voltage-${svc.name}`,
+      script: `./microservices/${svc.name}.js`,
+      instances: svc.name === 'worker' ? 2 : 1,
+      exec_mode: 'cluster' in svc && svc.cluster ? 'cluster' : 'fork',
+      env: {
+        NODE_ENV: 'production',
+        VOLT_SERVICE: svc.name
+      },
+      error_file: `./logs/${svc.name}-error.log`,
+      out_file: `./logs/${svc.name}-out.log`,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      max_memory_restart: svc.name === 'api' ? '1G' : '512M',
+      listen_timeout: 8000,
+      kill_timeout: 5000
+    }))
+
+    return `module.exports = {
+  apps: ${JSON.stringify(apps, null, 2)}
+}
+`
+  }
+
+  generateMultiServiceDockerCompose(services) {
+    const svcList = services.map(svc => `  voltage-${svc.name}:
+    image: voltage:latest
+    container_name: volt-${svc.name}
+    restart: unless-stopped
+    ports:
+      - "${svc.port}:${svc.port}"
+    environment:
+      - NODE_ENV=production
+      - VOLT_SERVICE=${svc.name}
+      - SERVER_URL=\${SERVER_URL}
+      - JWT_SECRET=\${JWT_SECRET}
+      - STORAGE_TYPE=sqlite
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${svc.port}/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+`).join('\n')
+
+    return `version: '3.8'
+
+services:
+${svcList}
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+`
+  }
+
+  generateServiceEntrypoints(services) {
+    const entrypoints = {}
+
+    for (const svc of services) {
+      if (svc.name === 'api') {
+        entrypoints['api'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'api'
+process.env.VOLT_API_ENABLED = 'true'
+process.env.VOLT_WEBSOCKET_ENABLED = 'false'
+process.env.VOLT_FEDERATION_ENABLED = 'false'
+process.env.VOLT_WORKER_ENABLED = 'false'
+console.log('[API Service] Starting API-only server on port ${svc.port}')
+await import('../server.js')
+`
+
+        entrypoints['websocket'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'websocket'
+process.env.VOLT_API_ENABLED = 'false'
+process.env.VOLT_WEBSOCKET_ENABLED = 'true'
+process.env.VOLT_FEDERATION_ENABLED = 'false'
+process.env.VOLT_WORKER_ENABLED = 'false'
+console.log('[WebSocket Service] Starting WebSocket-only server on port ${svc.port}')
+await import('../server.js')
+`
+
+        entrypoints['federation'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'federation'
+process.env.VOLT_API_ENABLED = 'false'
+process.env.VOLT_WEBSOCKET_ENABLED = 'false'
+process.env.VOLT_FEDERATION_ENABLED = 'true'
+process.env.VOLT_WORKER_ENABLED = 'false'
+console.log('[Federation Service] Starting Federation-only server on port ${svc.port}')
+await import('../server.js')
+`
+
+        entrypoints['cdn'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'cdn'
+process.env.VOLT_API_ENABLED = 'true'
+process.env.VOLT_WEBSOCKET_ENABLED = 'false'
+process.env.VOLT_FEDERATION_ENABLED = 'false'
+process.env.VOLT_WORKER_ENABLED = 'false'
+console.log('[CDN Service] Starting CDN-only server on port ${svc.port}')
+await import('../server.js')
+`
+
+        entrypoints['worker'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'worker'
+process.env.VOLT_API_ENABLED = 'false'
+process.env.VOLT_WEBSOCKET_ENABLED = 'false'
+process.env.VOLT_FEDERATION_ENABLED = 'false'
+process.env.VOLT_WORKER_ENABLED = 'true'
+console.log('[Worker Service] Starting Background Worker')
+await import('../server.js')
+`
+      } else if (svc.name === 'websocket') {
+        entrypoints['websocket'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'websocket'
+process.env.VOLT_API_ENABLED = 'false'
+process.env.VOLT_WEBSOCKET_ENABLED = 'true'
+process.env.VOLT_FEDERATION_ENABLED = 'false'
+process.env.VOLT_WORKER_ENABLED = 'false'
+console.log('[WebSocket Service] Starting WebSocket-only server on port ${svc.port}')
+await import('../server.js')
+`
+
+        entrypoints['federation'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'federation'
+process.env.VOLT_API_ENABLED = 'false'
+process.env.VOLT_WEBSOCKET_ENABLED = 'false'
+process.env.VOLT_FEDERATION_ENABLED = 'true'
+process.env.VOLT_WORKER_ENABLED = 'false'
+console.log('[Federation Service] Starting Federation-only server on port ${svc.port}')
+await import('../server.js')
+`
+
+        entrypoints['cdn'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'cdn'
+process.env.VOLT_API_ENABLED = 'true'
+process.env.VOLT_WEBSOCKET_ENABLED = 'false'
+process.env.VOLT_FEDERATION_ENABLED = 'false'
+process.env.VOLT_WORKER_ENABLED = 'false'
+console.log('[CDN Service] Starting CDN-only server on port ${svc.port}')
+await import('../server.js')
+`
+
+        entrypoints['worker'] = `import dotenv from 'dotenv'
+dotenv.config()
+process.env.VOLT_SERVICE = 'worker'
+process.env.VOLT_API_ENABLED = 'false'
+process.env.VOLT_WEBSOCKET_ENABLED = 'false'
+process.env.VOLT_FEDERATION_ENABLED = 'false'
+process.env.VOLT_WORKER_ENABLED = 'true'
+console.log('[Worker Service] Starting Background Worker')
+await import('../server.js')
+`
+      } else if (svc.name === 'federation') {
+        entrypoints['federation'] = `import express from 'express'
+import cors from 'cors'
+import dotenv from 'dotenv'
+
+dotenv.config()
+
+process.env.VOLT_SERVICE = 'federation'
+
+const app = express()
+const config = require('../config/config.js')
+
+app.use(cors())
+app.use(express.json())
+
+const federationRoutes = require('../routes/federationRoutes.js')
+app.use('/federation', federationRoutes)
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'federation', timestamp: new Date().toISOString() })
+})
+
+const PORT = process.env.PORT || ${svc.port}
+
+app.listen(PORT, () => {
+  console.log('[Federation Server] Running on port ' + PORT)
+})
+`
+      } else if (svc.name === 'cdn') {
+        entrypoints['cdn'] = `import express from 'express'
+import cors from 'cors'
+import dotenv from 'dotenv'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+dotenv.config()
+
+process.env.VOLT_SERVICE = 'cdn'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+const app = express()
+
+app.use(cors())
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')))
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'cdn', timestamp: new Date().toISOString() })
+})
+
+const PORT = process.env.PORT || ${svc.port}
+
+app.listen(PORT, () => {
+  console.log('[CDN Server] Running on port ' + PORT)
+})
+`
+      } else if (svc.name === 'worker') {
+        entrypoints['worker'] = `import dotenv from 'dotenv'
+
+dotenv.config()
+
+process.env.VOLT_SERVICE = 'worker'
+
+const { startSystemScheduler } = require('../services/systemMessageScheduler.js')
+
+console.log('[Worker Server] Starting background workers...')
+
+startSystemScheduler(null)
+
+console.log('[Worker Server] Workers running')
+
+setInterval(() => {
+  // Keep worker alive
+}, 60000)
+`
+      }
+    }
+
+    return entrypoints
   }
 
   async generateConfig(type = 'default') {
@@ -349,6 +815,10 @@ async function main() {
       await scaler.scale()
       break
 
+    case 'split':
+      await scaler.split()
+      break
+
     case 'config':
       await scaler.generateConfig(args[1] || 'default')
       break
@@ -370,6 +840,8 @@ Commands:
 
   scale                     Show scaling options
 
+  split                     Generate multi-service configs (microservices)
+
   config [type]             Generate config
     Types: default, mainline, production
 
@@ -377,6 +849,7 @@ Examples:
   volt scale setup production mydomain.com
   volt scale setup development localhost
   volt scale status
+  volt scale split
   volt scale config production
 
 Volt - Decentralized Chat Platform

@@ -1,0 +1,46 @@
+{
+  "server": {
+    "name": "VoltChat",
+    "version": "1.0.0",
+    "mode": "mainline",
+    "host": "localhost",
+    "port": 5000,
+    "url": "http://localhost:5000",
+    "imageServerUrl": "https://api.enclicainteractive.com"
+  },
+  "storage": {
+    "type": "sqlite",
+    "sqlite": {
+      "dbPath": "./data/voltage.db"
+    }
+  },
+  "branding": {
+    "logo": null,
+    "primaryColor": "#5865f2",
+    "accentColor": "#7289da"
+  },
+  "auth": {
+    "type": "all",
+    "local": {
+      "enabled": true,
+      "allowRegistration": true,
+      "requireEmailVerification": false
+    },
+    "oauth": {
+      "enabled": true,
+      "provider": "enclica"
+    }
+  },
+  "security": {
+    "jwtSecret": "volt_super_secret_key_change_in_production"
+  },
+  "features": {
+    "bots": true,
+    "voiceChannels": true,
+    "e2eEncryption": true,
+    "federation": false
+  },
+  "limits": {
+    "maxUploadSize": 10485760
+  }
+}

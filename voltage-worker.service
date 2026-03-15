@@ -1,0 +1,16 @@
+[Unit]
+Description=Volt Background Worker
+After=network.target
+
+[Service]
+Type=simple
+User=volt
+WorkingDirectory=/home/bluet/Documents/EIVoltChat/voltchat/Voltage
+ExecStart=/usr/bin/node /home/bluet/Documents/EIVoltChat/voltchat/Voltage/microservices/worker.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=VOLT_SERVICE=worker
+
+[Install]
+WantedBy=multi-user.target

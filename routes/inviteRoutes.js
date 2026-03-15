@@ -1,46 +1,94 @@
 import express from 'express'
 import { authenticateToken, optionalAuth } from '../middleware/authMiddleware.js'
-import { inviteService } from '../services/dataService.js'
+import { FILES, channelService, inviteService, serverService } from '../services/dataService.js'
 import { InviteEncoder, parseCrossHostInvite, createCrossHostInvite } from '../utils/inviteEncoder.js'
 import { federationService } from '../services/federationService.js'
 import axios from 'axios'
 import config from '../config/config.js'
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA_DIR = path.join(__dirname, '..', '..', 'data')
-const SERVERS_FILE = path.join(DATA_DIR, 'servers.json')
+const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
 
 const getAvatarUrl = (userId) => {
-  const imageServerUrl = config.getImageServerUrl()
-  return `${imageServerUrl}/api/images/users/${userId}/profile`
+  const safeUserId = String(userId || '')
+  if (!safeUserId) return null
+  const baseUrl = safeUserId.startsWith('u_')
+    ? (config.getServerUrl() || config.getImageServerUrl())
+    : config.getImageServerUrl()
+  return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
+}
+
+const resolveUserAvatar = (userId, profile = null) => {
+  const explicit = profile?.imageUrl || profile?.imageurl || profile?.avatarUrl || profile?.avatarURL || profile?.avatar || null
+  if (isExternalImage(explicit)) return explicit
+  return getAvatarUrl(userId)
 }
 
 const router = express.Router()
 
-const loadData = (file, defaultValue = []) => {
-  try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'))
+const getServers = () => {
+  const data = serverService.getAllServers()
+  if (Array.isArray(data)) return data
+  if (data && typeof data === 'object') return Object.values(data)
+  return []
+}
+
+const saveServers = async (servers) => {
+  const record = {}
+  for (const server of servers || []) {
+    if (server?.id) record[server.id] = server
+  }
+  for (const server of Object.values(record)) {
+    await serverService.updateServer(server.id, server)
+  }
+}
+
+const syncRemoteChannels = (serverId, remoteHost, channels = []) => {
+  for (const channel of channels) {
+    if (!channel?.id) continue
+    const nextChannel = {
+      ...channel,
+      serverId,
+      remoteHost,
+      federated: true
     }
-  } catch (err) {
-    console.error(`[Data] Error loading ${file}:`, err.message)
-  }
-  return defaultValue
-}
-
-const saveData = (file, data) => {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2))
-  } catch (err) {
-    console.error(`[Data] Error saving ${file}:`, err.message)
+    const existing = channelService.getChannel(channel.id)
+    if (existing) channelService.updateChannel(channel.id, nextChannel)
+    else channelService.createChannel(nextChannel)
   }
 }
 
-const getServers = () => loadData(SERVERS_FILE, [])
-const setServers = (servers) => saveData(SERVERS_FILE, servers)
+const buildFederatedServerRecord = (remoteServer, baseUrl, remoteHost, user) => ({
+  id: remoteServer.id,
+  name: remoteServer.name || 'Remote Server',
+  icon: remoteServer.icon ? (remoteServer.icon.startsWith('http') ? remoteServer.icon : `${baseUrl}${remoteServer.icon}`) : null,
+  description: remoteServer.description || '',
+  banner: remoteServer.banner || null,
+  remoteHost,
+  remoteUrl: baseUrl,
+  imageServerUrl: remoteServer.imageServerUrl || null,
+  federated: true,
+  memberCount: remoteServer.memberCount || 0,
+  roles: Array.isArray(remoteServer.roles) ? remoteServer.roles : [],
+  categories: Array.isArray(remoteServer.categories) ? remoteServer.categories : [],
+  members: [{
+    id: user.id,
+    username: user.username,
+    imageUrl: user?.imageUrl || user?.imageurl || user?.avatarUrl || user?.avatarURL || (isExternalImage(user?.avatar) ? user.avatar : null),
+    avatar: resolveUserAvatar(user.id, user),
+    host: user.host || config.getHost(),
+    avatarHost: config.getImageServerUrl(),
+    roles: ['member'],
+    role: 'member',
+    status: 'online',
+    joinedAt: new Date().toISOString()
+  }],
+  createdAt: remoteServer.createdAt || new Date().toISOString()
+})
+
+const fetchRemoteServerSnapshot = async (baseUrl, serverId) => {
+  const response = await axios.get(`${baseUrl}/api/federation/server-snapshot/${serverId}`, { timeout: 8000 })
+  return response.data
+}
 
 // Get invite info (public - for invite page)
 router.get('/:code', optionalAuth, (req, res) => {
@@ -75,7 +123,8 @@ router.get('/:code', optionalAuth, (req, res) => {
     inviter: inviter ? {
       id: inviter.id,
       username: inviter.username,
-      avatar: getAvatarUrl(inviter.id)
+      imageUrl: inviter?.imageUrl || inviter?.imageurl || inviter?.avatarUrl || inviter?.avatarURL || null,
+      avatar: resolveUserAvatar(inviter.id, inviter)
     } : null,
     expiresAt: invite.expiresAt,
     uses: invite.uses
@@ -83,8 +132,8 @@ router.get('/:code', optionalAuth, (req, res) => {
 })
 
 // Join server via invite
-router.post('/:code/join', authenticateToken, (req, res) => {
-  const result = inviteService.useInvite(req.params.code)
+router.post('/:code/join', authenticateToken, async (req, res) => {
+  const result = await inviteService.useInvite(req.params.code)
   
   if (result.error) {
     return res.status(400).json({ error: result.error })
@@ -108,7 +157,8 @@ router.post('/:code/join', authenticateToken, (req, res) => {
   server.members.push({
     id: req.user.id,
     username: req.user.username || req.user.email,
-    avatar: getAvatarUrl(req.user.id),
+    imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+    avatar: resolveUserAvatar(req.user.id, req.user),
     host: req.user.host || config.getHost(),
     avatarHost: config.getImageServerUrl(),
     roles: ['member'],
@@ -117,7 +167,7 @@ router.post('/:code/join', authenticateToken, (req, res) => {
     joinedAt: new Date().toISOString()
   })
   
-  setServers(servers)
+  await setServers(servers)
   console.log(`[API] User ${req.user.username} joined server ${server.name} via invite ${req.params.code}`)
   res.json(server)
 })
@@ -166,8 +216,7 @@ router.get('/cross-host/:code', optionalAuth, async (req, res) => {
     // If no invite code, try to get server info directly
     if (!remoteInvite && decoded.serverId) {
       try {
-        const serverRes = await axios.get(`${baseUrl}/api/federation/server-info/${decoded.serverId}`, { timeout: 8000 })
-        remoteInvite = { server: serverRes.data }
+        remoteInvite = { server: await fetchRemoteServerSnapshot(baseUrl, decoded.serverId) }
       } catch { /* fallback to local data */ }
     }
 
@@ -226,7 +275,7 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
     const currentHost = config.getHost()
     
     if (serverHost === currentHost) {
-      const result = inviteService.useInvite(decoded.key || decoded.serverId)
+      const result = await inviteService.useInvite(decoded.key || decoded.serverId)
       if (result.error) {
         return res.status(400).json({ error: result.error })
       }
@@ -254,8 +303,7 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
     // Fallback to server info endpoint
     if (!remoteServer && decoded.serverId) {
       try {
-        const serverRes = await axios.get(`${baseUrl}/api/federation/server-info/${decoded.serverId}`, { timeout: 8000 })
-        remoteServer = serverRes.data
+        remoteServer = await fetchRemoteServerSnapshot(baseUrl, decoded.serverId)
       } catch { /* fallback to local */ }
     }
 
@@ -273,38 +321,22 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
     let localServer = servers.find(s => s.id === serverId && s.remoteHost === serverHost)
 
     if (!localServer) {
-      const icon = remoteServer?.icon
-        ? (remoteServer.icon.startsWith('http') ? remoteServer.icon : `${baseUrl}${remoteServer.icon}`)
-        : null
-      localServer = {
-        id: serverId,
-        name: remoteServer?.name || 'Remote Server',
-        icon,
-        remoteHost: serverHost,
-        remoteUrl: baseUrl,
-        federated: true,
-        memberCount: remoteServer?.memberCount || 0,
-        members: [{
-          id: req.user.id,
-          username: req.user.username,
-          avatar: getAvatarUrl(req.user.id),
-          roles: ['member'],
-          role: 'member',
-          status: 'online',
-          joinedAt: new Date().toISOString()
-        }],
-        roles: [],
-        createdAt: new Date().toISOString()
-      }
+      localServer = buildFederatedServerRecord(remoteServer, baseUrl, serverHost, req.user)
       servers.push(localServer)
     } else {
+      localServer = {
+        ...localServer,
+        ...buildFederatedServerRecord(remoteServer, baseUrl, serverHost, req.user),
+        members: localServer.members || []
+      }
       const existingMember = localServer.members?.find(m => m.id === req.user.id)
       if (!existingMember) {
         if (!localServer.members) localServer.members = []
         localServer.members.push({
           id: req.user.id,
           username: req.user.username,
-          avatar: getAvatarUrl(req.user.id),
+          imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+          avatar: resolveUserAvatar(req.user.id, req.user),
           host: req.user.host || config.getHost(),
           avatarHost: config.getImageServerUrl(),
           roles: ['member'],
@@ -315,16 +347,20 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
       }
     }
 
+    syncRemoteChannels(serverId, serverHost, remoteServer?.channels || [])
+
     // Notify the remote host about the join
     try {
+      const peer = federationService.getPeerByHost(serverHost)
       await axios.post(`${baseUrl}/api/federation/member-joined`, {
         serverId,
         host: currentHost,
+        token: peer ? federationService.generateHandshakeToken(peer.id) : null,
         user: { id: req.user.id, username: req.user.username }
       }, { timeout: 5000 })
     } catch { /* non-critical */ }
     
-    setServers(servers)
+    await setServers(servers)
     console.log(`[API] User ${req.user.username} joined cross-host server ${localServer.name} (${serverHost})`)
     res.json(localServer)
   } catch (error) {
@@ -353,14 +389,18 @@ router.get('/cross-host/:code/generate-link', authenticateToken, (req, res) => {
 const ensureFederationPeer = async (remoteUrl) => {
   try {
     const parsedUrl = new URL(remoteUrl)
-    const remoteHost = parsedUrl.host
+    const remoteHost = federationService.normalizeHost(parsedUrl.host)
     const currentHost = config.getHost()
     if (remoteHost === currentHost) return { local: true }
 
     const existing = federationService.getPeerByHost(remoteHost)
     if (existing) {
       if (existing.status !== 'connected') {
-        federationService.updatePeer(existing.id, { status: 'connected', lastSeen: new Date().toISOString() })
+        try {
+          await federationService.sendHeartbeat(existing.id)
+        } catch {
+          federationService.updatePeer(existing.id, { status: 'error', lastError: 'Heartbeat failed during auto-peer reuse' })
+        }
       }
       return { peer: existing, alreadyPeered: true }
     }
@@ -385,15 +425,7 @@ const ensureFederationPeer = async (remoteUrl) => {
     }
 
     try {
-      await axios.post(`${baseUrl}/api/federation/handshake`, {
-        name: config.config.server.name,
-        host: currentHost,
-        url: config.getServerUrl(),
-        sharedSecret: result.peer?.sharedSecret,
-        features: config.config.features || {},
-        autoAccept: true
-      }, { timeout: 5000 })
-      federationService.updatePeer(result.peer.id, { status: 'connected', lastSeen: new Date().toISOString() })
+      await federationService.sendHandshake(result.peer.id, { autoAccept: true })
     } catch (err) {
       console.log(`[Federation] Auto-handshake with ${remoteHost} deferred: ${err.message}`)
     }
@@ -458,7 +490,9 @@ router.post('/resolve-external/join', authenticateToken, async (req, res) => {
 
     const servers = getServers()
     const inviteRes = await axios.get(`${baseUrl}/api/invites/${code}`, { timeout: 8000 })
-    const remoteServer = inviteRes.data?.server || inviteRes.data
+    const remoteServer = inviteRes.data?.server?.id
+      ? await fetchRemoteServerSnapshot(baseUrl, inviteRes.data.server.id).catch(() => inviteRes.data.server)
+      : (inviteRes.data?.server || inviteRes.data)
     const remoteHost = new URL(baseUrl).host
 
     if (!remoteServer?.id) {
@@ -467,35 +501,22 @@ router.post('/resolve-external/join', authenticateToken, async (req, res) => {
 
     let localServer = servers.find(s => s.id === remoteServer.id && s.remoteHost === remoteHost)
     if (!localServer) {
-      localServer = {
-        id: remoteServer.id,
-        name: remoteServer.name,
-        icon: remoteServer.icon ? (remoteServer.icon.startsWith('http') ? remoteServer.icon : `${baseUrl}${remoteServer.icon}`) : null,
-        remoteHost,
-        remoteUrl: baseUrl,
-        federated: true,
-        memberCount: remoteServer.memberCount || 0,
-        members: [{
-          id: req.user.id,
-          username: req.user.username,
-          avatar: req.user.avatar,
-          roles: ['member'],
-          role: 'member',
-          status: 'online',
-          joinedAt: new Date().toISOString()
-        }],
-        roles: [],
-        createdAt: new Date().toISOString()
-      }
+      localServer = buildFederatedServerRecord(remoteServer, baseUrl, remoteHost, req.user)
       servers.push(localServer)
     } else {
+      localServer = {
+        ...localServer,
+        ...buildFederatedServerRecord(remoteServer, baseUrl, remoteHost, req.user),
+        members: localServer.members || []
+      }
       const existingMember = localServer.members?.find(m => m.id === req.user.id)
       if (!existingMember) {
         if (!localServer.members) localServer.members = []
         localServer.members.push({
           id: req.user.id,
           username: req.user.username,
-          avatar: req.user.avatar,
+          imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+          avatar: resolveUserAvatar(req.user.id, req.user),
           host: req.user.host || config.getHost(),
           avatarHost: config.getImageServerUrl(),
           roles: ['member'],
@@ -506,7 +527,9 @@ router.post('/resolve-external/join', authenticateToken, async (req, res) => {
       }
     }
 
-    setServers(servers)
+    syncRemoteChannels(remoteServer.id, remoteHost, remoteServer?.channels || [])
+
+    await setServers(servers)
     console.log(`[API] User ${req.user.username} joined federated server ${localServer.name} from ${remoteHost}`)
     res.json(localServer)
   } catch (err) {

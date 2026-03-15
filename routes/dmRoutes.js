@@ -7,12 +7,45 @@ import {
   userService,
   blockService 
 } from '../services/dataService.js'
+import { botService } from '../services/botService.js'
+import { federationService } from '../services/federationService.js'
 import { isUserOnline } from '../services/socketService.js'
 import config from '../config/config.js'
+import rateLimiter from '../services/rateLimiter.js'
+
+const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
 
 const getImageUrl = (userId) => {
-  const imageServerUrl = config.getImageServerUrl()
-  return `${imageServerUrl}/api/images/users/${userId}/profile`
+  const safeUserId = String(userId || '')
+  if (!safeUserId) return null
+  const baseUrl = safeUserId.startsWith('u_')
+    ? (config.getServerUrl() || config.getImageServerUrl())
+    : config.getImageServerUrl()
+  return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
+}
+
+const resolveUserAvatar = (userId, profile = null) => {
+  const explicit = profile?.imageUrl || profile?.imageurl || profile?.avatar || null
+  if (isExternalImage(explicit)) return explicit
+  return getImageUrl(userId)
+}
+
+const normalizeHost = (value) => federationService?.normalizeHost?.(value) || String(value || '').toLowerCase()
+
+const resolvePresenceStatus = (userId, profile = null) => {
+  const profileHost = normalizeHost(profile?.host || config.getHost())
+  const localHost = normalizeHost(config.getHost())
+  if (profileHost && profileHost !== localHost) {
+    return profile?.status || 'offline'
+  }
+  const online = isUserOnline(userId)
+  return online ? (profile?.status === 'invisible' ? 'invisible' : (profile?.status || 'online')) : 'offline'
+}
+
+const buildAddress = (profile = {}) => {
+  const username = profile?.customUsername || profile?.username || ''
+  const host = normalizeHost(profile?.host || config.getHost())
+  return username && host ? `${username}:${host}` : username || ''
 }
 
 const router = express.Router()
@@ -37,30 +70,51 @@ const buildDMReplyReference = (conversationMessages, replyTo) => {
 }
 
 // Get all DM conversations
-router.get('/', authenticateToken, (req, res) => {
+router.get('/', authenticateToken, async (req, res) => {
   const { search } = req.query
   let conversations = dmService.getConversations(req.user.id)
   
-  let enrichedConversations = conversations.map(conv => {
+  let enrichedConversations = await Promise.all(conversations.map(async conv => {
     const participantIds = Array.isArray(conv.participants)
       ? conv.participants
       : [req.user.id, conv.recipientId].filter(Boolean)
     const otherIds = participantIds.filter(id => id !== req.user.id)
     const isGroup = !!conv.isGroup || otherIds.length > 1
 
-    const recipients = otherIds.map(id => {
-      const profile = userService.getUser(id)
-      const online = isUserOnline(id)
-      const status = online ? (profile?.status === 'invisible' ? 'invisible' : (profile?.status || 'online')) : 'offline'
+    const recipients = await Promise.all(otherIds.map(async id => {
+      let profile = userService.getUser(id)
+      let isBot = false
+      let botStatus = 'offline'
+      
+      if (!profile && id.startsWith('bot_')) {
+        const bot = await botService.getBot(id)
+        if (bot) {
+          profile = {
+            username: bot.name,
+            displayName: bot.name,
+            imageUrl: bot.avatar,
+            avatar: bot.avatar,
+            host: config.getHost()
+          }
+          isBot = true
+          botStatus = bot.status || 'offline'
+        }
+      }
+      
+      const status = isBot ? botStatus : resolvePresenceStatus(id, profile)
       return {
         id,
         username: profile?.username || 'Unknown',
         displayName: profile?.displayName,
         customUsername: profile?.customUsername,
-        avatar: getImageUrl(id),
-        status
+        imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+        avatar: resolveUserAvatar(id, profile),
+        status,
+        host: profile?.host || config.getHost(),
+        address: buildAddress(profile),
+        isBot
       }
-    })
+    }))
     const primaryRecipient = recipients[0] || null
 
     return {
@@ -72,7 +126,7 @@ router.get('/', authenticateToken, (req, res) => {
         ? (conv.groupName || recipients.map(r => r.displayName || r.customUsername || r.username).slice(0, 3).join(', ') || 'Group DM')
         : (primaryRecipient?.displayName || primaryRecipient?.customUsername || primaryRecipient?.username || 'Unknown')
     }
-  })
+  }))
   
   // Filter by search query if provided
   if (search && search.trim()) {
@@ -81,11 +135,11 @@ router.get('/', authenticateToken, (req, res) => {
       if (conv.isGroup) {
         const groupName = conv.groupName?.toLowerCase() || ''
         const title = conv.title?.toLowerCase() || ''
-        const memberMatch = (conv.recipients || []).some(r =>
+        const memberMatch = Array.isArray(conv.recipients) ? conv.recipients.some(r =>
           (r.username || '').toLowerCase().includes(searchLower) ||
           (r.displayName || '').toLowerCase().includes(searchLower) ||
           (r.customUsername || '').toLowerCase().includes(searchLower)
-        )
+        ) : false
         return groupName.includes(searchLower) || title.includes(searchLower) || memberMatch
       }
       const username = conv.recipient?.username?.toLowerCase() || ''
@@ -103,7 +157,7 @@ router.get('/', authenticateToken, (req, res) => {
 })
 
 // Search for users to start a new DM
-router.get('/search', authenticateToken, (req, res) => {
+router.get('/search', authenticateToken, async (req, res) => {
   const { q } = req.query
   
   if (!q || q.trim().length < 2) {
@@ -119,7 +173,7 @@ router.get('/search', authenticateToken, (req, res) => {
   const existingRecipientIds = new Set(existingConversations.map(c => c.recipientId))
   
   // Filter users by search query, exclude self and blocked users
-  const results = Object.values(allUsers)
+  let userResults = Object.values(allUsers)
     .filter(user => {
       if (user.id === currentUserId) return false
       if (blockService.isBlocked(currentUserId, user.id)) return false
@@ -134,27 +188,55 @@ router.get('/search', authenticateToken, (req, res) => {
              customUsername.includes(searchLower) ||
              email.includes(searchLower)
     })
-    .slice(0, 20) // Limit results
+    .slice(0, 20)
     .map(user => {
-      const online = isUserOnline(user.id)
-      const status = online ? (user.status === 'invisible' ? 'invisible' : (user.status || 'online')) : 'offline'
+      const status = resolvePresenceStatus(user.id, user)
       return {
         id: user.id,
         username: user.username,
         displayName: user.displayName,
         customUsername: user.customUsername,
-        avatar: getImageUrl(user.id),
+        imageUrl: user.imageUrl || user.imageurl || user.avatar || null,
+        avatar: resolveUserAvatar(user.id, user),
         status,
-        hasExistingDM: existingRecipientIds.has(user.id)
+        host: user.host || config.getHost(),
+        address: buildAddress(user),
+        hasExistingDM: existingRecipientIds.has(user.id),
+        isBot: false
       }
     })
+  
+  // Also search bots
+  const bots = await botService.getAllBots()
+  const botResults = bots
+    .filter(bot => {
+      if (blockService.isBlocked(currentUserId, bot.id)) return false
+      const name = bot.name?.toLowerCase() || ''
+      return name.includes(searchLower)
+    })
+    .slice(0, 5)
+    .map(bot => ({
+      id: bot.id,
+      username: bot.name,
+      displayName: bot.name,
+      customUsername: null,
+      imageUrl: bot.avatar,
+      avatar: bot.avatar,
+      status: bot.status || 'offline',
+      host: config.getHost(),
+      address: `${bot.name}:${config.getHost()}`,
+      hasExistingDM: existingRecipientIds.has(bot.id),
+      isBot: true
+    }))
+  
+  const results = [...userResults, ...botResults]
   
   console.log(`[API] DM user search for "${q}" - ${results.length} results`)
   res.json(results)
 })
 
 // Create or get DM conversation
-router.post('/', authenticateToken, (req, res) => {
+router.post('/', authenticateToken, async (req, res) => {
   const { userId, participantIds, groupName } = req.body
 
   // Group DM flow
@@ -168,20 +250,22 @@ router.post('/', authenticateToken, (req, res) => {
     }
 
     try {
-      const conversation = dmService.createGroupConversation(req.user.id, ids, groupName)
+      const conversation = await dmService.createGroupConversation(req.user.id, ids, groupName)
       const recipients = conversation.participants
         .filter(id => id !== req.user.id)
         .map(id => {
           const profile = userService.getUser(id)
-          const online = isUserOnline(id)
-          const status = online ? (profile?.status === 'invisible' ? 'invisible' : (profile?.status || 'online')) : 'offline'
+          const status = resolvePresenceStatus(id, profile)
           return {
             id,
             username: profile?.username || 'Unknown',
             displayName: profile?.displayName,
             customUsername: profile?.customUsername,
-            avatar: getImageUrl(id),
-            status
+            imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+            avatar: resolveUserAvatar(id, profile),
+            status,
+            host: profile?.host || config.getHost(),
+            address: buildAddress(profile)
           }
         })
 
@@ -209,12 +293,29 @@ router.post('/', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'User is blocked' })
   }
   
-  const conversation = dmService.getOrCreateConversation(req.user.id, userId)
-  const recipientProfile = userService.getUser(userId)
-  const online = isUserOnline(userId)
-  const status = online ? (recipientProfile?.status === 'invisible' ? 'invisible' : (recipientProfile?.status || 'online')) : 'offline'
+  const conversation = await dmService.getOrCreateConversation(req.user.id, userId)
+  let recipientProfile = userService.getUser(userId)
+  let isBot = false
+  let botStatus = 'offline'
   
-  userService.saveUser(req.user.id, {
+  if (!recipientProfile && userId.startsWith('bot_')) {
+    const bot = await botService.getBot(userId)
+    if (bot) {
+      recipientProfile = {
+        username: bot.name,
+        displayName: bot.name,
+        imageUrl: bot.avatar,
+        avatar: bot.avatar,
+        host: config.getHost()
+      }
+      isBot = true
+      botStatus = bot.status || 'offline'
+    }
+  }
+  
+  const status = isBot ? botStatus : resolvePresenceStatus(userId, recipientProfile)
+  
+  await userService.saveUser(req.user.id, {
     username: req.user.username
   })
   
@@ -225,16 +326,37 @@ router.post('/', authenticateToken, (req, res) => {
       id: userId,
       username: recipientProfile?.username || 'Unknown',
       displayName: recipientProfile?.displayName,
-      avatar: getImageUrl(userId),
-      status
+      imageUrl: recipientProfile?.imageUrl || recipientProfile?.imageurl || recipientProfile?.avatar || null,
+      avatar: resolveUserAvatar(userId, recipientProfile),
+      status,
+      host: recipientProfile?.host || config.getHost(),
+      address: buildAddress(recipientProfile),
+      isBot
     }
   })
 })
 
 // Get messages for a DM conversation
-router.get('/:conversationId/messages', authenticateToken, (req, res) => {
-  const { limit = 50, search } = req.query
-  let messages = dmMessageService.getMessages(req.params.conversationId, parseInt(limit))
+router.get('/:conversationId/messages', authenticateToken, async (req, res) => {
+  const { limit = 50, search, before, offset = 0 } = req.query
+  const parsedLimit = Math.max(1, Math.min(parseInt(limit, 10) || 50, 100))
+  const parsedOffset = Math.max(0, parseInt(offset, 10) || 0)
+  const conversationMessages = await dmMessageService.getMessagesForConversation(
+    req.params.conversationId,
+    Math.max(parsedLimit + parsedOffset, 100),
+    before || null
+  )
+  let messages = [...conversationMessages]
+
+  if (before) {
+    const beforeTime = new Date(before).getTime()
+    if (Number.isFinite(beforeTime)) {
+      messages = messages.filter((msg) => {
+        const msgTime = new Date(msg?.timestamp || 0).getTime()
+        return Number.isFinite(msgTime) && msgTime < beforeTime
+      })
+    }
+  }
   
   // Filter by search query if provided
   if (search && search.trim()) {
@@ -244,9 +366,12 @@ router.get('/:conversationId/messages', authenticateToken, (req, res) => {
       msg.username?.toLowerCase().includes(searchLower)
     )
   }
-  
-  const all = dmMessageService.getAllMessages()
-  const conversationMessages = Array.isArray(all?.[req.params.conversationId]) ? all[req.params.conversationId] : []
+
+  if (parsedOffset > 0) {
+    messages = messages.slice(parsedOffset)
+  }
+  messages = messages.slice(-parsedLimit)
+
   const hydrated = messages.map(msg => ({
     ...msg,
     replyTo: buildDMReplyReference(conversationMessages, msg.replyTo)
@@ -283,7 +408,8 @@ router.get('/search/messages', authenticateToken, (req, res) => {
           id,
           username: p?.username || 'Unknown',
           displayName: p?.displayName,
-          avatar: getImageUrl(id)
+          imageUrl: p?.imageUrl || p?.imageurl || p?.avatar || null,
+          avatar: resolveUserAvatar(id, p)
         }
       })
       results.push({
@@ -308,9 +434,17 @@ router.get('/search/messages', authenticateToken, (req, res) => {
 })
 
 // Send message in DM
-router.post('/:conversationId/messages', authenticateToken, (req, res) => {
+router.post('/:conversationId/messages', authenticateToken, async (req, res) => {
   const { content, attachments, replyTo } = req.body
   const conversationId = req.params.conversationId
+  
+  const rateLimit = await rateLimiter.checkMessageRateLimit(req.user.id)
+  if (!rateLimit.allowed) {
+    return res.status(429).json({ 
+      error: 'Too many messages. Please slow down.', 
+      retryAfter: rateLimit.retryAfter 
+    })
+  }
   
   if (!content?.trim()) {
     return res.status(400).json({ error: 'Message content required' })
@@ -327,7 +461,7 @@ router.post('/:conversationId/messages', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Cannot send message to blocked user' })
   }
   if (conversation.isGroup) {
-    const others = (conversation.participants || []).filter(id => id !== req.user.id)
+     const others = Array.isArray(conversation.participants) ? conversation.participants.filter(id => id !== req.user.id) : []
     if (others.some(id => blockService.isBlocked(req.user.id, id))) {
       return res.status(400).json({ error: 'Cannot send message to one or more blocked users in this group' })
     }
@@ -338,22 +472,22 @@ router.post('/:conversationId/messages', authenticateToken, (req, res) => {
     conversationId,
     userId: req.user.id,
     username: req.user.username,
-    avatar: getImageUrl(req.user.id),
+    avatar: req.user.avatar || getImageUrl(req.user.id),
     content: content.trim(),
     attachments: attachments || [],
     replyTo: buildDMReplyReference(dmMessageService.getAllMessages()?.[conversationId] || [], replyTo),
     timestamp: new Date().toISOString()
   }
   
-  dmMessageService.addMessage(conversationId, message)
-  dmService.updateLastMessage(conversationId, req.user.id, conversation.recipientId)
+  await dmMessageService.addMessage(conversationId, message)
+  await dmService.updateLastMessage(conversationId, req.user.id, conversation.recipientId)
   
   console.log(`[API] DM message sent in ${conversationId}`)
   res.status(201).json(message)
 })
 
 // Edit DM message
-router.put('/:conversationId/messages/:messageId', authenticateToken, (req, res) => {
+router.put('/:conversationId/messages/:messageId', authenticateToken, async (req, res) => {
   const { content } = req.body
   const { conversationId, messageId } = req.params
   
@@ -372,13 +506,13 @@ router.put('/:conversationId/messages/:messageId', authenticateToken, (req, res)
     return res.status(403).json({ error: 'Cannot edit others messages' })
   }
   
-  const updated = dmMessageService.editMessage(conversationId, messageId, content.trim())
+  const updated = await dmMessageService.editMessage(conversationId, messageId, content.trim())
   console.log(`[API] DM message ${messageId} edited`)
   res.json(updated)
 })
 
 // Delete DM message
-router.delete('/:conversationId/messages/:messageId', authenticateToken, (req, res) => {
+router.delete('/:conversationId/messages/:messageId', authenticateToken, async (req, res) => {
   const { conversationId, messageId } = req.params
   
   const messages = dmMessageService.getMessages(conversationId, 100)
@@ -392,7 +526,7 @@ router.delete('/:conversationId/messages/:messageId', authenticateToken, (req, r
     return res.status(403).json({ error: 'Cannot delete others messages' })
   }
   
-  dmMessageService.deleteMessage(conversationId, messageId)
+  await dmMessageService.deleteMessage(conversationId, messageId)
   console.log(`[API] DM message ${messageId} deleted`)
   res.json({ success: true })
 })

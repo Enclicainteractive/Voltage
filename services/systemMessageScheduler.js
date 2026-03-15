@@ -24,6 +24,7 @@ const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 
 // io instance — set via init()
 let _io = null
+const isAdminFlag = (value) => value === true || value === 1 || value === '1' || value === 'true'
 
 // ---------------------------------------------------------------------------
 // Version comparison
@@ -97,7 +98,7 @@ async function checkForVoltageUpdate() {
   // Find all platform-level admins and owners
   const admins = userService.getAllUsers().filter(u => {
     const role = u.adminRole || u.role
-    return role === 'admin' || role === 'owner' || u.isAdmin === true
+    return role === 'admin' || role === 'owner' || isAdminFlag(u.isAdmin)
   })
 
   if (admins.length === 0) return
