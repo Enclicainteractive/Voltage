@@ -3278,6 +3278,41 @@ export const initActivityTables = async () => {
         INDEX idx_user_id (user_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `)
+    
+    // Activity manifests - JSON schemas for custom activities
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS activity_manifests (
+        id VARCHAR(255) PRIMARY KEY,
+        app_id VARCHAR(255) NOT NULL,
+        owner_id VARCHAR(255) NOT NULL,
+        manifest JSON NOT NULL,
+        is_valid TINYINT(1) DEFAULT 1,
+        validation_errors TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_app_id (app_id),
+        INDEX idx_owner_id (owner_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `)
+    
+    // OAuth refresh tokens for token renewal
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS activity_oauth_refresh_tokens (
+        refresh_token VARCHAR(255) PRIMARY KEY,
+        app_id VARCHAR(255) NOT NULL,
+        client_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL,
+        scope TEXT,
+        context_type VARCHAR(50),
+        context_id VARCHAR(255),
+        session_id VARCHAR(255),
+        created_at BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        INDEX idx_app_id (app_id),
+        INDEX idx_client_id (client_id),
+        INDEX idx_user_id (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `)
   } catch (err) {
     console.error('[Activity] Failed to initialize tables:', err.message)
   }
@@ -3524,6 +3559,41 @@ export const activityAppService = {
     }
   },
 
+  async update(ownerId, appId, data) {
+    const pool = getDbPool()
+    if (!pool) return null
+    try {
+      const fields = []
+      const values = []
+      if (data.name !== undefined) {
+        fields.push('name = ?')
+        values.push(data.name)
+      }
+      if (data.description !== undefined) {
+        fields.push('description = ?')
+        values.push(data.description)
+      }
+      if (data.redirectUris !== undefined) {
+        fields.push('redirect_uris = ?')
+        values.push(JSON.stringify(data.redirectUris))
+      }
+      if (data.scopes !== undefined) {
+        fields.push('scopes = ?')
+        values.push(JSON.stringify(data.scopes))
+      }
+      if (fields.length === 0) return this.getById(appId)
+      values.push(appId, ownerId)
+      const [result] = await pool.execute(
+        `UPDATE activity_apps SET ${fields.join(', ')} WHERE id = ? AND owner_id = ?`,
+        values
+      )
+      return result.affectedRows > 0 ? this.getById(appId) : null
+    } catch (err) {
+      console.error('[Activity] update error:', err.message)
+      return null
+    }
+  },
+
   async delete(ownerId, appId) {
     const pool = getDbPool()
     if (!pool) return false
@@ -3723,6 +3793,223 @@ export const activityOAuthService = {
   }
 }
 
+const VALID_MANIFEST_FIELDS = ['id', 'name', 'description', 'version', 'icon', 'developer', 'launch', 'features', 'permissions', 'scopes', 'capabilities']
+const VALID_FEATURES = ['p2p', 'state-sync', 'voice', 'camera', 'screen-share', 'file-share']
+const VALID_SCOPES = ['activities:read', 'activities:write', 'activities:state:read', 'activities:state:write', 'activities:join', 'activities:p2p', 'activities:voice', 'activities:presence']
+
+const validateManifest = (manifest) => {
+  const errors = []
+  if (!manifest || typeof manifest !== 'object') {
+    return { valid: false, errors: ['Manifest must be an object'] }
+  }
+  if (!manifest.id || typeof manifest.id !== 'string') {
+    errors.push('Manifest must have an id string')
+  }
+  if (!manifest.name || typeof manifest.name !== 'string') {
+    errors.push('Manifest must have a name string')
+  }
+  if (!manifest.version || typeof manifest.version !== 'string') {
+    errors.push('Manifest must have a version string')
+  }
+  if (!manifest.launch || typeof manifest.launch !== 'object') {
+    errors.push('Manifest must have a launch object')
+  } else {
+    if (!manifest.launch.url) {
+      errors.push('Manifest launch must have a url')
+    }
+  }
+  if (manifest.features && Array.isArray(manifest.features)) {
+    for (const feature of manifest.features) {
+      if (!VALID_FEATURES.includes(feature)) {
+        errors.push(`Invalid feature: ${feature}`)
+      }
+    }
+  }
+  if (manifest.scopes && Array.isArray(manifest.scopes)) {
+    for (const scope of manifest.scopes) {
+      if (!VALID_SCOPES.includes(scope)) {
+        errors.push(`Invalid scope: ${scope}`)
+      }
+    }
+  }
+  for (const key of Object.keys(manifest)) {
+    if (!VALID_MANIFEST_FIELDS.includes(key)) {
+      errors.push(`Unknown field: ${key}`)
+    }
+  }
+  return { valid: errors.length === 0, errors }
+}
+
+export const activityManifestService = {
+  async create(appId, ownerId, manifest) {
+    const pool = getDbPool()
+    if (!pool) return null
+    const validation = validateManifest(manifest)
+    const manifestId = manifest.id || generateId()
+    try {
+      await pool.execute(
+        `INSERT INTO activity_manifests (id, app_id, owner_id, manifest, is_valid, validation_errors) VALUES (?, ?, ?, ?, ?, ?)`,
+        [manifestId, appId, ownerId, JSON.stringify(manifest), validation.valid ? 1 : 0, validation.valid ? null : JSON.stringify(validation.errors)]
+      )
+      return { id: manifestId, appId, manifest, isValid: validation.valid, validationErrors: validation.errors }
+    } catch (err) {
+      console.error('[Activity] manifest create error:', err.message)
+      return null
+    }
+  },
+
+  async getByAppId(appId) {
+    const pool = getDbPool()
+    if (!pool) return null
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_manifests WHERE app_id = ?', [appId])
+      if (!rows || !rows[0]) return null
+      const row = rows[0]
+      return {
+        id: row.id,
+        appId: row.app_id,
+        ownerId: row.owner_id,
+        manifest: row.manifest,
+        isValid: !!row.is_valid,
+        validationErrors: row.validation_errors ? JSON.parse(row.validation_errors) : null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }
+    } catch (err) {
+      console.error('[Activity] manifest getByAppId error:', err.message)
+      return null
+    }
+  },
+
+  async update(appId, ownerId, manifest) {
+    const pool = getDbPool()
+    if (!pool) return null
+    const validation = validateManifest(manifest)
+    try {
+      const [result] = await pool.execute(
+        `UPDATE activity_manifests SET manifest = ?, is_valid = ?, validation_errors = ?, updated_at = CURRENT_TIMESTAMP WHERE app_id = ? AND owner_id = ?`,
+        [JSON.stringify(manifest), validation.valid ? 1 : 0, validation.valid ? null : JSON.stringify(validation.errors), appId, ownerId]
+      )
+      return result.affectedRows > 0 ? { id: manifest.id || generateId(), appId, manifest, isValid: validation.valid, validationErrors: validation.errors } : null
+    } catch (err) {
+      console.error('[Activity] manifest update error:', err.message)
+      return null
+    }
+  },
+
+  async delete(appId, ownerId) {
+    const pool = getDbPool()
+    if (!pool) return false
+    try {
+      const [result] = await pool.execute('DELETE FROM activity_manifests WHERE app_id = ? AND owner_id = ?', [appId, ownerId])
+      return result.affectedRows > 0
+    } catch (err) {
+      console.error('[Activity] manifest delete error:', err.message)
+      return false
+    }
+  },
+
+  async listByUser(userId) {
+    const pool = getDbPool()
+    if (!pool) return []
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_manifests WHERE owner_id = ?', [userId])
+      if (!rows || !Array.isArray(rows)) return []
+      return rows.map(row => ({
+        id: row.id,
+        appId: row.app_id,
+        ownerId: row.owner_id,
+        manifest: row.manifest,
+        isValid: !!row.is_valid,
+        validationErrors: row.validation_errors ? JSON.parse(row.validation_errors) : null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      }))
+    } catch (err) {
+      console.error('[Activity] manifest listByUser error:', err.message)
+      return []
+    }
+  },
+
+  validate(manifest) {
+    return validateManifest(manifest)
+  }
+}
+
+export const activityRefreshTokenService = {
+  async create(data) {
+    const pool = getDbPool()
+    if (!pool) return null
+    const refreshToken = generateId() + generateId()
+    const expiresAt = Date.now() + (30 * 24 * 60 * 60 * 1000)
+    try {
+      await pool.execute(
+        `INSERT INTO activity_oauth_refresh_tokens (refresh_token, app_id, client_id, user_id, scope, context_type, context_id, session_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [refreshToken, data.appId, data.clientId, data.userId, data.scope || '', data.contextType || null, data.contextId || null, data.sessionId || null, Date.now(), expiresAt]
+      )
+      return { refreshToken, expiresAt }
+    } catch (err) {
+      console.error('[Activity] refresh token create error:', err.message)
+      return null
+    }
+  },
+
+  async use(refreshToken) {
+    const pool = getDbPool()
+    if (!pool) return null
+    try {
+      const [rows] = await pool.execute('SELECT * FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
+      const tokenData = rows[0]
+      if (!tokenData) return { error: 'invalid_grant' }
+      if (Date.now() > tokenData.expires_at) {
+        await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
+        return { error: 'invalid_grant' }
+      }
+      await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
+      return {
+        appId: tokenData.app_id,
+        clientId: tokenData.client_id,
+        userId: tokenData.user_id,
+        scope: tokenData.scope,
+        contextType: tokenData.context_type,
+        contextId: tokenData.context_id,
+        sessionId: tokenData.session_id
+      }
+    } catch (err) {
+      console.error('[Activity] refresh token use error:', err.message)
+      return null
+    }
+  },
+
+  async revoke(userId, refreshToken) {
+    const pool = getDbPool()
+    if (!pool) return false
+    try {
+      const [result] = await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ? AND user_id = ?', [refreshToken, userId])
+      return result.affectedRows > 0
+    } catch (err) {
+      console.error('[Activity] refresh token revoke error:', err.message)
+      return false
+    }
+  },
+
+  async revokeAll(userId, appId) {
+    const pool = getDbPool()
+    if (!pool) return false
+    try {
+      if (appId) {
+        await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE user_id = ? AND app_id = ?', [userId, appId])
+      } else {
+        await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE user_id = ?', [userId])
+      }
+      return true
+    } catch (err) {
+      console.error('[Activity] refresh token revokeAll error:', err.message)
+      return false
+    }
+  }
+}
+
 export const activityService = {
   async listCatalog() {
     const publicActivities = await activityPublicService.listAll()
@@ -3749,8 +4036,60 @@ export const activityService = {
     return activityPublicService.create(userId, data)
   },
 
+  async deletePublicActivity(userId, activityId) {
+    return activityPublicService.delete(userId, activityId)
+  },
+
   async getAppByClientId(clientId) {
     return activityAppService.getByClientId(clientId)
+  },
+
+  async getAppById(appId) {
+    return activityAppService.getById(appId)
+  },
+
+  async updateApp(userId, appId, data) {
+    const existing = await activityAppService.getById(appId)
+    if (!existing || existing.ownerId !== userId) return null
+    return activityAppService.update(userId, appId, data)
+  },
+
+  async deleteApp(userId, appId) {
+    const existing = await activityAppService.getById(appId)
+    if (!existing || existing.ownerId !== userId) return false
+    await activityAppService.delete(userId, appId)
+    await activityManifestService.delete(appId, userId)
+    return true
+  },
+
+  async createManifest(appId, userId, manifest) {
+    const existing = await activityAppService.getById(appId)
+    if (!existing || existing.ownerId !== userId) return null
+    return activityManifestService.create(appId, userId, manifest)
+  },
+
+  async getManifest(appId) {
+    return activityManifestService.getByAppId(appId)
+  },
+
+  async updateManifest(appId, userId, manifest) {
+    const existing = await activityAppService.getById(appId)
+    if (!existing || existing.ownerId !== userId) return null
+    return activityManifestService.update(appId, userId, manifest)
+  },
+
+  async deleteManifest(appId, userId) {
+    const existing = await activityAppService.getById(appId)
+    if (!existing || existing.ownerId !== userId) return false
+    return activityManifestService.delete(appId, userId)
+  },
+
+  async validateManifest(manifest) {
+    return activityManifestService.validate(manifest)
+  },
+
+  async listManifestsByUser(userId) {
+    return activityManifestService.listByUser(userId)
   },
 
   async createAuthorizationCode(data) {
@@ -3758,11 +4097,74 @@ export const activityService = {
   },
 
   async exchangeAuthorizationCode(data) {
-    return activityOAuthService.exchangeCode(data)
+    const result = await activityOAuthService.exchangeCode(data)
+    if (result?.access_token) {
+      await activityRefreshTokenService.create({
+        appId: result.app_id,
+        clientId: data.clientId,
+        userId: result.user_id,
+        scope: result.scope
+      })
+    }
+    return result
+  },
+
+  async refreshAccessToken(refreshToken, clientId, clientSecret) {
+    const tokenData = await activityRefreshTokenService.use(refreshToken)
+    if (tokenData?.error) return tokenData
+    if (tokenData.clientId !== clientId) return { error: 'invalid_grant' }
+    const app = await activityAppService.getByClientId(clientId)
+    if (!app || app.clientSecret !== clientSecret) return { error: 'invalid_client' }
+    const accessToken = generateId() + generateId()
+    const expiresAt = Date.now() + (3600 * 1000)
+    try {
+      const pool = getDbPool()
+      await pool.execute(
+        `INSERT INTO activity_oauth_tokens (access_token, app_id, client_id, user_id, scope, context_type, context_id, session_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [accessToken, app.id, clientId, tokenData.userId, tokenData.scope, tokenData.contextType, tokenData.contextId, tokenData.sessionId, Date.now(), expiresAt]
+      )
+      await activityRefreshTokenService.create({
+        appId: app.id,
+        clientId,
+        userId: tokenData.userId,
+        scope: tokenData.scope,
+        contextType: tokenData.contextType,
+        contextId: tokenData.contextId,
+        sessionId: tokenData.sessionId
+      })
+      return {
+        access_token: accessToken,
+        token_type: 'Bearer',
+        expires_in: 3600,
+        refresh_token: tokenData.refreshToken,
+        scope: tokenData.scope
+      }
+    } catch (err) {
+      console.error('[Activity] refresh token error:', err.message)
+      return { error: 'server_error' }
+    }
+  },
+
+  async revokeToken(token, userId) {
+    if (!token || !userId) return { error: 'invalid_request' }
+    const pool = getDbPool()
+    if (!pool) return { error: 'server_error' }
+    try {
+      const [result] = await pool.execute('DELETE FROM activity_oauth_tokens WHERE access_token = ? AND user_id = ?', [token, userId])
+      await activityRefreshTokenService.revokeAll(userId)
+      return { success: result.affectedRows > 0 }
+    } catch (err) {
+      console.error('[Activity] revoke token error:', err.message)
+      return { error: 'server_error' }
+    }
   },
 
   async introspectAccessToken(token) {
     return activityOAuthService.introspectAccessToken(token)
+  },
+
+  getAvailableScopes() {
+    return VALID_SCOPES
   }
 }
 

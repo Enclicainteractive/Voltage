@@ -142,6 +142,7 @@ const serializeActivitySession = (sessionId) => {
     sessionId: session.id,
     activityId: session.activityId,
     activityName: session.activityName,
+    launchUrl: session.launchUrl || null,
     contextType: session.contextType,
     contextId: session.contextId,
     ownerId: session.ownerId,
@@ -1237,7 +1238,7 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('activity:create-session', (data = {}) => {
       try {
-        const { contextType = 'voice', contextId, activityId, activityDefinition = null, p2p, sound } = data
+        const { contextType = 'voice', contextId, activityId, activityDefinition = null, launchUrl = null, p2p, sound } = data
         if (!contextId || !activityId) {
           socket.emit('activity:error', { error: 'Missing activity id or context' })
           return
@@ -1245,11 +1246,13 @@ export const setupSocketHandlers = (io) => {
 
         const sessionId = uuidv4()
         const activityName = activityDefinition?.name || String(activityId).replace(/^builtin:/, '').replace(/[-_]/g, ' ') || 'Activity'
+        const resolvedLaunchUrl = launchUrl || activityDefinition?.launchUrl || null
         const now = new Date().toISOString()
         const session = {
           id: sessionId,
           activityId,
           activityName,
+          launchUrl: resolvedLaunchUrl,
           contextType,
           contextId,
           ownerId: userId,
