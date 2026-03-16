@@ -319,7 +319,13 @@ router.delete('/avatar', async (req, res) => {
 
 // Update profile
 router.put('/profile', async (req, res) => {
-  const { displayName, bio, customStatus, socialLinks, banner, avatar, customUsername, birthDate } = req.body
+  const {
+    displayName, bio, customStatus, socialLinks, banner, avatar, customUsername, birthDate,
+    accentColor, profileEffect,
+    // New customization fields
+    profileCSS, profileTemplate, bannerEffect, profileLayout, badgeStyle,
+    clientCSS, clientCSSEnabled
+  } = req.body
   const updates = {}
   
   if (customUsername !== undefined) {
@@ -370,10 +376,93 @@ router.put('/profile', async (req, res) => {
     }
     updates.socialLinks = sanitized
   }
+  if (accentColor !== undefined) {
+    // Validate hex color or null
+    if (accentColor === null || /^#[0-9a-fA-F]{6}$/.test(accentColor)) {
+      updates.accentColor = accentColor
+    }
+  }
+  if (profileEffect !== undefined) {
+    updates.profileEffect = typeof profileEffect === 'string' ? profileEffect.slice(0, 64) : null
+  }
+  // Profile customization fields
+  if (profileCSS !== undefined) {
+    // Limit to 20 KB
+    updates.profileCSS = typeof profileCSS === 'string' ? profileCSS.slice(0, 20480) : null
+  }
+  if (profileTemplate !== undefined) {
+    updates.profileTemplate = typeof profileTemplate === 'string' ? profileTemplate.slice(0, 64) : 'default'
+  }
+  if (bannerEffect !== undefined) {
+    const validEffects = ['none', 'gradient-shift', 'pulse', 'wave', 'aurora', 'shimmer', 'particles']
+    updates.bannerEffect = validEffects.includes(bannerEffect) ? bannerEffect : 'none'
+  }
+  if (profileLayout !== undefined) {
+    const validLayouts = ['standard', 'compact', 'expanded', 'card']
+    updates.profileLayout = validLayouts.includes(profileLayout) ? profileLayout : 'standard'
+  }
+  if (badgeStyle !== undefined) {
+    const validBadgeStyles = ['default', 'glow', 'bordered', 'minimal', '3d']
+    updates.badgeStyle = validBadgeStyles.includes(badgeStyle) ? badgeStyle : 'default'
+  }
+  // Client-side custom CSS (synced across devices)
+  if (clientCSS !== undefined) {
+    updates.clientCSS = typeof clientCSS === 'string' ? clientCSS.slice(0, 51200) : null
+  }
+  if (clientCSSEnabled !== undefined) {
+    updates.clientCSSEnabled = Boolean(clientCSSEnabled)
+  }
   
   const profile = await userService.updateProfile(req.user.id, updates)
   console.log(`[API] Profile updated for ${req.user.username}`)
   res.json(profile)
+})
+
+// Get user guild tag
+router.get('/guild-tag', async (req, res) => {
+  const profile = userService.getUser(req.user.id)
+  res.json({ guildTag: profile?.guildTag || null, guildTagServerId: profile?.guildTagServerId || null })
+})
+
+// Set/update user guild tag (display a server's tag on your profile globally)
+router.put('/guild-tag', async (req, res) => {
+  const { serverId } = req.body
+  if (serverId === null || serverId === undefined || serverId === '') {
+    // Clear guild tag
+    await userService.updateProfile(req.user.id, { guildTag: null, guildTagServerId: null })
+    return res.json({ guildTag: null, guildTagServerId: null })
+  }
+  const servers = serverService.getAllServers ? toArray(serverService.getAllServers()) : []
+  const server = (Array.isArray(servers) ? servers : Object.values(servers || {})).find(s => s.id === serverId)
+  if (!server) return res.status(404).json({ error: 'Server not found' })
+  // User must be a member
+  const isMember = Array.isArray(server.members) && server.members.some(m => m.id === req.user.id)
+  if (!isMember) return res.status(403).json({ error: 'You are not a member of this server' })
+  if (!server.guildTag) return res.status(400).json({ error: 'This server has no guild tag set' })
+  await userService.updateProfile(req.user.id, { guildTag: server.guildTag, guildTagServerId: serverId })
+  res.json({ guildTag: server.guildTag, guildTagServerId: serverId })
+})
+
+// Get server nick for current user in a server
+router.get('/server-nick/:serverId', async (req, res) => {
+  const profile = userService.getUser(req.user.id)
+  const serverNicks = profile?.serverNicks || {}
+  res.json({ nick: serverNicks[req.params.serverId] || null })
+})
+
+// Set server nick for current user in a server
+router.put('/server-nick/:serverId', async (req, res) => {
+  const { nick } = req.body
+  const profile = userService.getUser(req.user.id)
+  const serverNicks = { ...(profile?.serverNicks || {}) }
+  if (!nick || nick.trim() === '') {
+    delete serverNicks[req.params.serverId]
+  } else {
+    const trimmed = nick.trim().slice(0, 32)
+    serverNicks[req.params.serverId] = trimmed
+  }
+  await userService.updateProfile(req.user.id, { serverNicks })
+  res.json({ nick: serverNicks[req.params.serverId] || null })
 })
 
 // Update status
@@ -588,8 +677,12 @@ router.get('/:userId', async (req, res) => {
   const avatarUrl = resolveUserAvatar(userId, profile)
   const bannerUrl = resolveStoredProfileImage(profile.banner, null)
   
+  // Strip private/sensitive fields from public profile response
+  const { clientCSS, clientCSSEnabled, passwordHash, serverNicks, email, ...publicProfile } = profile
+  const isOwn = req.user.id === userId
+
   res.json({
-    ...profile,
+    ...publicProfile,
     host: profile.host || config.getHost(),
     avatarHost: profile.avatarHost || config.getImageServerUrl(),
     imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
@@ -598,7 +691,18 @@ router.get('/:userId', async (req, res) => {
     status: liveStatus,
     address: buildAddress(profile),
     isFriend,
-    isBlocked
+    isBlocked,
+    // Only include email for own profile
+    ...(isOwn ? { email: profile.email } : {}),
+    // Include profileCSS so viewers can render it
+    profileCSS: profile.profileCSS || null,
+    profileTemplate: profile.profileTemplate || 'default',
+    bannerEffect: profile.bannerEffect || 'none',
+    profileLayout: profile.profileLayout || 'standard',
+    badgeStyle: profile.badgeStyle || 'default',
+    accentColor: profile.accentColor || null,
+    // clientCSS is only returned to the owner
+    ...(isOwn ? { clientCSS: profile.clientCSS || null, clientCSSEnabled: profile.clientCSSEnabled !== false } : {})
   })
 })
 

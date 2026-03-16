@@ -18,12 +18,39 @@ class CDNService {
     this.provider = this.config.provider || 'local'
   }
 
+  /**
+   * Resolve the active upload directory.
+   * - 'nfs'   → uses cdn.nfs.uploadDir (the mounted NFS path)
+   * - 'local' → uses UPLOADS_DIR (the default ./uploads directory)
+   * Both behave identically at the filesystem level; NFS just happens
+   * to be a remote share that looks like a local directory to the OS.
+   */
+  getActiveUploadDir() {
+    if (this.provider === 'nfs' && this.config.nfs?.uploadDir) {
+      const nfsDir = this.config.nfs.uploadDir
+      if (!fs.existsSync(nfsDir)) {
+        try {
+          fs.mkdirSync(nfsDir, { recursive: true })
+        } catch (err) {
+          console.error(`[CDN/NFS] Cannot create NFS upload dir "${nfsDir}":`, err.message)
+        }
+      }
+      return nfsDir
+    }
+    return UPLOADS_DIR
+  }
+
   async upload(file, options = {}) {
     const { filename, mimetype, originalname } = file
     
     const ext = path.extname(originalname)
     const fileId = uuidv4()
     const storedFilename = `${fileId}${ext}`
+
+    // NFS: treat exactly like local — the OS handles the remote filesystem
+    if (this.provider === 'nfs') {
+      return this.uploadLocal(file, storedFilename, options)
+    }
 
     if (this.enabled && this.provider !== 'local') {
       return this.uploadToCDN(file, storedFilename, options)
@@ -33,7 +60,9 @@ class CDNService {
   }
 
   async uploadLocal(file, storedFilename, options = {}) {
-    const destPath = path.join(UPLOADS_DIR, storedFilename)
+    const activeDir = this.getActiveUploadDir()
+    const destPath = path.join(activeDir, storedFilename)
+    const providerLabel = this.provider === 'nfs' ? 'nfs' : 'local'
     
     return new Promise((resolve, reject) => {
       const readStream = fs.createReadStream(file.path)
@@ -44,7 +73,7 @@ class CDNService {
       writeStream.on('finish', () => {
         resolve({
           success: true,
-          provider: 'local',
+          provider: providerLabel,
           fileId: path.basename(storedFilename, path.extname(storedFilename)),
           filename: storedFilename,
           url: `/api/upload/file/${storedFilename}`,
@@ -178,11 +207,12 @@ class CDNService {
   }
 
   async deleteLocal(filename) {
-    const filePath = path.join(UPLOADS_DIR, filename)
+    const activeDir = this.getActiveUploadDir()
+    const filePath = path.join(activeDir, filename)
     
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath)
-      return { success: true, provider: 'local' }
+      return { success: true, provider: this.provider === 'nfs' ? 'nfs' : 'local' }
     }
     
     return { success: false, error: 'File not found' }
@@ -230,7 +260,7 @@ class CDNService {
   }
 
   getUploadDir() {
-    return UPLOADS_DIR
+    return this.getActiveUploadDir()
   }
 
   getLocalUrl(filename) {
@@ -245,10 +275,16 @@ class CDNService {
     return this.provider
   }
 
+  isNfs() {
+    return this.provider === 'nfs'
+  }
+
   getConfig() {
     return {
       enabled: this.enabled,
       provider: this.provider,
+      nfsEnabled: this.isNfs(),
+      nfsMountPath: this.isNfs() ? (this.config.nfs?.uploadDir || null) : null,
       hasCredentials: !!(
         (this.config.s3?.accessKeyId && this.config.s3?.secretAccessKey) ||
         (this.config.cloudflare?.accessKeyId && this.config.cloudflare?.secretAccessKey)

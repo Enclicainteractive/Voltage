@@ -18,8 +18,9 @@ Complete reference for all VoltChat backend configuration options.
 12. [Limits Section](#limits-section)
 13. [Logging Section](#logging-section)
 14. [Monitoring Section](#monitoring-section)
-15. [Environment Variables](#environment-variables)
-16. [Config Loader API](#config-loader-api)
+15. [Scaling Section](#scaling-section)
+16. [Environment Variables](#environment-variables)
+17. [Config Loader API](#config-loader-api)
 
 ---
 
@@ -535,7 +536,7 @@ Configure content delivery for uploaded files (avatars, attachments, images).
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `enabled` | boolean | No | `false` | Enable CDN functionality |
-| `provider` | string | If enabled | `"local"` | CDN provider: `local`, `s3`, `cloudflare` |
+| `provider` | string | If enabled | `"local"` | CDN provider: `local`, `nfs`, `s3`, `cloudflare` |
 
 ### Local Provider
 
@@ -558,6 +559,35 @@ Stores files on the local filesystem.
   }
 }
 ```
+
+### NFS Provider
+
+NFS (Network File System) shared folder. All VPS nodes mount the same directory from a Storage Master. Uploads written on any node are instantly available on all others because they are all reading the same physical disk. **No application code changes required.**
+
+Use this when running Voltage across multiple VPS servers. See [SCALING.md](SCALING.md) for the complete setup guide.
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `nfs.uploadDir` | string | If provider=nfs | `null` | Path where the NFS share is mounted on this node. Must exist and be writable before starting Voltage. |
+| `nfs.baseUrl` | string | No | `null` | Public URL base for serving files (same as `local.baseUrl`). Leave `null` to use the standard `/api/upload/file/` route. |
+
+```json
+{
+  "cdn": {
+    "enabled": true,
+    "provider": "nfs",
+    "nfs": {
+      "uploadDir": "/www/shared_uploads",
+      "baseUrl": null
+    }
+  }
+}
+```
+
+**Pros**: Files are instantly consistent across all nodes; zero application-layer routing; simple config
+**Cons**: Requires NFS setup on the OS level; nodes must be in the same datacenter or have low-latency private networking; Storage Master becomes a single point of failure unless replicated
+
+> If you mount the NFS share directly at Voltage's default `./uploads` directory and keep `provider: "local"`, it also works — NFS is transparent to the OS. The `"nfs"` provider is for custom mount paths.
 
 ### S3 Provider
 
@@ -619,25 +649,28 @@ Cloudflare R2 (zero egress fees).
 
 ### Feature Support by CDN Provider
 
-| Feature | Local | S3 | Cloudflare R2 |
-|---------|-------|-----|---------------|
-| **File Upload** | ✅ | ✅ | ✅ |
-| **File Download** | ✅ | ✅ | ✅ |
-| **Avatars** | ✅ | ✅ | ✅ |
-| **Attachments** | ✅ | ✅ | ✅ |
-| **Streaming** | ❌ | ✅ | ✅ |
-| **CDN/Cache** | ❌ | ✅* | ✅ |
-| **Zero Egress** | N/A | ❌ | ✅ |
-| **Custom Domain** | ✅ | ✅ | ✅ |
-| **Signed URLs** | ❌ | ❌ | ❌ |
-| **Webhooks** | N/A | ❌ | ❌ |
+| Feature | Local | NFS | S3 | Cloudflare R2 |
+|---------|-------|-----|----|---------------|
+| **File Upload** | ✅ | ✅ | ✅ | ✅ |
+| **File Download** | ✅ | ✅ | ✅ | ✅ |
+| **Avatars** | ✅ | ✅ | ✅ | ✅ |
+| **Attachments** | ✅ | ✅ | ✅ | ✅ |
+| **Multi-node consistent** | ❌ | ✅ | ✅ | ✅ |
+| **Streaming** | ❌ | ❌ | ✅ | ✅ |
+| **CDN/Cache** | ❌ | ❌ | ✅* | ✅ |
+| **Zero Egress** | N/A | N/A | ❌ | ✅ |
+| **Custom Domain** | ✅ | ✅ | ✅ | ✅ |
+| **No extra infra** | ✅ | ❌ | ❌ | ❌ |
 
 *With CloudFront distribution
 
 ### Recommended Setup
 
-**Development**: Local provider
-**Production**: S3 with CloudFront or Cloudflare R2
+| Deployment | Recommended Provider |
+|------------|---------------------|
+| Development / single server | `local` |
+| 2–5 nodes, same datacenter | `nfs` |
+| Large scale / multi-region | `s3` or `cloudflare` |
 
 ---
 
@@ -1310,6 +1343,80 @@ http_requests_total{method="GET",status="200"} 12345
 | Custom Metrics | ❌ | Planned |
 | Tracing | ❌ | Planned |
 | APM | ❌ | External |
+
+---
+
+## Scaling Section
+
+Configuration for running Voltage across multiple VPS servers behind a load balancer. This is **not federation** — all nodes are the same instance sharing the same database.
+
+For a complete step-by-step guide including NFS setup, HAProxy config, and firewall rules, see [SCALING.md](SCALING.md).
+
+```json
+{
+  "scaling": {
+    "enabled": false,
+    "nodeSecret": "CHANGE_ME_SAME_ON_ALL_NODES",
+    "nodeId": "node-1",
+    "nodeUrl": "http://10.0.0.1:5000",
+    "nodes": [
+      { "id": "node-1", "url": "http://10.0.0.1:5000" },
+      { "id": "node-2", "url": "http://10.0.0.2:5000" }
+    ],
+    "heartbeatInterval": 30000,
+    "heartbeatTimeout": 90000,
+    "fileResolutionMode": "proxy"
+  }
+}
+```
+
+### Configuration Options
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `enabled` | boolean | No | `false` | Enable multi-node scaling |
+| `nodeSecret` | string | If enabled | — | Shared secret for node-to-node auth. **Must be identical on all nodes.** Generate with `openssl rand -hex 32`. |
+| `nodeId` | string | If enabled | — | Unique identifier for this node. Use a short slug: `node-1`, `vps-nyc`, `eu-west`. **Different on each node.** |
+| `nodeUrl` | string | If enabled | server.url | URL other nodes use to reach THIS node internally. Use private/internal IPs. **Different on each node.** |
+| `nodes` | array | If enabled | `[]` | List of all nodes in the cluster including self. Same on all nodes. Format: `[{ "id": "...", "url": "..." }]` |
+| `heartbeatInterval` | number | No | `30000` | How often (ms) to ping peer nodes to check health |
+| `heartbeatTimeout` | number | No | `90000` | How long (ms) without a heartbeat before a node is marked offline |
+| `fileResolutionMode` | string | No | `"proxy"` | How to serve files from peer nodes: `"proxy"` (stream through this node) or `"redirect"` (302 to peer) |
+
+### What Changes Per Node
+
+Only two fields differ between nodes. Everything else is a carbon copy:
+
+| Field | node-1 | node-2 |
+|-------|--------|--------|
+| `scaling.nodeId` | `"node-1"` | `"node-2"` |
+| `scaling.nodeUrl` | `"http://10.0.0.1:5000"` | `"http://10.0.0.2:5000"` |
+
+### File Resolution Modes
+
+| Mode | Behavior |
+|------|----------|
+| `"proxy"` | This node fetches the file from the peer and streams it to the client. Peer URLs are never exposed. |
+| `"redirect"` | This node sends a 302 redirect to the peer node's direct URL. One fewer network hop, but exposes peer URLs. |
+
+### Admin API Endpoints
+
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `GET /api/scale/ping` | None | Node liveness + version |
+| `GET /api/scale/admin/status` | Admin | Full cluster status |
+| `GET /api/scale/admin/nodes` | Admin | Node list with live state |
+| `POST /api/scale/admin/refresh` | Admin | Force heartbeat refresh |
+
+### File Storage Requirements
+
+Multi-node deployments require a shared file storage strategy. Options ranked by simplicity:
+
+1. **NFS** (`cdn.provider: "nfs"`) — mount a shared folder from a Storage Master. See above.
+2. **Peer-proxy** — built in, no extra infra, works automatically when `scaling.enabled: true`.
+3. **S3 / Cloudflare R2** — best for large scale. Files never stored locally.
+
+> SQLite is not supported for multi-node. Use MariaDB, MySQL, PostgreSQL, or CockroachDB.
 
 ---
 

@@ -2594,7 +2594,10 @@ export const discoveryService = {
           name: entry.name || server.name,
           icon: entry.icon || server.icon,
           description: entry.description || server.description,
-          memberCount: server.members?.length || 0
+          memberCount: server.members?.length || 0,
+          // Guild tag — only include if server has one and it's not private
+          guildTag: server.guildTagPrivate ? null : (server.guildTag || null),
+          guildTagPrivate: server.guildTagPrivate === true
         }
       }
       return entry
@@ -3205,10 +3208,18 @@ export const callLogService = {
 
 export const initActivityTables = async () => {
   const pool = getDbPool()
-  if (!pool) return
+  if (!pool) {
+    console.warn('[Activity] No DB pool available — activity tables not initialized')
+    return
+  }
   
+  // Use pool.query() — works with both mysql2 (returns [rows, fields]) and
+  // mariadb (returns rows directly). We don't destructure the result so both
+  // drivers work without special-casing.
+  const run = (sql) => pool.query(sql)
+
   try {
-    await pool.execute(`
+    await run(`
       CREATE TABLE IF NOT EXISTS activity_apps (
         id VARCHAR(255) PRIMARY KEY,
         client_id VARCHAR(255) UNIQUE NOT NULL,
@@ -3220,11 +3231,11 @@ export const initActivityTables = async () => {
         scopes TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_owner_id (owner_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        INDEX idx_activity_apps_owner (owner_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `)
     
-    await pool.execute(`
+    await run(`
       CREATE TABLE IF NOT EXISTS activity_public (
         id VARCHAR(255) PRIMARY KEY,
         owner_id VARCHAR(255) NOT NULL,
@@ -3237,13 +3248,12 @@ export const initActivityTables = async () => {
         is_builtin_client TINYINT(1) DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_owner_id (owner_id),
-        INDEX idx_visibility (visibility)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        INDEX idx_activity_public_owner (owner_id),
+        INDEX idx_activity_public_visibility (visibility)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `)
     
-    // OAuth authorization codes - temporary codes for OAuth flow
-    await pool.execute(`
+    await run(`
       CREATE TABLE IF NOT EXISTS activity_oauth_codes (
         code VARCHAR(255) PRIMARY KEY,
         client_id VARCHAR(255) NOT NULL,
@@ -3255,13 +3265,12 @@ export const initActivityTables = async () => {
         session_id VARCHAR(255),
         app_id VARCHAR(255),
         expires_at BIGINT NOT NULL,
-        INDEX idx_client_id (client_id),
-        INDEX idx_user_id (user_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        INDEX idx_activity_codes_client (client_id),
+        INDEX idx_activity_codes_user (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `)
     
-    // OAuth access tokens - long-lived tokens for API access
-    await pool.execute(`
+    await run(`
       CREATE TABLE IF NOT EXISTS activity_oauth_tokens (
         access_token VARCHAR(255) PRIMARY KEY,
         app_id VARCHAR(255) NOT NULL,
@@ -3273,30 +3282,28 @@ export const initActivityTables = async () => {
         session_id VARCHAR(255),
         created_at BIGINT NOT NULL,
         expires_at BIGINT NOT NULL,
-        INDEX idx_app_id (app_id),
-        INDEX idx_client_id (client_id),
-        INDEX idx_user_id (user_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        INDEX idx_activity_tokens_app (app_id),
+        INDEX idx_activity_tokens_client (client_id),
+        INDEX idx_activity_tokens_user (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `)
     
-    // Activity manifests - JSON schemas for custom activities
-    await pool.execute(`
+    await run(`
       CREATE TABLE IF NOT EXISTS activity_manifests (
         id VARCHAR(255) PRIMARY KEY,
         app_id VARCHAR(255) NOT NULL,
         owner_id VARCHAR(255) NOT NULL,
-        manifest JSON NOT NULL,
+        manifest LONGTEXT NOT NULL,
         is_valid TINYINT(1) DEFAULT 1,
         validation_errors TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_app_id (app_id),
-        INDEX idx_owner_id (owner_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        INDEX idx_activity_manifests_app (app_id),
+        INDEX idx_activity_manifests_owner (owner_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `)
     
-    // OAuth refresh tokens for token renewal
-    await pool.execute(`
+    await run(`
       CREATE TABLE IF NOT EXISTS activity_oauth_refresh_tokens (
         refresh_token VARCHAR(255) PRIMARY KEY,
         app_id VARCHAR(255) NOT NULL,
@@ -3308,13 +3315,16 @@ export const initActivityTables = async () => {
         session_id VARCHAR(255),
         created_at BIGINT NOT NULL,
         expires_at BIGINT NOT NULL,
-        INDEX idx_app_id (app_id),
-        INDEX idx_client_id (client_id),
-        INDEX idx_user_id (user_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        INDEX idx_activity_refresh_app (app_id),
+        INDEX idx_activity_refresh_client (client_id),
+        INDEX idx_activity_refresh_user (user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `)
+
+    console.log('[Activity] Tables initialized successfully')
   } catch (err) {
     console.error('[Activity] Failed to initialize tables:', err.message)
+    throw err
   }
 }
 
@@ -3441,25 +3451,48 @@ const DEFAULT_ACTIVITIES = [
   { id: 'builtin:connect-four', key: 'connect-four', name: 'Connect Four', description: 'Drop-disc strategy game.', category: 'Games', icon: 'connect-four', participantCap: 8, isBuiltinClient: true, oauthRequired: false, launchUrl: 'builtin://connect-four' }
 ]
 
+// Helper: normalise rows returned by either mysql2 (returns [rows,fields] tuple)
+// or mariadb (returns rows array directly). Both are now covered.
+const dbRows = (result) => {
+  if (!result) return []
+  // mysql2: result is [rowsArray, fieldsArray]
+  if (Array.isArray(result) && Array.isArray(result[0])) return result[0]
+  // mariadb: result is the rows array directly
+  if (Array.isArray(result)) return result
+  return []
+}
+
+// Helper: normalise DML result (INSERT/UPDATE/DELETE) from either driver.
+// mysql2 returns [OkPacket, fields]; mariadb returns OkPacket directly.
+const dbResult = (result) => {
+  if (!result) return { affectedRows: 0 }
+  if (Array.isArray(result)) return result[0] || { affectedRows: 0 }
+  return result
+}
+
 export const activityAppService = {
+  _mapRow(row) {
+    return {
+      id: row.id,
+      clientId: row.client_id,
+      clientSecret: row.client_secret,
+      ownerId: row.owner_id,
+      name: row.name,
+      description: row.description,
+      redirectUris: row.redirect_uris ? JSON.parse(row.redirect_uris) : [],
+      scopes: row.scopes ? JSON.parse(row.scopes) : [],
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }
+  },
+
   async listByUser(userId) {
     const pool = getDbPool()
     if (!pool) return []
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_apps WHERE owner_id = ?', [userId])
-      if (!rows || !Array.isArray(rows)) return []
-      return rows.map(row => ({
-        id: row.id,
-        clientId: row.client_id,
-        clientSecret: row.client_secret,
-        ownerId: row.owner_id,
-        name: row.name,
-        description: row.description,
-        redirectUris: row.redirect_uris ? JSON.parse(row.redirect_uris) : [],
-        scopes: row.scopes ? JSON.parse(row.scopes) : [],
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }))
+      const raw = await pool.query('SELECT * FROM activity_apps WHERE owner_id = ?', [userId])
+      const rows = dbRows(raw)
+      return rows.map(r => this._mapRow(r))
     } catch (err) {
       console.error('[Activity] listByUser error:', err.message)
       return []
@@ -3470,21 +3503,10 @@ export const activityAppService = {
     const pool = getDbPool()
     if (!pool) return null
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_apps WHERE id = ?', [appId])
-      if (!rows || !Array.isArray(rows) || !rows[0]) return null
-      const row = rows[0]
-      return {
-        id: row.id,
-        clientId: row.client_id,
-        clientSecret: row.client_secret,
-        ownerId: row.owner_id,
-        name: row.name,
-        description: row.description,
-        redirectUris: row.redirect_uris ? JSON.parse(row.redirect_uris) : [],
-        scopes: row.scopes ? JSON.parse(row.scopes) : [],
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }
+      const raw = await pool.query('SELECT * FROM activity_apps WHERE id = ?', [appId])
+      const rows = dbRows(raw)
+      if (!rows[0]) return null
+      return this._mapRow(rows[0])
     } catch (err) {
       console.error('[Activity] getById error:', err.message)
       return null
@@ -3495,21 +3517,10 @@ export const activityAppService = {
     const pool = getDbPool()
     if (!pool) return null
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_apps WHERE client_id = ?', [clientId])
+      const raw = await pool.query('SELECT * FROM activity_apps WHERE client_id = ?', [clientId])
+      const rows = dbRows(raw)
       if (!rows[0]) return null
-      const row = rows[0]
-      return {
-        id: row.id,
-        clientId: row.client_id,
-        clientSecret: row.client_secret,
-        ownerId: row.owner_id,
-        name: row.name,
-        description: row.description,
-        redirectUris: row.redirect_uris ? JSON.parse(row.redirect_uris) : [],
-        scopes: row.scopes ? JSON.parse(row.scopes) : [],
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }
+      return this._mapRow(rows[0])
     } catch (err) {
       console.error('[Activity] getByClientId error:', err.message)
       return null
@@ -3522,21 +3533,17 @@ export const activityAppService = {
     const appId = generateId()
     const clientId = generateId()
     const clientSecret = generateId() + generateId()
+    const name = data.name || 'My Activity'
+    const description = data.description || ''
+    const redirectUris = data.redirectUris || []
+    const scopes = data.scopes || ['activities:read', 'activities:join']
     try {
-      await pool.execute(
+      await pool.query(
         `INSERT INTO activity_apps (id, client_id, client_secret, owner_id, name, description, redirect_uris, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [appId, clientId, clientSecret, ownerId, data.name || 'My Activity', data.description || '', JSON.stringify(data.redirectUris || []), JSON.stringify(data.scopes || ['activities:read', 'activities:join'])]
+        [appId, clientId, clientSecret, ownerId, name, description, JSON.stringify(redirectUris), JSON.stringify(scopes)]
       )
-      return {
-        id: appId,
-        clientId,
-        clientSecret,
-        ownerId,
-        name: data.name || 'My Activity',
-        description: data.description || '',
-        redirectUris: data.redirectUris || [],
-        scopes: data.scopes || ['activities:read', 'activities:join']
-      }
+      console.log(`[Activity] Created app ${appId} for owner ${ownerId}`)
+      return { id: appId, clientId, clientSecret, ownerId, name, description, redirectUris, scopes }
     } catch (err) {
       console.error('[Activity] create error:', err.message)
       return null
@@ -3548,11 +3555,11 @@ export const activityAppService = {
     if (!pool) return null
     const newSecret = generateId() + generateId()
     try {
-      const [result] = await pool.execute(
+      const raw = await pool.query(
         'UPDATE activity_apps SET client_secret = ? WHERE id = ? AND owner_id = ?',
         [newSecret, appId, ownerId]
       )
-      return result.affectedRows > 0 ? { clientSecret: newSecret } : null
+      return dbResult(raw).affectedRows > 0 ? { clientSecret: newSecret } : null
     } catch (err) {
       console.error('[Activity] rotateSecret error:', err.message)
       return null
@@ -3565,29 +3572,17 @@ export const activityAppService = {
     try {
       const fields = []
       const values = []
-      if (data.name !== undefined) {
-        fields.push('name = ?')
-        values.push(data.name)
-      }
-      if (data.description !== undefined) {
-        fields.push('description = ?')
-        values.push(data.description)
-      }
-      if (data.redirectUris !== undefined) {
-        fields.push('redirect_uris = ?')
-        values.push(JSON.stringify(data.redirectUris))
-      }
-      if (data.scopes !== undefined) {
-        fields.push('scopes = ?')
-        values.push(JSON.stringify(data.scopes))
-      }
+      if (data.name !== undefined) { fields.push('name = ?'); values.push(data.name) }
+      if (data.description !== undefined) { fields.push('description = ?'); values.push(data.description) }
+      if (data.redirectUris !== undefined) { fields.push('redirect_uris = ?'); values.push(JSON.stringify(data.redirectUris)) }
+      if (data.scopes !== undefined) { fields.push('scopes = ?'); values.push(JSON.stringify(data.scopes)) }
       if (fields.length === 0) return this.getById(appId)
       values.push(appId, ownerId)
-      const [result] = await pool.execute(
+      const raw = await pool.query(
         `UPDATE activity_apps SET ${fields.join(', ')} WHERE id = ? AND owner_id = ?`,
         values
       )
-      return result.affectedRows > 0 ? this.getById(appId) : null
+      return dbResult(raw).affectedRows > 0 ? this.getById(appId) : null
     } catch (err) {
       console.error('[Activity] update error:', err.message)
       return null
@@ -3598,11 +3593,11 @@ export const activityAppService = {
     const pool = getDbPool()
     if (!pool) return false
     try {
-      const [result] = await pool.execute(
+      const raw = await pool.query(
         'DELETE FROM activity_apps WHERE id = ? AND owner_id = ?',
         [appId, ownerId]
       )
-      return result.affectedRows > 0
+      return dbResult(raw).affectedRows > 0
     } catch (err) {
       console.error('[Activity] delete error:', err.message)
       return false
@@ -3611,25 +3606,28 @@ export const activityAppService = {
 }
 
 export const activityPublicService = {
+  _mapRow(row) {
+    return {
+      id: row.id,
+      ownerId: row.owner_id,
+      name: row.name,
+      description: row.description,
+      icon: row.icon,
+      category: row.category,
+      launchUrl: row.launch_url,
+      visibility: row.visibility,
+      isBuiltinClient: Boolean(row.is_builtin_client),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }
+  },
+
   async listAll() {
     const pool = getDbPool()
     if (!pool) return []
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_public WHERE visibility = ?', ['public'])
-      if (!rows || !Array.isArray(rows)) return []
-      return rows.map(row => ({
-        id: row.id,
-        ownerId: row.owner_id,
-        name: row.name,
-        description: row.description,
-        icon: row.icon,
-        category: row.category,
-        launchUrl: row.launch_url,
-        visibility: row.visibility,
-        isBuiltinClient: Boolean(row.is_builtin_client),
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }))
+      const raw = await pool.query('SELECT * FROM activity_public WHERE visibility = ?', ['public'])
+      return dbRows(raw).map(r => this._mapRow(r))
     } catch (err) {
       console.error('[Activity] listAll error:', err.message)
       return []
@@ -3640,22 +3638,10 @@ export const activityPublicService = {
     const pool = getDbPool()
     if (!pool) return null
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_public WHERE id = ?', [activityId])
-      if (!rows || !Array.isArray(rows) || !rows[0]) return null
-      const row = rows[0]
-      return {
-        id: row.id,
-        ownerId: row.owner_id,
-        name: row.name,
-        description: row.description,
-        icon: row.icon,
-        category: row.category,
-        launchUrl: row.launch_url,
-        visibility: row.visibility,
-        isBuiltinClient: Boolean(row.is_builtin_client),
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }
+      const raw = await pool.query('SELECT * FROM activity_public WHERE id = ?', [activityId])
+      const rows = dbRows(raw)
+      if (!rows[0]) return null
+      return this._mapRow(rows[0])
     } catch (err) {
       console.error('[Activity] getById error:', err.message)
       return null
@@ -3666,22 +3652,17 @@ export const activityPublicService = {
     const pool = getDbPool()
     if (!pool) return null
     const activityId = generateId()
+    const name = data.name || 'My Activity'
+    const description = data.description || ''
+    const icon = data.icon || 'puzzle'
+    const category = data.category || 'Games'
+    const launchUrl = data.launchUrl || ''
     try {
-      await pool.execute(
+      await pool.query(
         `INSERT INTO activity_public (id, owner_id, name, description, icon, category, launch_url, visibility, is_builtin_client) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [activityId, ownerId, data.name || 'My Activity', data.description || '', data.icon || 'puzzle', data.category || 'Games', data.launchUrl || '', 'public', 0]
+        [activityId, ownerId, name, description, icon, category, launchUrl, 'public', 0]
       )
-      return {
-        id: activityId,
-        ownerId,
-        name: data.name || 'My Activity',
-        description: data.description || '',
-        icon: data.icon || 'puzzle',
-        category: data.category || 'Games',
-        launchUrl: data.launchUrl || '',
-        visibility: 'public',
-        isBuiltinClient: false
-      }
+      return { id: activityId, ownerId, name, description, icon, category, launchUrl, visibility: 'public', isBuiltinClient: false }
     } catch (err) {
       console.error('[Activity] create public error:', err.message)
       return null
@@ -3692,11 +3673,11 @@ export const activityPublicService = {
     const pool = getDbPool()
     if (!pool) return false
     try {
-      const [result] = await pool.execute(
+      const raw = await pool.query(
         'DELETE FROM activity_public WHERE id = ? AND owner_id = ?',
         [activityId, ownerId]
       )
-      return result.affectedRows > 0
+      return dbResult(raw).affectedRows > 0
     } catch (err) {
       console.error('[Activity] delete public error:', err.message)
       return false
@@ -3711,7 +3692,7 @@ export const activityOAuthService = {
     const code = generateId() + generateId()
     const expiresAt = Date.now() + 10 * 60 * 1000
     try {
-      await pool.execute(
+      await pool.query(
         `INSERT INTO activity_oauth_codes (code, client_id, user_id, scope, redirect_uri, context_type, context_id, session_id, app_id, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [code, clientId, userId, scope, redirectUri, contextType, contextId, sessionId, appId, expiresAt]
       )
@@ -3726,11 +3707,11 @@ export const activityOAuthService = {
     const pool = getDbPool()
     if (!pool) return { error: 'server_error' }
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_oauth_codes WHERE code = ?', [code])
-      const codeData = rows[0]
+      const codeRows = dbRows(await pool.query('SELECT * FROM activity_oauth_codes WHERE code = ?', [code]))
+      const codeData = codeRows[0]
       if (!codeData) return { error: 'invalid_code' }
-      if (Date.now() > codeData.expires_at) {
-        await pool.execute('DELETE FROM activity_oauth_codes WHERE code = ?', [code])
+      if (Date.now() > Number(codeData.expires_at)) {
+        await pool.query('DELETE FROM activity_oauth_codes WHERE code = ?', [code])
         return { error: 'code_expired' }
       }
       if (codeData.client_id !== clientId) return { error: 'invalid_client' }
@@ -3739,14 +3720,14 @@ export const activityOAuthService = {
       const app = await activityAppService.getByClientId(clientId)
       if (!app || app.clientSecret !== clientSecret) return { error: 'invalid_client' }
 
-      await pool.execute('DELETE FROM activity_oauth_codes WHERE code = ?', [code])
+      await pool.query('DELETE FROM activity_oauth_codes WHERE code = ?', [code])
 
       const accessToken = generateId() + generateId() + generateId()
       const refreshToken = generateId() + generateId() + generateId()
       const now = Date.now()
       const expiresAt = now + 24 * 60 * 60 * 1000
 
-      await pool.execute(
+      await pool.query(
         `INSERT INTO activity_oauth_tokens (access_token, app_id, client_id, user_id, scope, context_type, context_id, session_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [accessToken, app.id, clientId, codeData.user_id, codeData.scope, codeData.context_type, codeData.context_id, codeData.session_id, now, expiresAt]
       )
@@ -3768,11 +3749,11 @@ export const activityOAuthService = {
     const pool = getDbPool()
     if (!pool) return { active: false }
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_oauth_tokens WHERE access_token = ?', [accessToken])
+      const rows = dbRows(await pool.query('SELECT * FROM activity_oauth_tokens WHERE access_token = ?', [accessToken]))
       const tokenData = rows[0]
       if (!tokenData) return { active: false }
-      if (Date.now() > tokenData.expires_at) {
-        await pool.execute('DELETE FROM activity_oauth_tokens WHERE access_token = ?', [accessToken])
+      if (Date.now() > Number(tokenData.expires_at)) {
+        await pool.query('DELETE FROM activity_oauth_tokens WHERE access_token = ?', [accessToken])
         return { active: false }
       }
       return {
@@ -3784,7 +3765,7 @@ export const activityOAuthService = {
         context_type: tokenData.context_type,
         context_id: tokenData.context_id,
         session_id: tokenData.session_id,
-        exp: Math.floor(tokenData.expires_at / 1000)
+        exp: Math.floor(Number(tokenData.expires_at) / 1000)
       }
     } catch (err) {
       console.error('[Activity] introspectAccessToken error:', err.message)
@@ -3841,13 +3822,26 @@ const validateManifest = (manifest) => {
 }
 
 export const activityManifestService = {
+  _mapRow(row) {
+    return {
+      id: row.id,
+      appId: row.app_id,
+      ownerId: row.owner_id,
+      manifest: row.manifest,
+      isValid: !!row.is_valid,
+      validationErrors: row.validation_errors ? JSON.parse(row.validation_errors) : null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    }
+  },
+
   async create(appId, ownerId, manifest) {
     const pool = getDbPool()
     if (!pool) return null
     const validation = validateManifest(manifest)
     const manifestId = manifest.id || generateId()
     try {
-      await pool.execute(
+      await pool.query(
         `INSERT INTO activity_manifests (id, app_id, owner_id, manifest, is_valid, validation_errors) VALUES (?, ?, ?, ?, ?, ?)`,
         [manifestId, appId, ownerId, JSON.stringify(manifest), validation.valid ? 1 : 0, validation.valid ? null : JSON.stringify(validation.errors)]
       )
@@ -3862,19 +3856,9 @@ export const activityManifestService = {
     const pool = getDbPool()
     if (!pool) return null
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_manifests WHERE app_id = ?', [appId])
-      if (!rows || !rows[0]) return null
-      const row = rows[0]
-      return {
-        id: row.id,
-        appId: row.app_id,
-        ownerId: row.owner_id,
-        manifest: row.manifest,
-        isValid: !!row.is_valid,
-        validationErrors: row.validation_errors ? JSON.parse(row.validation_errors) : null,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }
+      const rows = dbRows(await pool.query('SELECT * FROM activity_manifests WHERE app_id = ?', [appId]))
+      if (!rows[0]) return null
+      return this._mapRow(rows[0])
     } catch (err) {
       console.error('[Activity] manifest getByAppId error:', err.message)
       return null
@@ -3886,11 +3870,11 @@ export const activityManifestService = {
     if (!pool) return null
     const validation = validateManifest(manifest)
     try {
-      const [result] = await pool.execute(
+      const raw = await pool.query(
         `UPDATE activity_manifests SET manifest = ?, is_valid = ?, validation_errors = ?, updated_at = CURRENT_TIMESTAMP WHERE app_id = ? AND owner_id = ?`,
         [JSON.stringify(manifest), validation.valid ? 1 : 0, validation.valid ? null : JSON.stringify(validation.errors), appId, ownerId]
       )
-      return result.affectedRows > 0 ? { id: manifest.id || generateId(), appId, manifest, isValid: validation.valid, validationErrors: validation.errors } : null
+      return dbResult(raw).affectedRows > 0 ? { id: manifest.id || generateId(), appId, manifest, isValid: validation.valid, validationErrors: validation.errors } : null
     } catch (err) {
       console.error('[Activity] manifest update error:', err.message)
       return null
@@ -3901,8 +3885,8 @@ export const activityManifestService = {
     const pool = getDbPool()
     if (!pool) return false
     try {
-      const [result] = await pool.execute('DELETE FROM activity_manifests WHERE app_id = ? AND owner_id = ?', [appId, ownerId])
-      return result.affectedRows > 0
+      const raw = await pool.query('DELETE FROM activity_manifests WHERE app_id = ? AND owner_id = ?', [appId, ownerId])
+      return dbResult(raw).affectedRows > 0
     } catch (err) {
       console.error('[Activity] manifest delete error:', err.message)
       return false
@@ -3913,18 +3897,8 @@ export const activityManifestService = {
     const pool = getDbPool()
     if (!pool) return []
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_manifests WHERE owner_id = ?', [userId])
-      if (!rows || !Array.isArray(rows)) return []
-      return rows.map(row => ({
-        id: row.id,
-        appId: row.app_id,
-        ownerId: row.owner_id,
-        manifest: row.manifest,
-        isValid: !!row.is_valid,
-        validationErrors: row.validation_errors ? JSON.parse(row.validation_errors) : null,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at
-      }))
+      const rows = dbRows(await pool.query('SELECT * FROM activity_manifests WHERE owner_id = ?', [userId]))
+      return rows.map(r => this._mapRow(r))
     } catch (err) {
       console.error('[Activity] manifest listByUser error:', err.message)
       return []
@@ -3943,7 +3917,7 @@ export const activityRefreshTokenService = {
     const refreshToken = generateId() + generateId()
     const expiresAt = Date.now() + (30 * 24 * 60 * 60 * 1000)
     try {
-      await pool.execute(
+      await pool.query(
         `INSERT INTO activity_oauth_refresh_tokens (refresh_token, app_id, client_id, user_id, scope, context_type, context_id, session_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [refreshToken, data.appId, data.clientId, data.userId, data.scope || '', data.contextType || null, data.contextId || null, data.sessionId || null, Date.now(), expiresAt]
       )
@@ -3958,14 +3932,14 @@ export const activityRefreshTokenService = {
     const pool = getDbPool()
     if (!pool) return null
     try {
-      const [rows] = await pool.execute('SELECT * FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
+      const rows = dbRows(await pool.query('SELECT * FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken]))
       const tokenData = rows[0]
       if (!tokenData) return { error: 'invalid_grant' }
-      if (Date.now() > tokenData.expires_at) {
-        await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
+      if (Date.now() > Number(tokenData.expires_at)) {
+        await pool.query('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
         return { error: 'invalid_grant' }
       }
-      await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
+      await pool.query('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ?', [refreshToken])
       return {
         appId: tokenData.app_id,
         clientId: tokenData.client_id,
@@ -3985,8 +3959,8 @@ export const activityRefreshTokenService = {
     const pool = getDbPool()
     if (!pool) return false
     try {
-      const [result] = await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ? AND user_id = ?', [refreshToken, userId])
-      return result.affectedRows > 0
+      const raw = await pool.query('DELETE FROM activity_oauth_refresh_tokens WHERE refresh_token = ? AND user_id = ?', [refreshToken, userId])
+      return dbResult(raw).affectedRows > 0
     } catch (err) {
       console.error('[Activity] refresh token revoke error:', err.message)
       return false
@@ -3998,9 +3972,9 @@ export const activityRefreshTokenService = {
     if (!pool) return false
     try {
       if (appId) {
-        await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE user_id = ? AND app_id = ?', [userId, appId])
+        await pool.query('DELETE FROM activity_oauth_refresh_tokens WHERE user_id = ? AND app_id = ?', [userId, appId])
       } else {
-        await pool.execute('DELETE FROM activity_oauth_refresh_tokens WHERE user_id = ?', [userId])
+        await pool.query('DELETE FROM activity_oauth_refresh_tokens WHERE user_id = ?', [userId])
       }
       return true
     } catch (err) {

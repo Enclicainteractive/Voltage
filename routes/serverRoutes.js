@@ -244,17 +244,18 @@ router.get('/:serverId/members', authenticateToken, async (req, res) => {
     return res.status(404).json({ error: 'Server not found' })
   }
 
-  // Enrich member objects with host/avatarHost from user profile if not already stored
+  // Enrich member objects with host/avatarHost/guildTag/nick from user profile
   const localHost = config.getHost()
   const localImageServerUrl = config.getImageServerUrl()
   const enrichedMembers = Array.isArray(server.members) ? server.members.map(member => {
-    // If both fields are present, no lookup needed
-    if (member.host && member.avatarHost) return member
     const profile = userService.getUser(member.id)
     const host = member.host || profile?.host || localHost
     // avatarHost is the image server URL for where this user's images are stored
     const avatarHost = member.avatarHost || profile?.avatarHost || localImageServerUrl
-    return { ...member, host, avatarHost }
+    // Include guild tag (global) and server nick (per-server)
+    const guildTag = profile?.guildTag || null
+    const nick = profile?.serverNicks?.[req.params.serverId] || null
+    return { ...member, host, avatarHost, guildTag, nick }
   }) : []
 
   // Merge bots - use roles from member entry if available, otherwise from botService
@@ -1223,6 +1224,158 @@ router.delete('/categories/:categoryId', authenticateToken, async (req, res) => 
   
   console.log(`[API] Deleted category ${req.params.categoryId}`)
   res.json({ success: true })
+})
+
+// Get server guild tag settings
+router.get('/:serverId/guild-tag', authenticateToken, async (req, res) => {
+  const servers = getServers()
+  const server = servers.find(s => s.id === req.params.serverId)
+  if (!server) return res.status(404).json({ error: 'Server not found' })
+  res.json({
+    guildTag: server.guildTag || null,
+    guildTagPrivate: server.guildTagPrivate === true
+  })
+})
+
+// Set server guild tag (owner/admin only)
+router.put('/:serverId/guild-tag', authenticateToken, async (req, res) => {
+  const servers = getServers()
+  const index = servers.findIndex(s => s.id === req.params.serverId)
+  if (index === -1) return res.status(404).json({ error: 'Server not found' })
+  const server = servers[index]
+  if (!hasPermission(server, req.user.id, 'manage_server')) {
+    return res.status(403).json({ error: 'Not authorized' })
+  }
+  const { guildTag, guildTagPrivate } = req.body
+  if (guildTag !== undefined) {
+    if (guildTag === null || guildTag === '') {
+      servers[index].guildTag = null
+    } else {
+      const tag = String(guildTag).trim()
+      if (tag.length < 1 || tag.length > 4) {
+        return res.status(400).json({ error: 'Guild tag must be 1-4 characters' })
+      }
+      // No emojis allowed
+      if (/\p{Emoji}/u.test(tag)) {
+        return res.status(400).json({ error: 'Emojis are not allowed in guild tags' })
+      }
+      // Blacklist check
+      const blacklist = [
+        'nigger', 'nigga', 'nigr', 'nigg', 'niga', 'faggot', 'fagt', 'fags', 'fag', 'fgt',
+        'retard', 'retard', 'retar', 'reta',
+        'cunt', 'cunts', 'cuntz', 'cun',
+        'whore', 'whor', 'whores',
+        'slut', 'sluts', 'slutz',
+        'bitch', 'bitchs', 'bich', 'bitc', 'btch',
+        'dick', 'diks', 'dik', 'dyke',
+        'pussy', 'puss', 'pusy', 'pus', 'pussys',
+        'cock', 'cocks', 'cok', 'c0ck', 'co ck',
+        'cum', 'cums', 'cumming',
+        'chink', 'chink', 'chin', 'chink',
+        'gook', 'gooks',
+        'spic', 'spics', 'spig',
+        'kike', 'kikes',
+        'wetback', 'wetb',
+        'fucker', 'fuck', 'fuk', 'fukk', 'fuk',
+        'shit', 'shits', 'shid', 'shyt', 'sh1t',
+        'ass', 'asses', 'azz',
+        'asshole', 'ashol', 'ashole',
+        'bastard', 'bastard', 'bast', 'basrd',
+        'damn', 'dammit', 'dam',
+        'hell', 'hell',
+        'crap', 'crapy',
+        'dumb', 'dum',
+        'idiot', 'idiots',
+        'moron', 'morons',
+        'imbecil', 'imbecile',
+        'loser', 'losers',
+        'pervert', 'perverts',
+        'pedo', 'pedos', 'pedophile',
+        'nazi', 'nazis',
+        'hitler', 'hiter',
+        'terrorist', 'terror',
+        'taliban', 'taliban',
+        'isis',
+        'anal', 'anus',
+        'arse', 'arses',
+        'blowjob', 'blowjob',
+        'bollocks', 'bollox',
+        'boner', 'boners',
+        'boob', 'boobs',
+        'bra', 'bras',
+        'bullshit',
+        'clit', 'clitoris',
+        'cooch', 'coochie',
+        'crap', 'crappy',
+        'cunt', 'cunts',
+        'dyke',
+        'ejaculate', 'ejaculated',
+        'erection', 'erections',
+        'fart', 'farted', 'farting',
+        'fck', 'fcuk',
+        'feck',
+        'felch', 'felching',
+        'fellate', 'fellatio',
+        'femdom',
+        'fudgepacker',
+        'gangbang', 'gangbanged',
+        'genital',
+        'homo', 'homosexual',
+        'jap', 'japs',
+        'jerk', 'jerked', 'jerking',
+        'jizz',
+        'kink', 'kinky',
+        'knob', 'knobhead',
+        'lmao', 'lmfao',
+        'masturbat', 'masturbating',
+        'muff', 'muffdiver',
+        'naked',
+        'nipple', 'nipples',
+        'nsfw',
+        'orgasm', 'orgasms',
+        'p0rn', 'porn', 'porno',
+        'prick', 'pricks',
+        'pube', 'pubes', 'pubic',
+        'queer', 'queers',
+        'rape', 'raped', 'rapist',
+        'satan', 'satanic',
+        'scrotum',
+        'sex', 'sexy',
+        'shag', 'shagged',
+        'skank', 'skanks',
+        'slag', 'slags',
+        'sodom', 'sodomy',
+        'spank', 'spanked',
+        'sperm',
+        'spunk',
+        'testicle',
+        'tits', 'titty',
+        'twat', 'twats',
+        'vagina',
+        'wank', 'wanked', 'wanker',
+        'wazoo',
+        'weenie',
+        'weiner',
+        'whore', 'whores',
+        'wiener',
+        'wtf',
+        'xxx'
+      ]
+      const lowerTag = tag.toLowerCase()
+      if (blacklist.some(word => lowerTag.includes(word))) {
+        return res.status(400).json({ error: 'This guild tag is not allowed' })
+      }
+      servers[index].guildTag = tag
+    }
+  }
+  if (guildTagPrivate !== undefined) {
+    servers[index].guildTagPrivate = Boolean(guildTagPrivate)
+  }
+  servers[index].updatedAt = new Date().toISOString()
+  await setServers(servers)
+  io.to(`server:${req.params.serverId}`).emit('server:updated', servers[index])
+  console.log(`[API] Updated guild tag for server ${req.params.serverId}: ${servers[index].guildTag}`)
+  res.json({ guildTag: servers[index].guildTag || null, guildTagPrivate: servers[index].guildTagPrivate === true })
 })
 
 export default router

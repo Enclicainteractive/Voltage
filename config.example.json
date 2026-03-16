@@ -69,11 +69,22 @@
   },
   "cdn": {
     "enabled": false,
+
+    "_comment_provider": "Options: 'local' (default), 'nfs' (shared folder across VPS nodes), 's3' (AWS S3 or compatible), 'cloudflare' (Cloudflare R2)",
     "provider": "local",
+
     "local": {
       "uploadDir": "./uploads",
       "baseUrl": null
     },
+
+    "_comment_nfs": "NFS: mount a shared folder from your Storage Master so all nodes see the same files. Set provider to 'nfs' and point uploadDir at the mount path. See docs/SCALING.md for the full setup guide.",
+    "nfs": {
+      "_comment_uploadDir": "The local path where the NFS share is mounted. Must be mounted BEFORE starting Voltage.",
+      "uploadDir": "/www/shared_uploads",
+      "baseUrl": null
+    },
+
     "s3": {
       "bucket": "my-volt-media",
       "region": "us-east-1",
@@ -148,5 +159,40 @@
   "monitoring": {
     "enabled": false,
     "prometheus": false
+  },
+
+  "_comment_scaling": "SCALING — NOT FEDERATION. Same Voltage instance across multiple VPS. All nodes share the same database. HAProxy/nginx sits in front.",
+  "scaling": {
+    "enabled": false,
+
+    "_comment_nodeSecret": "Shared secret — ALL nodes must have the SAME value. Change this.",
+    "nodeSecret": "CHANGE_ME_SAME_ON_ALL_NODES",
+
+    "_comment_nodeId": "Unique ID for THIS node. Short slug. e.g. node-1, vps-nyc, eu-west",
+    "nodeId": "node-1",
+
+    "_comment_nodeUrl": "Public (or internal) URL that OTHER nodes use to reach THIS node.",
+    "nodeUrl": "https://node1.myvolt.example.com",
+
+    "_comment_nodes": "Full list of ALL nodes (including self). Copy this identical block to every node's config.",
+    "nodes": [
+      {
+        "id": "node-1",
+        "url": "https://node1.myvolt.example.com"
+      },
+      {
+        "id": "node-2",
+        "url": "https://node2.myvolt.example.com"
+      }
+    ],
+
+    "_comment_heartbeatInterval": "How often (ms) to ping peer nodes. Default 30s.",
+    "heartbeatInterval": 30000,
+
+    "_comment_heartbeatTimeout": "How long (ms) of silence before a node is marked offline. Default 90s.",
+    "heartbeatTimeout": 90000,
+
+    "_comment_fileResolutionMode": "'proxy' = stream file through this node (hides peers). 'redirect' = 302 to peer (faster, exposes peer URL).",
+    "fileResolutionMode": "proxy"
   }
 }

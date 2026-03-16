@@ -173,6 +173,9 @@ const gracefulShutdown = async (signal) => {
       return
     }
 
+    // Mark this scale node as offline before connections drain
+    await scaleService.shutdown()
+
     // start draining - tell websockets to close
     // 30 seconds is plenty of time
     // if it takes longer, we force close anyway
@@ -225,9 +228,11 @@ import safetyRoutes from './routes/safetyRoutes.js'
 import notificationSettingsRoutes from './routes/notificationSettingsRoutes.js'
 import activityRoutes from './routes/activityRoutes.js'
 import gifRoutes from './routes/gifRoutes.js'
+import scaleRoutes from './routes/scaleRoutes.js'
 
 
 import { authenticateSocket } from './middleware/authMiddleware.js'
+import scaleService from './services/scaleService.js'
 import { setupSocketHandlers } from './services/socketService.js'
 import { startSystemScheduler } from './services/systemMessageScheduler.js'
 import config from './config/config.js'
@@ -358,7 +363,7 @@ if (isWorker) {
   // Workers also need to initialize storage
   await initStorageAndDistribute()
   await dataService.initStorage()
-  dataService.initActivityTables()
+  await dataService.initActivityTables()
 
   setInterval(() => {
     const memUsage = process.memoryUsage()
@@ -379,12 +384,14 @@ if (isWorker) {
 await initStorageAndDistribute()
 await redisService.connect()
 await dataService.initStorage()
-dataService.initActivityTables()
+await dataService.initActivityTables()
 await sessionManager.init()
 rateLimiter.init()
 messageBus.init()
 wsManager.init()
 healthCheck.resetUptime()
+// Scale service: init after storage is ready, no-ops if scaling.enabled=false
+await scaleService.init()
 
 const app = express()
 const httpServer = createServer(app)
@@ -401,6 +408,21 @@ const io = new Server(httpServer, {
     credentials: true
   }
 })
+
+// ── Redis Adapter for Socket.IO ────────────────────────────────────────────────
+// When scaling is enabled (or when Redis is available), attach the Redis adapter
+// so Socket.IO rooms/events work across all nodes behind the load balancer.
+// Without this, a message emitted on node-1 won't reach sockets on node-2.
+if (redisService.isReady()) {
+  try {
+    const { createAdapter } = await import('@socket.io/redis-adapter')
+    const { pubClient, subClient } = redisService.getAdapterClients()
+    io.adapter(createAdapter(pubClient, subClient))
+    console.log('[Socket.IO] Redis adapter attached — cross-node socket events enabled')
+  } catch (err) {
+    console.warn('[Socket.IO] Could not attach Redis adapter:', err.message, '— running in single-node socket mode')
+  }
+}
 
 // ─── Multi-Service Support ────────────────────────────────────────────────────────
 // Support running services independently via VOLT_SERVICE or VOLT_*_ENABLED env vars
@@ -559,6 +581,7 @@ app.use('/api/notifications', notificationSettingsRoutes)
 app.use('/api/activities', activityRoutes)
 app.use('/api/gif', gifRoutes)
 app.use('/api/gifs', gifRoutes)
+app.use('/api/scale', scaleRoutes)
 
 // Global error handler - catches any unhandled errors from routes
 app.use((err, req, res, next) => {
@@ -681,7 +704,12 @@ app.get('/api/health', async (req, res) => {
              bots: config.config.features?.bots || false,
              e2eTrueEncryption: config.config.features?.e2eTrueEncryption || false,
              e2eEncryption: config.config.features?.e2eEncryption || false
-           }
+           },
+           scaling: config.isScalingEnabled() ? {
+             enabled: true,
+             nodeId: config.getNodeId(),
+             ...scaleService.getClusterStatus().summary
+           } : { enabled: false }
   })
 })
 
@@ -901,6 +929,18 @@ function printBanner(serverName, version, mode, storage, PORT) {
   console.log(line('Enabled', enabled(config.config.federation?.enabled)))
   if (config.config.federation?.enabled) {
     console.log(line('Server name', val(config.config.federation.serverName || 'N/A')))
+  }
+  console.log()
+
+  // Scaling
+  const scaleCfg = config.getScalingConfig()
+  console.log(section('Scaling'))
+  console.log(line('Enabled', enabled(scaleCfg.enabled)))
+  if (scaleCfg.enabled) {
+    console.log(line('Node ID',    val(scaleCfg.nodeId || '(not set)')))
+    console.log(line('Node URL',   val(scaleCfg.nodeUrl || config.getServerUrl())))
+    console.log(line('Peers',      val(String((scaleCfg.nodes || []).length - 1 > 0 ? (scaleCfg.nodes.length - 1) : scaleCfg.nodes.length) + ' configured')))
+    console.log(line('File mode',  val(scaleCfg.fileResolutionMode || 'proxy')))
   }
   console.log()
 

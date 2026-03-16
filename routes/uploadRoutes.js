@@ -7,6 +7,8 @@ import { v4 as uuidv4 } from 'uuid'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { fileService } from '../services/dataService.js'
 import { cdnService } from '../services/cdnService.js'
+import config from '../config/config.js'
+import { existsLocally, findFileOnPeer, proxyFileFromPeer } from '../services/scaleService.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const UPLOADS_DIR = cdnService.getUploadDir()
@@ -197,11 +199,33 @@ router.get('/metadata/:fileId', authenticateToken, (req, res) => {
 })
 
 // Serve file by ID
-router.get('/file/:filename', (req, res) => {
+router.get('/file/:filename', async (req, res) => {
   try {
     const filePath = path.join(UPLOADS_DIR, req.params.filename)
     
     if (!fs.existsSync(filePath)) {
+      // ── Scale fallback: ask peer nodes if they have it ────────────────────
+      if (config.isScalingEnabled()) {
+        const scaleCfg = config.getScalingConfig()
+        const peerNode = await findFileOnPeer(req.params.filename)
+
+        if (peerNode) {
+          const mode = scaleCfg.fileResolutionMode || 'proxy'
+
+          if (mode === 'redirect') {
+            // 302 redirect straight to the peer (faster, exposes peer URL)
+            const peerUrl = `${peerNode.url}/api/upload/file/${encodeURIComponent(req.params.filename)}`
+            console.log(`[Scale] Redirecting ${req.params.filename} to node ${peerNode.id}`)
+            return res.redirect(302, peerUrl)
+          } else {
+            // Default: proxy the file through this node (hides peer topology)
+            console.log(`[Scale] Proxying ${req.params.filename} from node ${peerNode.id}`)
+            return await proxyFileFromPeer(peerNode, req.params.filename, res)
+          }
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       console.error(`[API] File not found: ${req.params.filename}`)
       return res.status(404).json({ error: 'File not found' })
     }
@@ -257,11 +281,24 @@ router.get('/file/:filename', (req, res) => {
 })
 
 // Legacy endpoint for backward compatibility
-router.get('/:filename', (req, res) => {
+router.get('/:filename', async (req, res) => {
   try {
     const filePath = path.join(UPLOADS_DIR, req.params.filename)
     
     if (!fs.existsSync(filePath)) {
+      // Scale fallback for legacy path too
+      if (config.isScalingEnabled()) {
+        const scaleCfg = config.getScalingConfig()
+        const peerNode = await findFileOnPeer(req.params.filename)
+        if (peerNode) {
+          const mode = scaleCfg.fileResolutionMode || 'proxy'
+          if (mode === 'redirect') {
+            return res.redirect(302, `${peerNode.url}/api/upload/${encodeURIComponent(req.params.filename)}`)
+          } else {
+            return await proxyFileFromPeer(peerNode, req.params.filename, res)
+          }
+        }
+      }
       return res.status(404).json({ error: 'File not found' })
     }
     

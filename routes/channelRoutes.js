@@ -741,12 +741,21 @@ router.post('/:channelId/messages', authenticateToken, async (req, res) => {
     return res.status(451).json({ error: 'Age verification required for this channel', code: 'AGE_VERIFICATION_REQUIRED' })
   }
   
+  // Include guild tag and server nick in message for global display
+  const senderProfile = userService.getUser(req.user.id)
+  const channelServerInfo = getChannelServer(channelId)
+  const serverId = channelServerInfo?.serverId || null
+  const serverNick = serverId ? (senderProfile?.serverNicks?.[serverId] || null) : null
+  // Resolve display name: server nick > display name > username
+  const messageUsername = serverNick || req.user.displayName || req.user.username || req.user.email
+
   const message = {
     id: uuidv4(),
     channelId,
     userId: req.user.id,
-    username: req.user.username || req.user.email,
+    username: messageUsername,
     avatar: req.user.avatar || getAvatarUrl(req.user.id),
+    guildTag: senderProfile?.guildTag || null,
     content,
     attachments: attachments || [],
     replyTo: typeof replyTo === 'string' ? replyTo : null,

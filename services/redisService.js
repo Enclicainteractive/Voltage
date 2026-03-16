@@ -289,6 +289,17 @@ class RedisService {
       console.error('[Redis] Disconnect error:', err.message)
     }
   }
+
+  /**
+   * Returns the raw redis client instances needed by @socket.io/redis-adapter.
+   * Both pub and sub must be separate clients per the adapter docs.
+   */
+  getAdapterClients() {
+    return {
+      pubClient: this.publisher,
+      subClient: this.subscriber
+    }
+  }
 }
 
 const redisService = new RedisService()

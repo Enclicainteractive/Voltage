@@ -90,7 +90,10 @@ router.get('/server/:serverId', async (req, res) => {
     // Is verification required
     verificationRequired: server.verificationRequired || false,
     // Theme color
-    themeColor: server.themeColor
+    themeColor: server.themeColor,
+    // Guild tag (only include if not private)
+    guildTag: server.guildTagPrivate ? null : (server.guildTag || null),
+    guildTagPrivate: server.guildTagPrivate === true
   }
   
   res.json(publicInfo)

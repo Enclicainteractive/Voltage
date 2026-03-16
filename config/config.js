@@ -100,6 +100,19 @@ const DEFAULT_CONFIG = {
       uploadDir: path.join(__dirname, '..', 'uploads'),
       baseUrl: null
     },
+    // NFS shared folder — all nodes mount the same remote path so uploaded
+    // files are instantly visible everywhere. Zero application-layer changes
+    // are needed once the mount is active; Voltage just writes to uploadDir
+    // as usual. See docs/SCALING.md for the full NFS setup guide.
+    nfs: {
+      // Path where the NFS share is mounted on THIS node.
+      // Must exist and be writable before starting Voltage.
+      // Example: "/www/shared_uploads" or "/mnt/volt_uploads"
+      uploadDir: null,
+      // Public URL base for serving files (same as local.baseUrl).
+      // If null, the standard /api/upload/file/:filename route is used.
+      baseUrl: null
+    },
     s3: {
       bucket: null,
       region: 'us-east-1',
@@ -216,6 +229,50 @@ const DEFAULT_CONFIG = {
     enabled: false,
     prometheus: false,
     healthCheckPath: '/health'
+  },
+
+  // ─── Horizontal Scaling (Multi-VPS / Multi-Node) ───────────────────────────
+  // This is NOT federation. This is the same Voltage instance spread across
+  // multiple VPS/servers. All nodes share the same database and config.
+  // Nodes register their IPs with each other so files stored on one node
+  // can be fetched transparently by users hitting a different node.
+  // HAProxy (or any load balancer) sits in front and distributes traffic.
+  // If you have a CDN configured, most of this is irrelevant for files —
+  // but the node registry and socket cross-node support still apply.
+  scaling: {
+    // Set to true to enable the multi-node scaling system
+    enabled: false,
+
+    // A shared secret that all nodes must present when talking to each other.
+    // CHANGE THIS. All nodes must have the SAME value.
+    nodeSecret: 'change_me_scaling_secret',
+
+    // This node's own public URL (what other nodes use to reach THIS server).
+    // Example: "https://node1.myvolt.com" or "http://10.0.0.1:5000"
+    nodeUrl: null,
+
+    // A unique identifier for this node. Keep it short and slug-safe.
+    // Example: "node-1", "us-east-1", "vps-frankfurt"
+    nodeId: null,
+
+    // List of ALL nodes in the cluster (including this one).
+    // Each node must have the same list — just copy the config.
+    // Format: { id: string, url: string }
+    // The "url" is what THIS server uses to reach that node internally.
+    // You can use internal IPs here if nodes are on the same private network.
+    nodes: [],
+
+    // How often (ms) to ping peer nodes to verify they are alive
+    heartbeatInterval: 30000,
+
+    // How many ms before a node is considered offline
+    heartbeatTimeout: 90000,
+
+    // File resolution: when a file is not found locally, should we
+    // redirect the client to the peer node that has it, or proxy it through?
+    // "redirect" = 302 redirect to peer (faster, exposes peer URL to client)
+    // "proxy"    = stream the file through this node (hides peer topology)
+    fileResolutionMode: 'proxy'
   }
 }
 
@@ -369,6 +426,30 @@ class Config {
     return this.config.server.mode === 'self-volt'
   }
 
+  isScalingEnabled() {
+    return this.config.scaling?.enabled === true
+  }
+
+  getScalingConfig() {
+    return this.config.scaling || {}
+  }
+
+  getScaleNodes() {
+    return this.config.scaling?.nodes || []
+  }
+
+  getNodeId() {
+    return this.config.scaling?.nodeId || null
+  }
+
+  getNodeUrl() {
+    return this.config.scaling?.nodeUrl || this.getServerUrl()
+  }
+
+  getNodeSecret() {
+    return this.config.scaling?.nodeSecret || null
+  }
+
   isOAuthEnabled() {
     return this.config.auth.oauth?.enabled === true
   }
@@ -412,6 +493,14 @@ class Config {
 
   getCdnConfig() {
     return this.config.cdn
+  }
+
+  isNfsEnabled() {
+    return this.config.cdn?.provider === 'nfs' && !!this.config.cdn?.nfs?.uploadDir
+  }
+
+  getNfsConfig() {
+    return this.config.cdn?.nfs || {}
   }
 
   isCacheEnabled() {
