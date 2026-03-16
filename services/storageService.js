@@ -1808,6 +1808,34 @@ const initMariadbStorage = () => {
         } catch {}
 
         try {
+          await conn.query(`ALTER TABLE users ADD COLUMN guildTag VARCHAR(10)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN guildTagServerId VARCHAR(50)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileCSS LONGTEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileTemplate VARCHAR(50)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN bannerEffect VARCHAR(50)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN profileLayout VARCHAR(50)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN badgeStyle VARCHAR(50)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN clientCSS LONGTEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE users ADD COLUMN clientCSSEnabled TINYINT DEFAULT 0`)
+        } catch {}
+
+        try {
           await conn.query(`ALTER TABLE friends ADD COLUMN createdAt TEXT`)
         } catch {}
 
@@ -1951,6 +1979,13 @@ const initMariadbStorage = () => {
         
         try {
           await conn.query(`ALTER TABLE servers ADD COLUMN automod TEXT`)
+        } catch {}
+        
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN guildTag VARCHAR(10)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN guildTagPrivate TINYINT DEFAULT 0`)
         } catch {}
         
         // Fix dms table
@@ -3836,12 +3871,12 @@ export const getStorage = () => {
 const TABLE_SCHEMAS = {
   users: {
     primaryKey: 'id',
-    columns: ['id', 'username', 'displayName', 'email', 'passwordHash', 'authProvider', 'avatar', 'banner', 'bio', 'customStatus', 'status', 'socialLinks', 'ageVerification', 'ageVerificationJurisdiction', 'host', 'createdAt', 'updatedAt', 'customUsername', 'avatarHost', 'adminRole', 'proofSummary', 'device', 'isAdmin', 'isModerator', 'profileTheme', 'profileBackground', 'profileAccentColor', 'profileFont', 'profileAnimation', 'profileBackgroundType', 'profileBackgroundOpacity', 'birthDate'],
+    columns: ['id', 'username', 'displayName', 'email', 'passwordHash', 'authProvider', 'avatar', 'banner', 'bio', 'customStatus', 'status', 'socialLinks', 'ageVerification', 'ageVerificationJurisdiction', 'host', 'createdAt', 'updatedAt', 'customUsername', 'avatarHost', 'adminRole', 'proofSummary', 'device', 'isAdmin', 'isModerator', 'profileTheme', 'profileBackground', 'profileAccentColor', 'profileFont', 'profileAnimation', 'profileBackgroundType', 'profileBackgroundOpacity', 'birthDate', 'guildTag', 'guildTagServerId', 'profileCSS', 'profileTemplate', 'bannerEffect', 'profileLayout', 'badgeStyle', 'clientCSS', 'clientCSSEnabled'],
     dataFormat: 'object'
   },
   servers: {
     primaryKey: 'id',
-    columns: ['id', 'name', 'description', 'icon', 'banner', 'ownerId', 'createdAt', 'updatedAt', 'themeColor', 'bannerUrl', 'backgroundUrl', 'bannerPosition', 'roles', 'members', 'bans', 'emojis', 'automod'],
+    columns: ['id', 'name', 'description', 'icon', 'banner', 'ownerId', 'createdAt', 'updatedAt', 'themeColor', 'bannerUrl', 'backgroundUrl', 'bannerPosition', 'roles', 'members', 'bans', 'emojis', 'automod', 'guildTag', 'guildTagPrivate'],
     dataFormat: 'object'
   },
   channels: {
