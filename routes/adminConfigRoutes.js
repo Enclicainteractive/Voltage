@@ -225,11 +225,23 @@ router.put('/raw', authenticateToken, requireOwner, (req, res) => {
 
 // Update config (GUI mode)
 router.put('/', authenticateToken, requireOwner, (req, res) => {
-  const updates = req.body
+  let updates = req.body
   
   try {
+    console.log('[Admin/Config] Received PUT updates, keys:', Object.keys(updates))
+    console.log('[Admin/Config] Current config scaling before merge:', config.config.scaling)
+    
+    // Normalize case: frontend may send "Scaling" but backend expects "scaling"
+    if (updates.Scaling && !updates.scaling) {
+      console.log('[Admin/Config] Normalizing "Scaling" -> "scaling"')
+      updates = { ...updates, scaling: updates.Scaling }
+      delete updates.Scaling
+    }
+    
     // Deep-merge updates into current in-memory config
     config.config = config.mergeDeep(config.config, updates)
+    
+    console.log('[Admin/Config] Config scaling after merge:', config.config.scaling)
 
     // Always write the full merged config to disk so restarts don't lose changes
     const saved = config.save()
@@ -241,6 +253,7 @@ router.put('/', authenticateToken, requireOwner, (req, res) => {
     const written = JSON.parse(fs.readFileSync(config.configFilePath, 'utf8'))
     config.config = written
 
+    console.log('[Admin/Config] Scaling after reload from disk:', config.config.scaling)
     console.log('[Admin/Config] Config saved and reloaded from disk')
     res.json({ success: true, message: 'Config saved and refreshed. Some changes (e.g. storage backend) require a restart.' })
   } catch (error) {
