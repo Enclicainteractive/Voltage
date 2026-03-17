@@ -157,7 +157,8 @@ const getPoolConnection = async () => {
  * Returns rows on success, null on failure.
  */
 const directQueryCache = new Map()
-const DIRECT_QUERY_CACHE_TTL = 1000
+// Optimize: Increased cache TTL for better query performance
+const DIRECT_QUERY_CACHE_TTL = 3000
 
 const getDirectQueryCacheKey = (sql, params) => `${sql}:${JSON.stringify(params)}`
 
@@ -564,35 +565,51 @@ const loadAllData = async () => {
   }
 }
 
+// Debounce/throttle for saves to prevent cascading saves
+const saveDebounceTimers = new Map()
+const SAVE_DEBOUNCE_MS = 100 // Wait 100ms before saving to batch multiple saves
+
 const saveToStorage = async (table, data) => {
   if (!useStorage || !storageService) {
     console.error(`[DataService] Cannot save - no storage configured for table: ${table}`)
     return false
   }
   
-  try {
-    const payload = cloneData(data)
-    let result
-    if (isAsyncStorageBackend(storageService.type)) {
-      result = await circuitBreakerManager.execute(`db:save:${table}`, async () => {
-        return await storageService.save(table, payload)
-      }, { failureThreshold: 3, resetTimeout: 15000 })
-    } else {
-      result = storageService.save(table, payload)
-    }
-    
-    if (result) {
-      // Update Redis cache (fire-and-forget, don't block on it)
-      writeTableToRedisCache(table, payload).catch(err => {
-        console.warn(`[DataService] Redis cache update failed for ${table}:`, err.message)
-      })
-    }
-    console.log(`[DataService] Saved ${table}: ${Object.keys(payload || {}).length} records`)
-    return result
-  } catch (err) {
-    console.error(`[DataService] Error saving ${table}:`, err.message)
-    return false
+  // Clear any existing debounce timer for this table
+  if (saveDebounceTimers.has(table)) {
+    clearTimeout(saveDebounceTimers.get(table))
   }
+  
+  // Set a new debounced save
+  return new Promise((resolve) => {
+    saveDebounceTimers.set(table, setTimeout(async () => {
+      try {
+        const payload = cloneData(data)
+        let result
+        if (isAsyncStorageBackend(storageService.type)) {
+          result = await circuitBreakerManager.execute(`db:save:${table}`, async () => {
+            return await storageService.save(table, payload)
+          }, { failureThreshold: 3, resetTimeout: 15000 })
+        } else {
+          result = storageService.save(table, payload)
+        }
+        
+        if (result) {
+          // Update Redis cache (fire-and-forget, don't block on it)
+          writeTableToRedisCache(table, payload).catch(err => {
+            console.warn(`[DataService] Redis cache update failed for ${table}:`, err.message)
+          })
+        }
+        console.log(`[DataService] Saved ${table}: ${Object.keys(payload || {}).length} records`)
+        saveDebounceTimers.delete(table)
+        resolve(result)
+      } catch (err) {
+        console.error(`[DataService] Error saving ${table}:`, err.message)
+        saveDebounceTimers.delete(table)
+        resolve(false)
+      }
+    }, SAVE_DEBOUNCE_MS))
+  })
 }
 
 const loadData = (file, defaultValue = {}) => {
@@ -952,7 +969,7 @@ const getTableName = (file) => {
   return FILE_TO_TABLE[file] || file
 }
 
-export { supportsDirectQuery, directQuery }
+export { supportsDirectQuery, directQuery, saveData }
 
 export const migrateData = async (sourceType, targetConfig) => {
   const results = { success: true, tables: {}, errors: [] }
@@ -3337,7 +3354,7 @@ export const moderationReportService = {
     await saveData(FILES.reports, reports)
   },
 
-  create(data) {
+  async create(data) {
     const reports = this._loadReports()
     const id = data.id || `report_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     reports[id] = {
@@ -3348,7 +3365,7 @@ export const moderationReportService = {
       updatedAt: new Date().toISOString(),
       actions: []
     }
-    this._saveReports(reports)
+    await this._saveReports(reports)
     return reports[id]
   },
 
@@ -3368,7 +3385,9 @@ export const moderationReportService = {
     const reports = this._loadReports()
     let list = Object.values(reports)
     if (status) {
-      list = list.filter(r => r.status === status)
+      // Normalize status aliases: 'open' maps to 'pending' (the internal status for new reports)
+      const normalizedStatus = status === 'open' ? 'pending' : status
+      list = list.filter(r => r.status === normalizedStatus || r.status === status)
     }
     return list
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
@@ -3379,25 +3398,30 @@ export const moderationReportService = {
     const reports = this._loadReports()
     let list = Object.values(reports).filter(r => r.reporterId === reporterId)
     if (status) {
-      list = list.filter(r => r.status === status)
+      // Normalize status aliases: 'open' maps to 'pending'
+      const normalizedStatus = status === 'open' ? 'pending' : status
+      list = list.filter(r => r.status === normalizedStatus || r.status === status)
     }
     return list
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
       .slice(offset, offset + limit)
   },
 
-  resolve(id, { resolvedBy, resolution = 'resolved' }) {
+  async resolve(id, { resolvedBy, status = 'resolved', resolution, note = null }) {
     const reports = this._loadReports()
     if (!reports[id]) return null
-    reports[id].status = resolution
+    // Accept either 'status' or 'resolution' parameter for the new status value
+    const newStatus = status || resolution || 'resolved'
+    reports[id].status = newStatus
     reports[id].resolvedBy = resolvedBy
     reports[id].resolvedAt = new Date().toISOString()
     reports[id].updatedAt = new Date().toISOString()
-    this._saveReports(reports)
+    if (note) reports[id].resolutionNote = note
+    await this._saveReports(reports)
     return reports[id]
   },
 
-  appendAction(id, action) {
+  async appendAction(id, action) {
     const reports = this._loadReports()
     if (!reports[id]) return null
     if (!reports[id].actions) reports[id].actions = []
@@ -3406,7 +3430,7 @@ export const moderationReportService = {
       createdAt: new Date().toISOString()
     })
     reports[id].updatedAt = new Date().toISOString()
-    this._saveReports(reports)
+    await this._saveReports(reports)
     return reports[id]
   },
 
@@ -3418,14 +3442,21 @@ export const moderationReportService = {
     ).length
   },
 
-  findOpenDuplicateForReporter(reporterId, { contextType, contextId }) {
+  findOpenDuplicateForReporter(reporterId, { contextType, channelId = null, conversationId = null, accusedUserId = null, targetUserId = null, reportType = null, serverId = null, messageId = null }) {
     const reports = this._loadReports()
-    return Object.values(reports).find(r => 
-      r.reporterId === reporterId && 
-      r.status === 'pending' &&
-      r.contextType === contextType && 
-      r.contextId === contextId
-    ) || null
+    return Object.values(reports).find(r => {
+      if (r.reporterId !== reporterId) return false
+      if (r.status !== 'pending') return false
+      if (r.contextType !== contextType) return false
+      if (reportType && r.reportType !== reportType) return false
+      // Match on the most specific available identifier
+      if (messageId && r.clientMeta?.messageId === messageId) return true
+      if (channelId && r.channelId === channelId && accusedUserId && r.accusedUserId === accusedUserId) return true
+      if (conversationId && r.conversationId === conversationId) return true
+      if (serverId && r.clientMeta?.serverId === serverId && !messageId) return true
+      if (accusedUserId && r.accusedUserId === accusedUserId && contextType === 'user_profile') return true
+      return false
+    }) || null
   }
 }
 

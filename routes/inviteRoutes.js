@@ -1,6 +1,6 @@
 import express from 'express'
 import { authenticateToken, optionalAuth } from '../middleware/authMiddleware.js'
-import { FILES, channelService, inviteService, serverService } from '../services/dataService.js'
+import { FILES, channelService, inviteService, serverService, saveData } from '../services/dataService.js'
 import { InviteEncoder, parseCrossHostInvite, createCrossHostInvite } from '../utils/inviteEncoder.js'
 import { federationService } from '../services/federationService.js'
 import axios from 'axios'
@@ -37,9 +37,8 @@ const saveServers = async (servers) => {
   for (const server of servers || []) {
     if (server?.id) record[server.id] = server
   }
-  for (const server of Object.values(record)) {
-    await serverService.updateServer(server.id, server)
-  }
+  // Use bulk save instead of iterating through each server
+  await saveData(FILES.servers, record)
 }
 
 const syncRemoteChannels = (serverId, remoteHost, channels = []) => {
@@ -167,7 +166,7 @@ router.post('/:code/join', authenticateToken, async (req, res) => {
     joinedAt: new Date().toISOString()
   })
   
-  await setServers(servers)
+  await saveServers(servers)
   console.log(`[API] User ${req.user.username} joined server ${server.name} via invite ${req.params.code}`)
   res.json(server)
 })
@@ -360,7 +359,7 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
       }, { timeout: 5000 })
     } catch { /* non-critical */ }
     
-    await setServers(servers)
+    await saveServers(servers)
     console.log(`[API] User ${req.user.username} joined cross-host server ${localServer.name} (${serverHost})`)
     res.json(localServer)
   } catch (error) {
@@ -529,7 +528,7 @@ router.post('/resolve-external/join', authenticateToken, async (req, res) => {
 
     syncRemoteChannels(remoteServer.id, remoteHost, remoteServer?.channels || [])
 
-    await setServers(servers)
+    await saveServers(servers)
     console.log(`[API] User ${req.user.username} joined federated server ${localServer.name} from ${remoteHost}`)
     res.json(localServer)
   } catch (err) {

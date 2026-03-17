@@ -5,7 +5,7 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { io } from '../server.js'
-import { FILES, discoveryService, userService, serverService, channelService, messageService, fileService } from '../services/dataService.js'
+import { FILES, discoveryService, userService, serverService, channelService, messageService, fileService, saveData } from '../services/dataService.js'
 import config from '../config/config.js'
 import { botService } from '../services/botService.js'
 import { isTagBlacklisted } from '../utils/guildTagBlacklist.js'
@@ -156,38 +156,37 @@ const toFlatRecord = (grouped, idField = 'id') => {
   return flat
 }
 
+// PERFORMANCE FIX: Use saveData to save entire dataset at once instead of iterating and saving each item
+// This eliminates cascading saves - before: 55 server saves + 400 channel saves per request
 const getServers = () => {
   const data = serverService.getAllServers()
   return Array.isArray(data) ? data : Object.values(data || {})
 }
 const setServers = async (servers) => {
-  for (const server of servers) {
-    if (server && server.id) {
-      await serverService.updateServer(server.id, server)
-    }
-  }
+  // Convert array to record format and save ALL servers in ONE operation
+  const serverRecord = toServerRecord(servers)
+  await saveData(FILES.servers, serverRecord)
 }
 
 const getAllChannels = () => channelService.getAllChannelsGrouped()
 const setAllChannels = async (channels) => {
-  for (const serverChannels of Object.values(channels)) {
-    for (const channel of serverChannels) {
-      if (channel && channel.id) {
-        await channelService.updateChannel(channel.id, channel)
-      }
-    }
-  }
+  // Flatten grouped channels and save ALL in ONE operation
+  const flatChannels = toFlatRecord(channels)
+  await saveData(FILES.channels, flatChannels)
 }
 
 const getAllCategories = () => serverService.getAllCategoriesGrouped()
 const setAllCategories = async (categories) => {
-  for (const serverCategories of Object.values(categories)) {
+  // Flatten and save ALL categories in ONE operation
+  const flatCategories = {}
+  for (const serverCategories of Object.values(categories || {})) {
     for (const category of serverCategories) {
-      if (category && category.id) {
-        await serverService.updateCategory(category.id, category)
+      if (category?.id) {
+        flatCategories[category.id] = category
       }
     }
   }
+  await saveData(FILES.categories, flatCategories)
 }
 
 const getMemberRoles = (server, userId) => {

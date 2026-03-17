@@ -28,7 +28,8 @@ const TABLES = [
   'discovery',
   'global_bans',
   'server_bans',
-  'admin_logs'
+  'admin_logs',
+  'moderation_reports'
 ]
 
 const getAllowedStorageTableNames = () => {
@@ -447,7 +448,8 @@ const initJsonStorage = () => {
       discovery: path.join(dataDir, 'discovery.json'),
       globalBans: path.join(dataDir, 'global-bans.json'),
       serverBans: path.join(dataDir, 'server-bans.json'),
-      adminLogs: path.join(dataDir, 'admin-logs.json')
+      adminLogs: path.join(dataDir, 'admin-logs.json'),
+      moderationReports: path.join(dataDir, 'moderation-reports.json')
     },
     load(file, defaultValue = {}) {
       try {
@@ -694,6 +696,20 @@ const initSqliteStorage = () => {
       details TEXT,
       createdAt TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS pinned_messages (
+      id TEXT PRIMARY KEY,
+      channelId TEXT NOT NULL,
+      userId TEXT,
+      username TEXT,
+      avatar TEXT,
+      content TEXT,
+      timestamp TEXT,
+      pinnedAt TEXT,
+      pinnedBy TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pinned_messages_channelId ON pinned_messages (channelId);
   `)
   
   console.log('[Storage] SQLite initialized:', dbPath)
@@ -3983,7 +3999,12 @@ const TABLE_SCHEMAS = {
   activity_apps: { primaryKey: 'id', columns: ['id', 'client_id', 'client_secret', 'owner_id', 'name', 'description', 'redirect_uris', 'scopes', 'created_at', 'updated_at'], dataFormat: 'object' },
   activity_oauth_codes: { primaryKey: 'code', columns: ['code', 'client_id', 'user_id', 'scope', 'redirect_uri', 'context_type', 'context_id', 'session_id', 'app_id', 'expires_at'], dataFormat: 'object' },
   activity_oauth_tokens: { primaryKey: 'access_token', columns: ['access_token', 'app_id', 'client_id', 'user_id', 'scope', 'context_type', 'context_id', 'session_id', 'created_at', 'expires_at'], dataFormat: 'object' },
-  activity_public: { primaryKey: 'id', columns: ['id', 'owner_id', 'name', 'description', 'icon', 'category', 'launch_url', 'visibility', 'is_builtin_client', 'created_at', 'updated_at'], dataFormat: 'object' }
+  activity_public: { primaryKey: 'id', columns: ['id', 'owner_id', 'name', 'description', 'icon', 'category', 'launch_url', 'visibility', 'is_builtin_client', 'created_at', 'updated_at'], dataFormat: 'object' },
+  moderation_reports: {
+    primaryKey: 'id',
+    columns: ['id', 'reporterId', 'contextType', 'contextId', 'accusedUserId', 'reason', 'status', 'createdAt', 'updatedAt', 'resolvedBy', 'resolvedAt', 'actions'],
+    dataFormat: 'object'
+  }
 }
 
 /**
@@ -4589,7 +4610,8 @@ export const FILES = {
   discovery: 'discovery',
   globalBans: 'global_bans',
   serverBans: 'server_bans',
-  adminLogs: 'admin_logs'
+  adminLogs: 'admin_logs',
+  moderationReports: 'moderation_reports'
 }
 
 export const getServers = () => {

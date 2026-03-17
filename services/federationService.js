@@ -12,16 +12,29 @@ let syncLoopInFlight = false
 let federationCache = { peers: [], relayQueue: {}, processedRelayIds: {}, lastSync: null }
 let cacheLoaded = false
 
+// Helper function to get current ISO timestamp
+const nowIso = () => new Date().toISOString()
+
 const ensureCacheLoaded = async () => {
   if (!cacheLoaded) {
     if (supportsDirectQuery()) {
       try {
-        const rows = await directQuery('SELECT data FROM federation LIMIT 1')
-        if (rows && rows.length > 0 && rows[0].data) {
-          federationCache = JSON.parse(rows[0].data)
+        // First check if the table exists and has the expected columns
+        const tableInfo = await directQuery('SHOW COLUMNS FROM federation')
+        const hasDataColumn = tableInfo && tableInfo.some(col => col.Field === 'data')
+        
+        if (hasDataColumn) {
+          const rows = await directQuery('SELECT data FROM federation LIMIT 1')
+          if (rows && rows.length > 0 && rows[0].data) {
+            federationCache = JSON.parse(rows[0].data)
+          }
+        } else {
+          // Table exists but no data column yet - this is fine for initial setup
+          console.log('[Federation] Table exists but no data column yet, using default cache')
         }
       } catch (err) {
-        console.error('[Federation] Error loading from DB:', err.message)
+        // Table might not exist yet or other DB issues - use default cache
+        console.log('[Federation] Using default cache (DB not ready):', err.message)
       }
     }
     cacheLoaded = true
@@ -34,6 +47,15 @@ const loadData = (defaultValue = {}) => {
     return { ...defaultValue, peers: [], relayQueue: {}, processedRelayIds: {}, lastSync: null }
   }
   return { ...federationCache }
+}
+
+// Mutable version for editing
+const loadPeersMutable = () => {
+  if (!cacheLoaded) {
+    ensureCacheLoaded().catch(err => console.error('[Federation] Failed to load cache:', err))
+    return { peers: [], relayQueue: {}, processedRelayIds: {}, lastSync: null }
+  }
+  return federationCache
 }
 
 const saveData = async (data) => {

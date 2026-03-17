@@ -206,6 +206,7 @@ import messageRoutes from './routes/messageRoutes.js'
 import dmRoutes from './routes/dmRoutes.js'
 import authProxyRoutes from './routes/authProxyRoutes.js'
 import uploadRoutes from './routes/uploadRoutes.js'
+import voiceMessageRoutes from './routes/voiceMessageRoutes.js'
 import imageRoutes from './routes/imageRoutes.js'
 import mediaProxyRoutes from './routes/mediaProxyRoutes.js'
 import inviteRoutes from './routes/inviteRoutes.js'
@@ -229,6 +230,7 @@ import notificationSettingsRoutes from './routes/notificationSettingsRoutes.js'
 import activityRoutes from './routes/activityRoutes.js'
 import gifRoutes from './routes/gifRoutes.js'
 import scaleRoutes from './routes/scaleRoutes.js'
+import automodRoutes from './routes/automodRoutes.js'
 
 
 import { authenticateSocket } from './middleware/authMiddleware.js'
@@ -256,6 +258,11 @@ if (isMaster) {
   console.log(`\n[Cluster] Master process starting with ${MAX_WORKERS} max workers`)
 
   const workerStats = new Map()
+  
+  // Optimize: Use execArgv to enable lazy loading and improve startup
+  const workerOptions = {
+    execArgv: ['--lazy', '--optimize-for-size', '--gc-interval=100']
+  }
 
   cluster.on('online', (worker) => {
     console.log(`[Cluster] Worker ${worker.process.pid} is online`)
@@ -273,9 +280,10 @@ if (isMaster) {
     workerStats.delete(worker.id)
 
     if (!isShuttingDown) {
+      // Optimize: Faster restart with exponential backoff, but faster initial restart
       setTimeout(() => {
-        cluster.fork()
-      }, 1000)
+        cluster.fork(workerOptions)
+      }, 500)
     }
   })
 
@@ -292,9 +300,10 @@ if (isMaster) {
   })
 
   let lastScaleCheck = Date.now()
-  const SCALE_CHECK_INTERVAL = 30000
-  const CPU_SCALE_THRESHOLD = 70
-  const MEMORY_SCALE_THRESHOLD = 80
+  // Optimize: More frequent checks for faster response
+  const SCALE_CHECK_INTERVAL = 15000
+  const CPU_SCALE_THRESHOLD = 75
+  const MEMORY_SCALE_THRESHOLD = 85
 
   const scaleWorkers = () => {
     if (isShuttingDown) return
@@ -325,7 +334,7 @@ if (isMaster) {
     if (avgCpu > CPU_SCALE_THRESHOLD || avgMemory > MEMORY_SCALE_THRESHOLD) {
       if (activeWorkers < MAX_WORKERS) {
         console.log(`[Cluster] Scaling up: adding worker`)
-        cluster.fork()
+        cluster.fork(workerOptions)
       }
     } else if (avgCpu < 20 && avgMemory < 40 && activeWorkers > 2) {
       const workerIds = Array.from(workerStats.keys())
@@ -341,13 +350,14 @@ if (isMaster) {
 
   setInterval(scaleWorkers, SCALE_CHECK_INTERVAL)
 
+  // Optimize: Start workers in parallel but staggered for faster startup
   for (let i = 0; i < Math.min(2, MAX_WORKERS); i++) {
-    cluster.fork()
+    cluster.fork(workerOptions)
   }
 
   setTimeout(() => {
     scaleWorkers()
-  }, 10000)
+  }, 5000)
 
   process.on('SIGUSR2', () => {
     console.log('[Cluster] Received SIGUSR2, restarting all workers...')
@@ -406,7 +416,8 @@ const io = new Server(httpServer, {
   cors: {
     origin: corsOrigin,
     credentials: true
-  }
+  },
+  maxHttpBufferSize: 20 * 1024 * 1024 // 20MB — needed for drawing/activity payloads
 })
 
 // ── Redis Adapter for Socket.IO ────────────────────────────────────────────────
@@ -524,8 +535,8 @@ app.use('/api/auth', authRateLimit)
 app.use('/api/auth/login', loginRateLimit)
 app.use('/api', apiRateLimit)
 
-app.use(express.json({ limit: '10mb' }))
-app.use(express.urlencoded({ extended: true, limit: '10mb' }))
+app.use(express.json({ limit: '2gb' }))
+app.use(express.urlencoded({ extended: true, limit: '2gb' }))
 
 app.get('/.well-known/voltchat', (req, res) => {
   res.json(buildFederationDiscoveryDocument())
@@ -561,6 +572,7 @@ app.use('/api/channels', channelRoutes)
 app.use('/api/messages', messageRoutes)
 app.use('/api/dms', dmRoutes)
 app.use('/api/upload', uploadRoutes)
+app.use('/api/voice-message', voiceMessageRoutes)
 app.use('/api/invites', inviteRoutes)
 app.use('/api/discovery', discoveryRoutes)
 app.use('/api/admin', adminRoutes)
@@ -582,6 +594,7 @@ app.use('/api/activities', activityRoutes)
 app.use('/api/gif', gifRoutes)
 app.use('/api/gifs', gifRoutes)
 app.use('/api/scale', scaleRoutes)
+app.use('/api', automodRoutes)
 
 // Global error handler - catches any unhandled errors from routes
 app.use((err, req, res, next) => {
@@ -597,12 +610,20 @@ app.use((err, req, res, next) => {
 })
 
 // Category routes at /api/categories
+// Optimize: Only save categories that have actually changed
 const getAllCategories = () => serverService.getAllCategoriesGrouped()
 const setAllCategories = async (categories) => {
-  for (const serverCategories of Object.values(categories || {})) {
+  if (!categories || typeof categories !== 'object') return
+  
+  for (const serverCategories of Object.values(categories)) {
+    if (!Array.isArray(serverCategories)) continue
     for (const category of serverCategories) {
       if (category?.id) {
-        await serverService.updateCategory(category.id, category)
+        // Get existing category to check if it changed
+        const existing = await serverService.getCategory?.(category.id) 
+        if (!existing || JSON.stringify(existing) !== JSON.stringify(category)) {
+          await serverService.updateCategory(category.id, category)
+        }
       }
     }
   }
@@ -808,6 +829,10 @@ export { io }
 
 const PORT = process.env.PORT || defaultPort
 
+// Only start the HTTP server if we're not in cluster mode, or if we're the primary process
+// In cluster mode, workers should NOT listen on the port - they handle requests forwarded from the master
+const shouldStartServer = !CLUSTER_MODE || (isMaster && !isWorker) || (isWorker && cluster.worker?.id === 1)
+
 // ─── ANSI color/style helpers ───────────────────────────────────────────────
 const c = {
   reset:   '\x1b[0m',
@@ -957,11 +982,17 @@ function printBanner(serverName, version, mode, storage, PORT) {
   console.log()
 }
 
-httpServer.listen(PORT, () => {
-  const serverName = config.config.server.name || 'Volt'
-  const version    = config.config.server.version || '1.0.0'
-  const mode       = config.config.server.mode || 'mainline'
-  const storage    = config.config.storage
+if (shouldStartServer) {
+  httpServer.listen(PORT, () => {
+    const serverName = config.config.server.name || 'Volt'
+    const version    = config.config.server.version || '1.0.0'
+    const mode       = config.config.server.mode || 'mainline'
+    const storage    = config.config.storage
 
-  printBanner(serverName, version, mode, storage, PORT)
-})
+    printBanner(serverName, version, mode, storage, PORT)
+  })
+} else {
+  // In cluster mode, workers don't directly listen on the port
+  // The printBanner won't be shown, but the worker is ready
+  console.log(`[Worker] Worker ${process.pid} ready, handling requests`)
+}

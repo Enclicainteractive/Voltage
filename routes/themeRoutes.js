@@ -17,12 +17,13 @@ router.get('/settings', authenticateToken, async (req, res) => {
       backgroundType: user?.backgroundType || 'solid',
       backgroundImage: user?.backgroundImage || null,
       backgroundOpacity: user?.backgroundOpacity || 100,
+      profileTheme: user?.profileTheme || null,
       profileAccentColor: user?.profileAccentColor || null,
-      profileFont: user?.profileFont || 'default',
-      profileAnimation: user?.profileAnimation || 'none',
+      profileFont: user?.profileFont || null,
+      profileAnimation: user?.profileAnimation || null,
       profileBackground: user?.profileBackground || null,
-      profileBackgroundType: user?.profileBackgroundType || 'solid',
-      profileBackgroundOpacity: user?.profileBackgroundOpacity || 100
+      profileBackgroundType: user?.profileBackgroundType || null,
+      profileBackgroundOpacity: user?.profileBackgroundOpacity ?? 100
     })
   } catch (error) {
     console.error('[API] Get theme settings error:', error)
@@ -41,6 +42,7 @@ router.put('/settings', authenticateToken, async (req, res) => {
       backgroundType,
       backgroundImage,
       backgroundOpacity,
+      profileTheme,
       profileAccentColor,
       profileFont,
       profileAnimation,
@@ -132,6 +134,14 @@ router.put('/settings', authenticateToken, async (req, res) => {
       }
     }
     
+    if (profileTheme !== undefined) {
+      if (profileTheme === null) {
+        updates.profileTheme = null
+      } else if (typeof profileTheme === 'string' && profileTheme.length <= 100) {
+        updates.profileTheme = profileTheme
+      }
+    }
+
     if (profileBackgroundOpacity !== undefined) {
       const opacity = parseInt(profileBackgroundOpacity)
       if (!isNaN(opacity) && opacity >= 0 && opacity <= 100) {

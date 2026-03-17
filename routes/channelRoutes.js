@@ -31,6 +31,9 @@ export let pendingMessageWrites = 0
 let messageFlushTimer = null
 let messageFlushPromise = Promise.resolve()
 
+// Slow mode tracking: { `${channelId}:${userId}` => lastMessageTimestamp (ms) }
+const slowModeLastMessage = new Map()
+
 // Helper function to load all messages (used internally and exported for botRoutes)
 const loadMessages = () => {
   if (messageStoreCache) {
@@ -362,27 +365,45 @@ const flushQueuedMessages = async () => {
   }
 }
 
-const loadPinnedMessages = () => {
+const loadPinnedMessages = (channelId = null) => {
   if (supportsDirectQuery()) {
     try {
-      const rows = directQuery('SELECT * FROM pinned_messages')
-      return rows || []
+      if (channelId) {
+        // Return flat array for a specific channel
+        const rows = directQuery('SELECT * FROM pinned_messages WHERE channelId = ?', [channelId])
+        return rows || []
+      }
+      // Return keyed object { channelId: [rows] } for bulk operations
+      const rows = directQuery('SELECT * FROM pinned_messages') || []
+      const grouped = {}
+      for (const row of rows) {
+        if (!grouped[row.channelId]) grouped[row.channelId] = []
+        grouped[row.channelId].push(row)
+      }
+      return grouped
     } catch (err) {
       console.error('[ChannelRoutes] Error loading pinned from DB:', err.message)
     }
   }
-  return loadData(PINNED_FILE, {})
+  const all = loadData(PINNED_FILE, {})
+  if (channelId) return all[channelId] || []
+  return all
 }
 
 const savePinnedMessages = async (pinned) => {
   if (supportsDirectQuery()) {
     try {
-      await directQuery('DELETE FROM pinned_messages')
-      for (const msg of pinned) {
-        await directQuery(
-          'INSERT INTO pinned_messages (id, channelId, userId, username, avatar, content, timestamp, pinnedAt, pinnedBy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [msg.id, msg.channelId, msg.userId, msg.username, msg.avatar, msg.content, msg.timestamp, msg.pinnedAt, msg.pinnedBy]
-        )
+      // pinned is a keyed object: { channelId: [messages] }
+      // Collect all channel IDs being updated and replace only those rows
+      const channelIds = Object.keys(pinned)
+      for (const cid of channelIds) {
+        await directQuery('DELETE FROM pinned_messages WHERE channelId = ?', [cid])
+        for (const msg of (pinned[cid] || [])) {
+          await directQuery(
+            'INSERT INTO pinned_messages (id, channelId, userId, username, avatar, content, timestamp, pinnedAt, pinnedBy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [msg.id, msg.channelId || cid, msg.userId, msg.username, msg.avatar, msg.content, msg.timestamp, msg.pinnedAt, msg.pinnedBy]
+          )
+        }
       }
       return true
     } catch (err) {
@@ -740,7 +761,31 @@ router.post('/:channelId/messages', authenticateToken, async (req, res) => {
   if (channelInfo?.nsfw && !isUserAgeVerified(req.user.id)) {
     return res.status(451).json({ error: 'Age verification required for this channel', code: 'AGE_VERIFICATION_REQUIRED' })
   }
-  
+
+  // Slow mode enforcement (skip for admins/manage_messages)
+  const slowModeSecs = Number(channelInfo?.slowMode) || 0
+  if (slowModeSecs > 0) {
+    const channelServerInfo2 = getChannelServer(channelId)
+    const servers2 = loadServers()
+    const server2 = servers2.find(s => s.id === channelServerInfo2?.serverId)
+    const isPrivileged = server2 && (hasPermission(server2, req.user.id, 'manage_messages') || hasPermission(server2, req.user.id, 'admin'))
+    if (!isPrivileged) {
+      const smKey = `${channelId}:${req.user.id}`
+      const lastMs = slowModeLastMessage.get(smKey) || 0
+      const nowMs = Date.now()
+      const elapsed = (nowMs - lastMs) / 1000
+      if (elapsed < slowModeSecs) {
+        const retryAfter = Math.ceil(slowModeSecs - elapsed)
+        return res.status(429).json({
+          error: `Slow mode is enabled. Please wait ${retryAfter} second${retryAfter !== 1 ? 's' : ''} before sending another message.`,
+          retryAfter,
+          slowMode: slowModeSecs
+        })
+      }
+      slowModeLastMessage.set(smKey, nowMs)
+    }
+  }
+
   // Include guild tag and server nick in message for global display
   const senderProfile = userService.getUser(req.user.id)
   const channelServerInfo = getChannelServer(channelId)
@@ -812,11 +857,15 @@ router.post('/:channelId/messages/:messageId/notify', authenticateToken, async (
 })
 
 router.put('/:channelId', authenticateToken, async (req, res) => {
-  const found = getChannelServer(req.params.channelId)
-  if (!found) return res.status(404).json({ error: 'Channel not found' })
+  const channelId = req.params.channelId
 
+  // Load channel directly from channelService (handles both flat and legacy formats)
+  const channel = channelService.getChannel(channelId)
+  if (!channel) return res.status(404).json({ error: 'Channel not found' })
+
+  const serverId = channel.serverId
   const servers = loadServers()
-  const server = servers.find(s => s.id === found.serverId)
+  const server = servers.find(s => s.id === serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
   if (!hasPermission(server, req.user.id, 'manage_channels')) {
     return res.status(403).json({ error: 'Not authorized to edit channels' })
@@ -825,34 +874,35 @@ router.put('/:channelId', authenticateToken, async (req, res) => {
   // Validate categoryId if provided
   if (req.body.categoryId !== undefined) {
     const allCategories = loadCategoriesGrouped()
-    const categories = allCategories[found.serverId] || []
-    
+    const categories = allCategories[serverId] || []
     if (req.body.categoryId && !categories.find(c => c.id === req.body.categoryId)) {
       return res.status(400).json({ error: 'Invalid category' })
     }
   }
 
-  const allChannels = found.channels
-  const list = allChannels[found.serverId] || []
-  const idx = list.findIndex(c => c.id === req.params.channelId)
-  if (idx === -1) return res.status(404).json({ error: 'Channel not found' })
-
-  list[idx] = { ...list[idx], ...req.body, updatedAt: new Date().toISOString() }
-  allChannels[found.serverId] = list
-  await saveChannels(allChannels)
-  
-  if (req.body.isDefault) {
-    server.defaultChannelId = req.params.channelId
-    const serverIdx = servers.findIndex(s => s.id === found.serverId)
-    servers[serverIdx] = server
-    await saveServers(servers)
-    io.to(`server:${found.serverId}`).emit('server:updated', server)
+  // Sanitize allowed fields (don't let clients overwrite id/serverId/type arbitrarily)
+  const ALLOWED_FIELDS = ['name', 'topic', 'slowMode', 'nsfw', 'isDefault', 'categoryId', 'position', 'permissions']
+  const updates = {}
+  for (const field of ALLOWED_FIELDS) {
+    if (req.body[field] !== undefined) updates[field] = req.body[field]
   }
-  
-  io.to(`server:${found.serverId}`).emit('channel:updated', list[idx])
-  
-  console.log(`[API] Updated channel ${req.params.channelId}`)
-  res.json(list[idx])
+  updates.updatedAt = new Date().toISOString()
+
+  const updated = await channelService.updateChannel(channelId, updates)
+  if (!updated) return res.status(404).json({ error: 'Channel not found' })
+
+  if (req.body.isDefault) {
+    server.defaultChannelId = channelId
+    const serverIdx = servers.findIndex(s => s.id === serverId)
+    if (serverIdx >= 0) servers[serverIdx] = server
+    await saveServers(servers)
+    io.to(`server:${serverId}`).emit('server:updated', server)
+  }
+
+  io.to(`server:${serverId}`).emit('channel:updated', updated)
+
+  console.log(`[API] Updated channel ${channelId}`)
+  res.json(updated)
 })
 
 router.delete('/:channelId', authenticateToken, async (req, res) => {
@@ -937,59 +987,212 @@ router.get('/:channelId/messages/search', authenticateToken, (req, res) => {
 })
 
 router.get('/:channelId/pins', authenticateToken, (req, res) => {
-  const pinned = loadPinnedMessages()
-  const channelPins = pinned[req.params.channelId] || []
+  // Pass channelId so the DB path returns a flat array directly
+  const channelPins = loadPinnedMessages(req.params.channelId)
   res.json(channelPins)
 })
 
 router.put('/:channelId/pins/:messageId', authenticateToken, async (req, res) => {
   const { channelId, messageId } = req.params
+
+  // Try to find the message in the in-memory store first, then fall back to DB
+  let message = null
   const allMessages = loadMessages()
   const messages = allMessages[channelId] || []
-  const message = messages.find(m => m.id === messageId)
-  
+  message = messages.find(m => m.id === messageId)
+
+  // If not found in memory cache, try querying the DB directly
+  if (!message && supportsDirectQuery()) {
+    try {
+      const rows = directQuery('SELECT * FROM messages WHERE id = ? AND channelId = ?', [messageId, channelId])
+      if (rows && rows.length > 0) message = rows[0]
+    } catch (err) {
+      console.error('[ChannelRoutes] DB message lookup failed:', err.message)
+    }
+  }
+
   if (!message) {
     return res.status(404).json({ error: 'Message not found' })
   }
-  
-  const pinned = loadPinnedMessages()
-  if (!pinned[channelId]) {
-    pinned[channelId] = []
-  }
-  
-  const existingIndex = pinned[channelId].findIndex(p => p.id === messageId)
+
+  // Load existing pins for this channel (flat array)
+  const channelPins = loadPinnedMessages(channelId)
+  const existingIndex = channelPins.findIndex(p => p.id === messageId)
   if (existingIndex >= 0) {
     return res.status(400).json({ error: 'Message already pinned' })
   }
-  
-  pinned[channelId].push({
+
+  // savePinnedMessages expects a keyed object
+  const pinned = { [channelId]: [...channelPins, {
     ...message,
+    channelId,
     pinnedAt: new Date().toISOString(),
     pinnedBy: req.user.id
-  })
+  }] }
   await savePinnedMessages(pinned)
-  
+
   console.log(`[API] Pinned message ${messageId} in channel ${channelId}`)
   res.json({ success: true })
 })
 
 router.delete('/:channelId/pins/:messageId', authenticateToken, async (req, res) => {
   const { channelId, messageId } = req.params
-  
-  const pinned = loadPinnedMessages()
-  if (!pinned[channelId]) {
+
+  // Load existing pins for this channel (flat array)
+  const channelPins = loadPinnedMessages(channelId)
+  if (!channelPins || channelPins.length === 0) {
     return res.status(404).json({ error: 'No pinned messages in this channel' })
   }
-  
-  const index = pinned[channelId].findIndex(p => p.id === messageId)
+
+  const index = channelPins.findIndex(p => p.id === messageId)
   if (index === -1) {
     return res.status(404).json({ error: 'Pinned message not found' })
   }
-  
-  pinned[channelId].splice(index, 1)
-  await savePinnedMessages(pinned)
-  
+
+  channelPins.splice(index, 1)
+  // savePinnedMessages expects a keyed object
+  await savePinnedMessages({ [channelId]: channelPins })
+
   console.log(`[API] Unpinned message ${messageId} from channel ${channelId}`)
+  res.json({ success: true })
+})
+
+// ─── Channel Permissions ────────────────────────────────────────────────────
+// Permissions are stored as an array on the channel object:
+// [{ id: roleId|userId, type: 'role'|'member', allow: [...perms], deny: [...perms] }]
+
+router.get('/:channelId/permissions', authenticateToken, (req, res) => {
+  const channelId = req.params.channelId
+  const channel = channelService.getChannel(channelId)
+  if (!channel) return res.status(404).json({ error: 'Channel not found' })
+
+  // Only server members can view permissions
+  const serverInfo = getChannelServer(channelId)
+  if (serverInfo) {
+    const server = serverService.getServer(serverInfo.serverId)
+    if (server && server.ownerId !== req.user.id) {
+      const member = server.members?.find(m => m && m.id === req.user.id)
+      if (!member) return res.status(403).json({ error: 'Not a member of this server' })
+    }
+  }
+
+  res.json(channel.permissions || [])
+})
+
+router.put('/:channelId/permissions', authenticateToken, async (req, res) => {
+  const channelId = req.params.channelId
+  const channel = channelService.getChannel(channelId)
+  if (!channel) return res.status(404).json({ error: 'Channel not found' })
+
+  const serverId = channel.serverId
+  const servers = loadServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!server) return res.status(404).json({ error: 'Server not found' })
+  if (!hasPermission(server, req.user.id, 'manage_channels')) {
+    return res.status(403).json({ error: 'Not authorized to manage channel permissions' })
+  }
+
+  // Accept multiple body formats:
+  //   { permissions: [...] }                    — replace all (array of overwrites)
+  //   { overrides: { id: { allow, deny } } }    — keyed object (frontend format)
+  //   { id, type, allow, deny }                 — single overwrite upsert
+  let newPermissions
+  if (Array.isArray(req.body.permissions)) {
+    // Full replacement via array
+    newPermissions = req.body.permissions
+  } else if (req.body.overrides && typeof req.body.overrides === 'object') {
+    // Frontend sends { overrides: { roleId: { allow: [], deny: [] }, '@everyone': { view, sendMessages } } }
+    // Convert to canonical array format
+    const existing = Array.isArray(channel.permissions) ? [...channel.permissions] : []
+    for (const [id, overrideData] of Object.entries(req.body.overrides)) {
+      // Normalise allow/deny — frontend may send string booleans for @everyone
+      let allow = Array.isArray(overrideData.allow) ? overrideData.allow : []
+      let deny = Array.isArray(overrideData.deny) ? overrideData.deny : []
+
+      // Handle @everyone shorthand: { view: "false", sendMessages: "false" }
+      if (id === '@everyone') {
+        if (overrideData.view === 'false' || overrideData.view === false) {
+          if (!deny.includes('view_channel')) deny = [...deny, 'view_channel']
+        } else if (overrideData.view === 'true' || overrideData.view === true) {
+          if (!allow.includes('view_channel')) allow = [...allow, 'view_channel']
+        }
+        if (overrideData.sendMessages === 'false' || overrideData.sendMessages === false) {
+          if (!deny.includes('send_messages')) deny = [...deny, 'send_messages']
+        } else if (overrideData.sendMessages === 'true' || overrideData.sendMessages === true) {
+          if (!allow.includes('send_messages')) allow = [...allow, 'send_messages']
+        }
+      }
+
+      const overwrite = {
+        id,
+        type: overrideData.type || (id === '@everyone' ? 'everyone' : 'role'),
+        allow,
+        deny
+      }
+      const idx = existing.findIndex(p => p.id === id)
+      if (idx >= 0) {
+        existing[idx] = overwrite
+      } else {
+        existing.push(overwrite)
+      }
+    }
+    newPermissions = existing
+  } else if (req.body.id) {
+    // Single overwrite upsert
+    const existing = Array.isArray(channel.permissions) ? [...channel.permissions] : []
+    const idx = existing.findIndex(p => p.id === req.body.id)
+    const overwrite = {
+      id: req.body.id,
+      type: req.body.type || 'role',
+      allow: Array.isArray(req.body.allow) ? req.body.allow : [],
+      deny: Array.isArray(req.body.deny) ? req.body.deny : []
+    }
+    if (idx >= 0) {
+      existing[idx] = overwrite
+    } else {
+      existing.push(overwrite)
+    }
+    newPermissions = existing
+  } else {
+    return res.status(400).json({ error: 'Provide either permissions array, overrides object, or a single overwrite {id, type, allow, deny}' })
+  }
+
+  const updated = await channelService.updateChannel(channelId, {
+    permissions: newPermissions,
+    updatedAt: new Date().toISOString()
+  })
+  if (!updated) return res.status(404).json({ error: 'Channel not found' })
+
+  io.to(`server:${serverId}`).emit('channel:updated', updated)
+  console.log(`[API] Updated permissions for channel ${channelId}`)
+  res.json(updated.permissions || [])
+})
+
+// DELETE a single permission overwrite
+router.delete('/:channelId/permissions/:targetId', authenticateToken, async (req, res) => {
+  const { channelId, targetId } = req.params
+  const channel = channelService.getChannel(channelId)
+  if (!channel) return res.status(404).json({ error: 'Channel not found' })
+
+  const serverId = channel.serverId
+  const servers = loadServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!server) return res.status(404).json({ error: 'Server not found' })
+  if (!hasPermission(server, req.user.id, 'manage_channels')) {
+    return res.status(403).json({ error: 'Not authorized to manage channel permissions' })
+  }
+
+  const existing = Array.isArray(channel.permissions) ? channel.permissions : []
+  const filtered = existing.filter(p => p.id !== targetId)
+
+  const updated = await channelService.updateChannel(channelId, {
+    permissions: filtered,
+    updatedAt: new Date().toISOString()
+  })
+  if (!updated) return res.status(404).json({ error: 'Channel not found' })
+
+  io.to(`server:${serverId}`).emit('channel:updated', updated)
+  console.log(`[API] Deleted permission overwrite ${targetId} from channel ${channelId}`)
   res.json({ success: true })
 })
 

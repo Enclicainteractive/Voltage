@@ -116,10 +116,30 @@ class RedisService {
     }
   }
 
+  // Helper to serialize values, handling BigInt and other special types
+  serialize(value) {
+    if (value === null || value === undefined) return 'null'
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+    if (typeof value === 'bigint') return String(value)
+    if (value instanceof Date) return value.toISOString()
+    if (Array.isArray(value)) {
+      return JSON.stringify(value.map(item => this.serialize(item)))
+    }
+    if (typeof value === 'object') {
+      const serialized = {}
+      for (const [k, v] of Object.entries(value)) {
+        serialized[k] = this.serialize(v)
+      }
+      return JSON.stringify(serialized)
+    }
+    return JSON.stringify(value)
+  }
+
   async set(key, value, ttlSeconds = 0) {
     if (!this.isReady()) return false
     try {
-      const serialized = typeof value === 'string' ? value : JSON.stringify(value)
+      const serialized = typeof value === 'string' ? value : this.serialize(value)
       if (ttlSeconds > 0) {
         await this.client.setEx(key, ttlSeconds, serialized)
       } else {
@@ -193,7 +213,7 @@ class RedisService {
   async hset(key, field, value) {
     if (!this.isReady()) return false
     try {
-      await this.client.hSet(key, field, JSON.stringify(value))
+      await this.client.hSet(key, field, this.serialize(value))
       return true
     } catch (err) {
       console.error('[Redis] HSet error:', err.message)

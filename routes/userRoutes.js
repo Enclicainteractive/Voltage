@@ -50,7 +50,7 @@ const avatarUpload = multer({
     cb(new Error('Only image files can be used as profile pictures'))
   },
   limits: {
-    fileSize: 10 * 1024 * 1024,
+    fileSize: 2 * 1024 * 1024 * 1024, // 2GB limit
     files: 1
   }
 })
@@ -701,6 +701,14 @@ router.get('/:userId', async (req, res) => {
     profileLayout: profile.profileLayout || 'standard',
     badgeStyle: profile.badgeStyle || 'default',
     accentColor: profile.accentColor || null,
+    // Profile theme fields
+    profileTheme: profile.profileTheme || null,
+    profileBackground: profile.profileBackground || null,
+    profileAccentColor: profile.profileAccentColor || null,
+    profileFont: profile.profileFont || null,
+    profileAnimation: profile.profileAnimation || null,
+    profileBackgroundType: profile.profileBackgroundType || null,
+    profileBackgroundOpacity: profile.profileBackgroundOpacity ?? 100,
     // clientCSS is only returned to the owner
     ...(isOwn ? { clientCSS: profile.clientCSS || null, clientCSSEnabled: profile.clientCSSEnabled !== false } : {})
   })
@@ -1039,7 +1047,7 @@ router.post('/me/themes', async (req, res) => {
       savedThemes.push({ themeId, name, theme: themeData, createdAt: new Date().toISOString() })
     }
     
-    await userService.updateUser(req.user.id, { savedThemes })
+    await userService.updateProfile(req.user.id, { savedThemes })
     res.json({ success: true })
   } catch (err) {
     console.error('[API] Save theme error:', err)
@@ -1056,7 +1064,7 @@ router.delete('/me/themes/:themeId', async (req, res) => {
     }
     
      const savedThemes = Array.isArray(user.savedThemes) ? user.savedThemes.filter(t => t.themeId !== themeId) : []
-    await userService.updateUser(req.user.id, { savedThemes })
+    await userService.updateProfile(req.user.id, { savedThemes })
     res.json({ success: true })
   } catch (err) {
     console.error('[API] Delete theme error:', err)
@@ -1067,7 +1075,7 @@ router.delete('/me/themes/:themeId', async (req, res) => {
 router.put('/me/themes/active', async (req, res) => {
   try {
     const { themeId } = req.body
-    await userService.updateUser(req.user.id, { activeTheme: themeId })
+    await userService.updateProfile(req.user.id, { activeTheme: themeId })
     res.json({ success: true })
   } catch (err) {
     console.error('[API] Set active theme error:', err)
@@ -1101,6 +1109,176 @@ router.get('/:userId/mutual-servers', async (req, res) => {
   } catch (err) {
     console.error('[API] Get mutual servers error:', err)
     res.json([])
+  }
+})
+
+// ─── Profile Comments ────────────────────────────────────────────────────────
+// Stored in-memory + persisted via userService on the target user's profile.
+// Shape: { id, authorId, authorUsername, authorAvatar, content, createdAt, likes: [] }
+
+const MAX_COMMENT_LENGTH = 500
+const MAX_COMMENTS_PER_PROFILE = 100
+
+const getProfileComments = (userId) => {
+  const user = userService.getUser(userId)
+  return Array.isArray(user?.profileComments) ? user.profileComments : []
+}
+
+// GET /api/users/:userId/comments
+router.get('/:userId/comments', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params
+    const target = userService.getUser(userId)
+    if (!target) return res.status(404).json({ error: 'User not found' })
+
+    // Respect allowComments privacy setting
+    if (target.allowComments === false && req.user.id !== userId) {
+      return res.status(403).json({ error: 'This user has disabled profile comments' })
+    }
+
+    const comments = getProfileComments(userId)
+    res.json(comments)
+  } catch (err) {
+    console.error('[API] Get profile comments error:', err)
+    res.status(500).json({ error: 'Failed to load comments' })
+  }
+})
+
+// POST /api/users/:userId/comments
+router.post('/:userId/comments', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params
+    const { content } = req.body
+
+    if (!content || typeof content !== 'string' || content.trim().length === 0) {
+      return res.status(400).json({ error: 'Comment content is required' })
+    }
+    if (content.trim().length > MAX_COMMENT_LENGTH) {
+      return res.status(400).json({ error: `Comment must be ${MAX_COMMENT_LENGTH} characters or less` })
+    }
+
+    const target = userService.getUser(userId)
+    if (!target) return res.status(404).json({ error: 'User not found' })
+
+    // Respect allowComments privacy setting
+    if (target.allowComments === false) {
+      return res.status(403).json({ error: 'This user has disabled profile comments' })
+    }
+
+    const author = userService.getUser(req.user.id)
+    const existing = getProfileComments(userId)
+
+    if (existing.length >= MAX_COMMENTS_PER_PROFILE) {
+      return res.status(400).json({ error: 'This profile has reached the maximum number of comments' })
+    }
+
+    const comment = {
+      id: `pc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      authorId: req.user.id,
+      authorUsername: author?.displayName || author?.username || req.user.username,
+      authorAvatar: author?.avatar || null,
+      content: content.trim(),
+      createdAt: new Date().toISOString(),
+      likes: []
+    }
+
+    const updated = [...existing, comment]
+    await userService.updateProfile(userId, { profileComments: updated })
+
+    res.status(201).json(comment)
+  } catch (err) {
+    console.error('[API] Add profile comment error:', err)
+    res.status(500).json({ error: 'Failed to add comment' })
+  }
+})
+
+// DELETE /api/users/comments/:commentId  (author or profile owner can delete)
+router.delete('/comments/:commentId', authenticateToken, async (req, res) => {
+  try {
+    const { commentId } = req.params
+    // We need to find which user's profile has this comment
+    // For efficiency, check if a targetUserId is passed as query param
+    const targetUserId = req.query.profileUserId
+    if (!targetUserId) {
+      return res.status(400).json({ error: 'profileUserId query param required' })
+    }
+
+    const target = userService.getUser(targetUserId)
+    if (!target) return res.status(404).json({ error: 'User not found' })
+
+    const comments = getProfileComments(targetUserId)
+    const comment = comments.find(c => c.id === commentId)
+    if (!comment) return res.status(404).json({ error: 'Comment not found' })
+
+    // Only the comment author or the profile owner can delete
+    if (comment.authorId !== req.user.id && targetUserId !== req.user.id) {
+      return res.status(403).json({ error: 'Not authorized to delete this comment' })
+    }
+
+    const updated = comments.filter(c => c.id !== commentId)
+    await userService.updateProfile(targetUserId, { profileComments: updated })
+
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[API] Delete profile comment error:', err)
+    res.status(500).json({ error: 'Failed to delete comment' })
+  }
+})
+
+// POST /api/users/comments/:commentId/like
+router.post('/comments/:commentId/like', authenticateToken, async (req, res) => {
+  try {
+    const { commentId } = req.params
+    const targetUserId = req.query.profileUserId
+    if (!targetUserId) return res.status(400).json({ error: 'profileUserId query param required' })
+
+    const target = userService.getUser(targetUserId)
+    if (!target) return res.status(404).json({ error: 'User not found' })
+
+    const comments = getProfileComments(targetUserId)
+    const idx = comments.findIndex(c => c.id === commentId)
+    if (idx === -1) return res.status(404).json({ error: 'Comment not found' })
+
+    const comment = { ...comments[idx] }
+    if (!Array.isArray(comment.likes)) comment.likes = []
+    if (!comment.likes.includes(req.user.id)) {
+      comment.likes = [...comment.likes, req.user.id]
+    }
+    comments[idx] = comment
+    await userService.updateProfile(targetUserId, { profileComments: comments })
+
+    res.json({ likes: comment.likes })
+  } catch (err) {
+    console.error('[API] Like profile comment error:', err)
+    res.status(500).json({ error: 'Failed to like comment' })
+  }
+})
+
+// DELETE /api/users/comments/:commentId/like
+router.delete('/comments/:commentId/like', authenticateToken, async (req, res) => {
+  try {
+    const { commentId } = req.params
+    const targetUserId = req.query.profileUserId
+    if (!targetUserId) return res.status(400).json({ error: 'profileUserId query param required' })
+
+    const target = userService.getUser(targetUserId)
+    if (!target) return res.status(404).json({ error: 'User not found' })
+
+    const comments = getProfileComments(targetUserId)
+    const idx = comments.findIndex(c => c.id === commentId)
+    if (idx === -1) return res.status(404).json({ error: 'Comment not found' })
+
+    const comment = { ...comments[idx] }
+    comment.likes = Array.isArray(comment.likes)
+      ? comment.likes.filter(id => id !== req.user.id)
+      : []
+    comments[idx] = comment
+    await userService.updateProfile(targetUserId, { profileComments: comments })
+
+    res.json({ likes: comment.likes })
+  } catch (err) {
+    console.error('[API] Unlike profile comment error:', err)
+    res.status(500).json({ error: 'Failed to unlike comment' })
   }
 })
 

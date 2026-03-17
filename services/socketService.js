@@ -34,7 +34,8 @@ const pendingIncomingCalls = new Map()
 // Call timeout duration (30 seconds)
 const CALL_TIMEOUT_MS = 30000
 
-// Consensus tracking for voice connections
+// Consensus tracking for voice connections - DISABLED for scalability
+// The aggressive consensus checking causes cascading reconnections in large channels
 const peerConnectionStates = new Map()  // userId -> { channelId, states: Map<targetPeerId, state>, lastUpdate }
 const channelConsensusState = new Map()   // channelId -> { status, lastReconnect, failureCount }
 const CONSENSUS_THRESHOLD_PERCENT = 50    // Majority = 50%+ reporting failure
@@ -766,7 +767,8 @@ const sendMentionNotifications = (io, senderSocket, channelId, message, mentions
 
 export const setupSocketHandlers = (io) => {
   startHeartbeatMonitor(io)
-  startConsensusMonitor(io)
+  // Consensus monitor disabled - it causes cascading reconnections in large voice channels
+  // startConsensusMonitor(io)
 
   // Apply WebSocket security middleware (connection validation, rate limiting)
   io.use((socket, next) => {
@@ -1468,11 +1470,12 @@ export const setupSocketHandlers = (io) => {
       }
     })
 
-    socket.on('message:send', async (data) => {
+    socket.on('message:send', async (data, ack) => {
       try {
         const profile = userService.getUser(userId)
         const adultAccess = normalizeAgeVerification(profile?.ageVerification, profile || {}).adultAccess
         if (isChannelAgeRestricted(data.channelId) && !adultAccess) {
+          if (typeof ack === 'function') ack({ success: false, error: 'Age verification required', code: 'AGE_VERIFICATION_REQUIRED' })
           socket.emit('message:error', { channelId: data.channelId, code: 'AGE_VERIFICATION_REQUIRED', error: 'Age verification required for this channel' })
           return
         }
@@ -1488,6 +1491,7 @@ export const setupSocketHandlers = (io) => {
           
           if (timeSinceLastMessage < slowMode * 1000) {
             const remainingTime = Math.ceil((slowMode * 1000 - timeSinceLastMessage) / 1000)
+            if (typeof ack === 'function') ack({ success: false, error: `Slowmode active. Wait ${remainingTime}s`, code: 'SLOWMODE' })
             socket.emit('message:error', { 
               channelId: data.channelId, 
               code: 'SLOWMODE', 
@@ -1507,8 +1511,9 @@ export const setupSocketHandlers = (io) => {
           serverUrl: config.getServerUrl()
         }
 
+        const messageId = uuidv4()
         const message = {
-          id: uuidv4(),
+          id: messageId,
           channelId: data.channelId,
           userId: userId,
           username: socket.user.username || socket.user.email,
@@ -1521,13 +1526,18 @@ export const setupSocketHandlers = (io) => {
           storage: storageInfo,
           encrypted: data.encrypted || false,
           iv: data.iv || null,
-          epoch: data.epoch || null
+          epoch: data.epoch || null,
+          clientNonce: data.clientNonce || null
         }
 
         const channelServerId = channel?.serverId
         if (channelServerId) {
           message.content = convertEmojiFormat(data.content, channelServerId)
         }
+
+        // Acknowledge to sender immediately so the client can confirm delivery
+        // and update the optimistic message status without waiting for persistence.
+        if (typeof ack === 'function') ack({ success: true, messageId })
 
         void addMessage(data.channelId, message).catch(err => {
           console.error('[Socket] Failed to persist message:', err.message)
@@ -2029,11 +2039,14 @@ export const setupSocketHandlers = (io) => {
       socket.currentDM = conversationId
     })
 
-    socket.on('dm:send', async (data) => {
+    socket.on('dm:send', async (data, ack) => {
       try {
-        const { conversationId, content, recipientId } = data
+        const { conversationId, content, recipientId, clientNonce } = data
         const conversation = dmService.getConversationForUser(userId, conversationId)
-        if (!conversation) return
+        if (!conversation) {
+          if (typeof ack === 'function') ack({ success: false, error: 'Conversation not found' })
+          return
+        }
 
         const cdnConfig = config.getCdnConfig()
         const storageInfo = {
@@ -2042,8 +2055,9 @@ export const setupSocketHandlers = (io) => {
           serverUrl: config.getServerUrl()
         }
 
+        const messageId = uuidv4()
         const message = {
-          id: uuidv4(),
+          id: messageId,
           conversationId,
           userId: userId,
           username: socket.user.username || socket.user.email,
@@ -2055,12 +2069,20 @@ export const setupSocketHandlers = (io) => {
           storage: storageInfo,
           encrypted: data.encrypted || false,
           iv: data.iv || null,
-          epoch: data.epoch || null
+          epoch: data.epoch || null,
+          clientNonce: clientNonce || null
         }
 
         await dmMessageService.addMessage(conversationId, message)
         await dmService.updateLastMessage(conversationId, userId, recipientId)
-        
+
+        // Acknowledge to the sender immediately so the client can confirm delivery
+        // and clear the pending timeout. This prevents the double-message bug where
+        // the timeout fires, marks the message failed, then dm:new arrives and adds
+        // a duplicate.
+        if (typeof ack === 'function') ack({ success: true, messageId })
+
+        // Emit to all participants in the conversation room
         io.to(`dm:${conversationId}`).emit('dm:new', message)
 
         const participantIds = Array.isArray(conversation.participants)

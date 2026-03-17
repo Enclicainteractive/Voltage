@@ -20,8 +20,39 @@ class SecurityManager {
     this.failedAttempts = new Map()
     this.suspiciousIPs = new Set()
     this.rateLimitStore = new Map()
+    // Optimize: Cache for IP lookups to avoid repeated Set lookups
+    this.blacklistCache = new Map()
+    this.whitelistCache = new Map()
+    this.cacheTTL = 5000 // 5 seconds cache
     this.loadBlacklist()
     this.loadWhitelist()
+  }
+
+  // Optimized: Cache blacklist check results
+  isBlacklisted(ip) {
+    const cached = this.blacklistCache.get(ip)
+    if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
+      return cached.result
+    }
+    const result = this.ipBlacklist.has(ip)
+    this.blacklistCache.set(ip, { result, timestamp: Date.now() })
+    return result
+  }
+
+  // Optimized: Cache whitelist check results
+  isWhitelisted(ip) {
+    const cached = this.whitelistCache.get(ip)
+    if (cached && Date.now() - cached.timestamp < this.cacheTTL) {
+      return cached.result
+    }
+    const result = this.ipWhitelist.has(ip)
+    this.whitelistCache.set(ip, { result, timestamp: Date.now() })
+    return result
+  }
+
+  invalidateCache(ip) {
+    this.blacklistCache.delete(ip)
+    this.whitelistCache.delete(ip)
   }
 
   loadBlacklist() {
@@ -62,21 +93,15 @@ class SecurityManager {
     }
   }
 
-  isBlacklisted(ip) {
-    return this.ipBlacklist.has(ip)
-  }
-
-  isWhitelisted(ip) {
-    return this.ipWhitelist.has(ip)
-  }
-
   addToBlacklist(ip) {
     this.ipBlacklist.add(ip)
+    this.invalidateCache(ip)
     this.saveBlacklist()
   }
 
   removeFromBlacklist(ip) {
     this.ipBlacklist.delete(ip)
+    this.invalidateCache(ip)
     this.saveBlacklist()
   }
 
