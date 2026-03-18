@@ -81,15 +81,21 @@ export const authenticateToken = async (req, res, next) => {
     }
 
     const normalized = normalizeTokenUser(decoded)
-    if (!normalized.userId || !normalized.username) {
+    if (!normalized.userId) {
       return res.status(403).json({ error: 'Invalid token payload' })
     }
-    
+
+    // Username may be null for local accounts that registered with email only
+    // Fall back to email prefix or userId to avoid blocking valid sessions
+    const resolvedUsername = normalized.username ||
+      (normalized.email ? normalized.email.split('@')[0] : null) ||
+      normalized.userId
+
     req.user = {
       id: normalized.userId,
-      username: normalized.username,
-      displayName: decoded.displayName || normalized.username,
-      email: normalized.email || `${normalized.username}@${normalized.host}`,
+      username: resolvedUsername,
+      displayName: decoded.displayName || resolvedUsername,
+      email: normalized.email || `${resolvedUsername}@${normalized.host}`,
       avatar: resolveAvatarFromToken(decoded, normalized.userId),
       host: normalized.host,
       adminRole: normalized.adminRole,
@@ -134,15 +140,20 @@ export const authenticateSocket = async (socket, next) => {
         }
 
         const normalized = normalizeTokenUser(decoded)
-        if (!normalized.userId || !normalized.username) {
+        if (!normalized.userId) {
             return next(new Error('Invalid token payload'))
         }
 
+        // Username may be null for local accounts that registered with email only
+        const resolvedSocketUsername = normalized.username ||
+          (normalized.email ? normalized.email.split('@')[0] : null) ||
+          normalized.userId
+
         socket.user = {
             id: normalized.userId,
-            username: normalized.username,
-            displayName: decoded.displayName || normalized.username,
-            email: normalized.email || `${normalized.username}@${normalized.host}`,
+            username: resolvedSocketUsername,
+            displayName: decoded.displayName || resolvedSocketUsername,
+            email: normalized.email || `${resolvedSocketUsername}@${normalized.host}`,
             avatar: resolveAvatarFromToken(decoded, normalized.userId),
             host: normalized.host,
             adminRole: normalized.adminRole,

@@ -2,7 +2,7 @@ import express from 'express'
 import { v4 as uuidv4 } from 'uuid'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { io } from '../server.js'
-import { FILES, serverService, channelService } from '../services/dataService.js'
+import { FILES, serverService, channelService, supportsDirectQuery, directQuery, reloadData } from '../services/dataService.js'
 
 const router = express.Router()
 
@@ -73,7 +73,7 @@ const setAllChannels = async (channels) => {
     }
   }
 }
-const getAllCategories = () => toGroupedByServer(serverService.getAllCategories())
+const getAllCategories = () => toGroupedByServer(serverService.getAllCategoriesGrouped())
 const setAllCategories = async (categories) => {
   for (const serverCategories of Object.values(categories || {})) {
     for (const category of serverCategories) {
@@ -188,17 +188,33 @@ const discordPermissionsToVoltage = (discordPermInteger) => {
 }
 
 const fetchDiscordTemplate = async (templateCode) => {
-  const response = await fetch(`https://discord.com/api/v9/guilds/templates/${templateCode}`, {
-    headers: {
-      'Content-Type': 'application/json'
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10000) // 10s timeout
+  try {
+    const response = await fetch(`https://discord.com/api/v9/guilds/templates/${templateCode}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'VoltChat/1.0'
+      },
+      signal: controller.signal
+    })
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error('Template not found. Please check the template code or URL.')
+      }
+      throw new Error(`Failed to fetch template from Discord: HTTP ${response.status}`)
     }
-  })
-  
-  if (!response.ok) {
-    throw new Error(`Failed to fetch template: ${response.status}`)
+
+    return await response.json()
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Request to Discord timed out. Please try again.')
+    }
+    throw err
+  } finally {
+    clearTimeout(timeout)
   }
-  
-  return await response.json()
 }
 
 const createDiscordServer = async (templateData, userId, existingServerId = null) => {
@@ -369,58 +385,125 @@ const createDiscordServer = async (templateData, userId, existingServerId = null
   
   allChannels.push(...uncategorizedText, ...uncategorizedVoice, ...uncategorizedForum, ...uncategorizedAnnouncement, ...uncategorizedMedia)
   
-  const allCategories = getAllCategories()
-  allCategories[serverId] = sortedCategories.map((c, idx) => ({
+  // Use direct SQL inserts when available (MariaDB/MySQL/SQLite) to avoid
+  // loading + re-saving the entire channels/categories tables for each record.
+  if (supportsDirectQuery()) {
+    // Insert categories via direct SQL
+    for (const [idx, c] of sortedCategories.entries()) {
+      await directQuery(
+        `INSERT INTO categories (id, serverId, name, position, createdAt)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name), position = VALUES(position)`,
+        [c.id, serverId, c.name, idx, c.createdAt]
+      )
+    }
+
+    // Insert channels via direct SQL
+    for (const channel of allChannels) {
+      const permsJson = channel.permissions ? JSON.stringify(channel.permissions) : null
+      await directQuery(
+        `INSERT INTO channels (id, serverId, name, type, topic, position, categoryId, createdAt, nsfw, slowMode, permissions)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name), type = VALUES(type), topic = VALUES(topic),
+           position = VALUES(position), categoryId = VALUES(categoryId), nsfw = VALUES(nsfw),
+           slowMode = VALUES(slowMode), permissions = VALUES(permissions)`,
+        [
+          channel.id, channel.serverId, channel.name, channel.type,
+          channel.topic || '', channel.position || 0,
+          channel.categoryId || null, channel.createdAt,
+          channel.nsfw ? 1 : 0, channel.slowMode || 0, permsJson
+        ]
+      )
+    }
+  } else {
+    // Fallback: use service methods (slower, triggers full-table saves)
+    for (const [idx, c] of sortedCategories.entries()) {
+      await serverService.createCategory({
+        id: c.id, serverId, name: c.name, position: idx, createdAt: c.createdAt
+      })
+    }
+    for (const channel of allChannels) {
+      await channelService.createChannel(channel)
+    }
+  }
+
+  // Save/update only the affected server (not all servers)
+  let updatedServer
+  if (newServer) {
+    if (supportsDirectQuery()) {
+      const rolesJson = JSON.stringify(newServer.roles || [])
+      const membersJson = JSON.stringify(newServer.members || {})
+      await directQuery(
+        `INSERT INTO servers (id, name, description, ownerId, roles, members, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name), description = VALUES(description),
+           roles = VALUES(roles), updatedAt = VALUES(updatedAt)`,
+        [newServer.id, newServer.name, newServer.description || '', newServer.ownerId,
+         rolesJson, membersJson, newServer.createdAt, newServer.updatedAt]
+      )
+      updatedServer = newServer
+    } else {
+      updatedServer = await serverService.createServer(newServer)
+    }
+  } else {
+    const existingServer = serverService.getServer(serverId)
+    if (existingServer) {
+      const mergedRoles = mergeImportedRoles(existingServer.roles || [], importedRoles)
+      if (supportsDirectQuery()) {
+        await directQuery(
+          `UPDATE servers SET name = ?, description = ?, roles = ?, updatedAt = ? WHERE id = ?`,
+          [serverData.name, serverData.description || existingServer.description || '',
+           JSON.stringify(mergedRoles), new Date().toISOString(), serverId]
+        )
+        updatedServer = { ...existingServer, name: serverData.name, roles: mergedRoles }
+      } else {
+        updatedServer = await serverService.updateServer(serverId, {
+          name: serverData.name,
+          description: serverData.description || existingServer.description || '',
+          roles: mergedRoles,
+          updatedAt: new Date().toISOString()
+        })
+      }
+    } else {
+      const fallbackServer = {
+        id: serverId, name: serverData.name,
+        description: serverData.description || '', ownerId: userId,
+        roles: mergeImportedRoles([], importedRoles),
+        members: {}, channels: {}, invites: {}, bots: [],
+        mfaLevel: 0, contentFilter: 0, notifications: 1,
+        verificationLevel: serverData.verification_level || 0,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+      }
+      if (supportsDirectQuery()) {
+        await directQuery(
+          `INSERT INTO servers (id, name, description, ownerId, roles, members, createdAt, updatedAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE name = VALUES(name)`,
+          [fallbackServer.id, fallbackServer.name, fallbackServer.description,
+           fallbackServer.ownerId, JSON.stringify(fallbackServer.roles),
+           JSON.stringify(fallbackServer.members), fallbackServer.createdAt, fallbackServer.updatedAt]
+        )
+        updatedServer = fallbackServer
+      } else {
+        updatedServer = await serverService.createServer(fallbackServer)
+      }
+    }
+  }
+
+  // Refresh in-memory cache so findChannelById and other cache-based lookups
+  // can find the newly inserted channels/categories/server immediately.
+  await reloadData()
+
+  const categoriesForServer = sortedCategories.map((c, idx) => ({
     id: c.id,
     serverId,
     name: c.name,
     position: idx,
     createdAt: c.createdAt
   }))
-  await setAllCategories(allCategories)
-  
-  const allChannelsStore = getAllChannels()
-  allChannelsStore[serverId] = allChannels
-  await setAllChannels(allChannelsStore)
-  
-  const servers = getServers()
-  const serverIndex = servers.findIndex(server => server?.id === serverId)
-  if (newServer) {
-    servers.push(newServer)
-  } else {
-    const existingServer = serverIndex >= 0 ? servers[serverIndex] : null
-    if (existingServer) {
-      servers[serverIndex] = {
-        ...existingServer,
-        name: serverData.name,
-        description: serverData.description || existingServer.description || '',
-        roles: mergeImportedRoles(existingServer.roles || [], importedRoles),
-        updatedAt: new Date().toISOString()
-      }
-    } else {
-      servers.push({
-        id: serverId,
-        name: serverData.name,
-        description: serverData.description || '',
-        ownerId: userId,
-        roles: mergeImportedRoles([], importedRoles),
-        members: {},
-        channels: {},
-        invites: {},
-        bots: [],
-        mfaLevel: 0,
-        contentFilter: 0,
-        notifications: 1,
-        verificationLevel: serverData.verification_level || 0
-      })
-    }
-  }
-  await setServers(servers)
-
-  const updatedServer = servers.find(server => server?.id === serverId)
 
   io.to(`server:${serverId}`).emit('server:updated', updatedServer)
-  io.to(`server:${serverId}`).emit('category:order-updated', allCategories[serverId] || [])
+  io.to(`server:${serverId}`).emit('category:order-updated', categoriesForServer)
   io.to(`server:${serverId}`).emit('channel:order-updated', allChannels)
   for (const role of importedRoles) {
     io.to(`server:${serverId}`).emit('role:created', { ...role, serverId })
@@ -430,7 +513,7 @@ const createDiscordServer = async (templateData, userId, existingServerId = null
     server: updatedServer,
     channels: allChannels,
     roles: updatedServer?.roles || [],
-    categories: allCategories[serverId]
+    categories: categoriesForServer
   }
 }
 
@@ -442,7 +525,14 @@ router.post('/discord/template', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Template code is required' })
     }
     
-    const templateCodeClean = templateCode.replace(/^https?:\/\/discord\.com\/template\//, '')
+    // Normalise all Discord template URL formats:
+    //   https://discord.new/<code>
+    //   https://discord.com/template/<code>
+    //   <code>  (bare code)
+    const templateCodeClean = templateCode
+      .replace(/^https?:\/\/discord\.new\//, '')
+      .replace(/^https?:\/\/discord\.com\/template\//, '')
+      .trim()
     
     console.log(`[Import] Fetching Discord template: ${templateCodeClean}`)
     

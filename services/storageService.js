@@ -567,9 +567,15 @@ const initSqliteStorage = () => {
       serverId TEXT NOT NULL,
       name TEXT NOT NULL,
       type TEXT DEFAULT 'text',
+      isDefault INTEGER DEFAULT 0,
       topic TEXT,
+      slowMode INTEGER DEFAULT 0,
+      nsfw INTEGER DEFAULT 0,
+      categoryId TEXT,
       position INTEGER,
-      createdAt TEXT
+      createdAt TEXT,
+      updatedAt TEXT,
+      permissions TEXT
     );
     
     CREATE TABLE IF NOT EXISTS messages (
@@ -1000,9 +1006,15 @@ const initMysqlStorage = () => {
             serverId VARCHAR(255) NOT NULL,
             name VARCHAR(255) NOT NULL,
             type VARCHAR(50) DEFAULT 'text',
+            isDefault TINYINT DEFAULT 0,
             topic TEXT,
+            slowMode INT DEFAULT 0,
+            nsfw TINYINT DEFAULT 0,
+            categoryId VARCHAR(255),
             position INTEGER,
             createdAt TEXT,
+            updatedAt TEXT,
+            permissions LONGTEXT,
             INDEX idx_serverId (serverId)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         `)
@@ -2002,6 +2014,29 @@ const initMariadbStorage = () => {
         } catch {}
         try {
           await conn.query(`ALTER TABLE servers ADD COLUMN guildTagPrivate TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE servers ADD COLUMN defaultChannelId VARCHAR(255)`)
+        } catch {}
+
+        // Fix channels table - add missing columns
+        try {
+          await conn.query(`ALTER TABLE channels ADD COLUMN isDefault TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE channels ADD COLUMN slowMode INT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE channels ADD COLUMN nsfw TINYINT DEFAULT 0`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE channels ADD COLUMN categoryId VARCHAR(255)`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE channels ADD COLUMN updatedAt TEXT`)
+        } catch {}
+        try {
+          await conn.query(`ALTER TABLE channels ADD COLUMN permissions LONGTEXT`)
         } catch {}
         
         // Fix dms table

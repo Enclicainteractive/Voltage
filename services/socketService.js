@@ -358,7 +358,7 @@ const scheduleVoiceDisconnectCleanup = (io, channelId, userId, reason = 'disconn
   })
 }
 
-const cleanupVoiceUser = (io, channelId, userId, reason = 'leave') => {
+export const cleanupVoiceUser = (io, channelId, userId, reason = 'leave') => {
   const channelSet = voiceChannels.get(channelId)
   const users = voiceChannelUsers.get(channelId)
   const hadUser = channelSet?.has(userId) || users?.some(u => u.id === userId)
@@ -1472,6 +1472,23 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('message:send', async (data, ack) => {
       try {
+        // Check if user is timed out in this server
+        const channel = findChannelById(data.channelId)
+        if (channel?.serverId) {
+          const servers = serverService ? serverService.getAllServers() : null
+          const serverList = servers ? (Array.isArray(servers) ? servers : Object.values(servers)) : []
+          const srv = serverList.find(s => s.id === channel.serverId)
+          if (srv) {
+            const member = srv.members?.find(m => m && m.id === userId)
+            if (member?.timeoutUntil && new Date(member.timeoutUntil) > new Date()) {
+              const remaining = Math.ceil((new Date(member.timeoutUntil) - Date.now()) / 1000)
+              if (typeof ack === 'function') ack({ success: false, error: `You are timed out for ${remaining} more seconds`, code: 'TIMED_OUT' })
+              socket.emit('message:error', { channelId: data.channelId, code: 'TIMED_OUT', error: `You are timed out. ${remaining}s remaining.` })
+              return
+            }
+          }
+        }
+
         const profile = userService.getUser(userId)
         const adultAccess = normalizeAgeVerification(profile?.ageVerification, profile || {}).adultAccess
         if (isChannelAgeRestricted(data.channelId) && !adultAccess) {
@@ -1480,7 +1497,6 @@ export const setupSocketHandlers = (io) => {
           return
         }
 
-        const channel = findChannelById(data.channelId)
         const slowMode = channel?.slowMode || 0
         
         if (slowMode > 0) {
@@ -1698,6 +1714,22 @@ export const setupSocketHandlers = (io) => {
     socket.on('voice:join', (data) => {
       const { channelId, peerId } = data
       cancelPendingVoiceDisconnect(userId)
+
+      // Check if user is timed out in this server
+      const voiceChannel = channelService.getChannel(channelId)
+      if (voiceChannel?.serverId) {
+        const serversData = serverService ? serverService.getAllServers() : null
+        const serverList = serversData ? (Array.isArray(serversData) ? serversData : Object.values(serversData)) : []
+        const voiceSrv = serverList.find(s => s.id === voiceChannel.serverId)
+        if (voiceSrv) {
+          const voiceMember = voiceSrv.members?.find(m => m && m.id === userId)
+          if (voiceMember?.timeoutUntil && new Date(voiceMember.timeoutUntil) > new Date()) {
+            const remaining = Math.ceil((new Date(voiceMember.timeoutUntil) - Date.now()) / 1000)
+            socket.emit('voice:error', { channelId, code: 'TIMED_OUT', error: `You are timed out. ${remaining}s remaining.` })
+            return
+          }
+        }
+      }
       
       console.log(`[Voice] User ${userId} joining channel ${channelId}`)
       

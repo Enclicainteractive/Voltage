@@ -139,11 +139,26 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email format' })
     }
     
-    const normalized = normalizeUsername(username || email)
-    const parsedUsername = parseUsername(normalized.fullUsername)
-    
-    if (!parsedUsername.isLocal) {
-      return res.status(400).json({ error: 'Cannot register users from other servers' })
+    // If a username was provided, parse it for federation check.
+    // If only an email was provided (no username), derive the username from the email
+    // local part and treat it as a local registration — never treat the email domain
+    // as a Voltage federation host.
+    let parsedUsername
+    if (username) {
+      const normalized = normalizeUsername(username)
+      parsedUsername = parseUsername(normalized.fullUsername)
+      if (!parsedUsername.isLocal) {
+        return res.status(400).json({ error: 'Cannot register users from other servers' })
+      }
+    } else {
+      // Derive username from email local part (e.g. "user" from "user@gmail.com")
+      const emailLocalPart = normalizedEmail.split('@')[0]
+      parsedUsername = {
+        username: emailLocalPart,
+        host: config.getHost(),
+        isLocal: true,
+        isFederated: false
+      }
     }
     
     const existingUsers = userService.getAllUsers()
@@ -232,17 +247,31 @@ router.post('/login', async (req, res) => {
     if (!loginIdentifier || !password) {
       return res.status(400).json({ error: 'Username/email and password are required' })
     }
-    
-    const parsed = parseUsername(loginIdentifier)
-    const normalizedLogin = email ? inputValidator.normalizeEmail(loginIdentifier) : loginIdentifier
-    
-    if (!parsed.isLocal) {
-      return res.status(400).json({ error: 'Please use the correct server for this user' })
+
+    // Detect if the identifier is an email address.
+    // An email has the form local@domain.tld — we check for a dot after the @.
+    // If it IS an email, we always treat it as a local login (look up by email),
+    // never as a federated username, because email domains are not Voltage hosts.
+    const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+    const isEmailLogin = EMAIL_REGEX.test(loginIdentifier)
+
+    const normalizedLogin = isEmailLogin
+      ? (inputValidator.normalizeEmail(loginIdentifier) || loginIdentifier.toLowerCase())
+      : loginIdentifier
+
+    // Only run federation check for non-email identifiers (e.g. user@otherserver.volt)
+    if (!isEmailLogin) {
+      const parsed = parseUsername(loginIdentifier)
+      if (!parsed.isLocal) {
+        return res.status(400).json({ error: 'Please use the correct server for this user' })
+      }
     }
-    
+
+    const parsedUsername = isEmailLogin ? { username: loginIdentifier.split('@')[0] } : parseUsername(loginIdentifier)
+
     const allUsers = userService.getAllUsers()
     const user = Object.values(allUsers).find(
-      u => (u.username?.toLowerCase() === parsed.username.toLowerCase()) ||
+      u => (u.username?.toLowerCase() === parsedUsername.username.toLowerCase()) ||
            (u.email?.toLowerCase() === normalizedLogin.toLowerCase())
     )
     

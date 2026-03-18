@@ -209,12 +209,8 @@ const directQuery = async (sql, params = []) => {
  * Check whether we can use direct DB queries (pool-backed storage).
  */
 const supportsDirectQuery = () => {
-  if (!useStorage) {
-    console.log('[DataService] supportsDirectQuery: useStorage is false')
-    return false
-  }
+  if (!useStorage) return false
   const storage = getStorage()
-  console.log('[DataService] supportsDirectQuery: storage type:', storage?.type, 'db:', !!storage?.db, 'pool:', !!storage?.pool)
   // SQLite uses .db, other databases use .pool
   if (storage?.type === 'sqlite') {
     return !!storage?.db
@@ -1940,10 +1936,20 @@ export const serverService = {
     return grouped
   },
 
+  async createCategory(categoryData) {
+    const categories = loadData(FILES.categories, {})
+    categories[categoryData.id] = {
+      ...categoryData,
+      createdAt: categoryData.createdAt || new Date().toISOString()
+    }
+    await saveData(FILES.categories, categories)
+    return categories[categoryData.id]
+  },
+
   async updateCategory(categoryId, updates) {
     const categories = loadData(FILES.categories, {})
     if (!categories[categoryId]) return null
-    
+
     categories[categoryId] = {
       ...categories[categoryId],
       ...updates,
@@ -2024,6 +2030,58 @@ export const channelService = {
   },
 
   async updateChannel(channelId, updates) {
+    // Fast path: use a targeted UPDATE query instead of loading + saving all channels
+    if (supportsDirectQuery()) {
+      try {
+        // Build SET clause dynamically from the updates object
+        const ALLOWED_COLUMNS = ['name', 'topic', 'slowMode', 'nsfw', 'isDefault', 'categoryId', 'position', 'permissions', 'updatedAt', 'type']
+        const setClauses = []
+        const values = []
+        for (const [key, value] of Object.entries(updates)) {
+          if (!ALLOWED_COLUMNS.includes(key)) continue
+          setClauses.push(`\`${key}\` = ?`)
+          // Serialize objects/arrays to JSON
+          if (value !== null && typeof value === 'object') {
+            values.push(JSON.stringify(value))
+          } else {
+            values.push(value ?? null)
+          }
+        }
+        if (setClauses.length === 0) {
+          // Nothing to update - just return the current channel
+          return this.getChannel(channelId)
+        }
+        values.push(channelId)
+        const result = await directQuery(
+          `UPDATE channels SET ${setClauses.join(', ')} WHERE id = ?`,
+          values
+        )
+        if (result === null) {
+          console.warn('[channelService.updateChannel] directQuery returned null, falling back to full save')
+          // Fall through to full save below
+        } else {
+          // Update the in-memory cache so getChannel() returns fresh data
+          const channelTable = 'channels'
+          if (storageCache[channelTable]) {
+            const existing = storageCache[channelTable][channelId]
+            if (existing) {
+              // Merge updates into cached channel, parsing JSON fields from updates
+              const merged = { ...existing }
+              for (const [key, value] of Object.entries(updates)) {
+                merged[key] = value
+              }
+              storageCache[channelTable][channelId] = merged
+            }
+          }
+          console.log(`[channelService.updateChannel] Updated channel ${channelId} in DB and cache`)
+          return this.getChannel(channelId)
+        }
+      } catch (err) {
+        console.warn('[channelService.updateChannel] directQuery failed, falling back:', err.message)
+      }
+    }
+
+    // Fallback: load all channels, update one, save all back
     const raw = loadData(FILES.channels, {})
     if (Object.keys(raw).length > 0 && this._isLegacyFormat(raw)) {
       // Legacy format: find and update in the server arrays

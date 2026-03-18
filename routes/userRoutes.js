@@ -970,6 +970,25 @@ router.get('/unread-counts', async (req, res) => {
   }
 })
 
+// Mark channel as read - updates lastRead timestamp for the channel
+router.post('/mark-read', async (req, res) => {
+  try {
+    const userId = req.user.id
+    const { channelId } = req.body
+    if (!channelId) return res.status(400).json({ error: 'channelId required' })
+
+    const userData = userService.getUser(userId) || {}
+    const lastRead = userData.lastRead || {}
+    lastRead[channelId] = Date.now()
+
+    await userService.saveUser(userId, { ...userData, lastRead })
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[API] Mark read error:', err)
+    res.status(500).json({ error: 'Failed to mark channel as read' })
+  }
+})
+
 // Update server mute setting
 router.put('/settings/server-mute', async (req, res) => {
   const { serverId, muted } = req.body

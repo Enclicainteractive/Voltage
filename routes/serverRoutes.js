@@ -5,6 +5,7 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { io } from '../server.js'
+import { cleanupVoiceUser, getVoiceChannelUsers } from '../services/socketService.js'
 import { FILES, discoveryService, userService, serverService, channelService, messageService, fileService, saveData } from '../services/dataService.js'
 import config from '../config/config.js'
 import { botService } from '../services/botService.js'
@@ -699,8 +700,26 @@ router.delete('/:serverId/members/:memberId', authenticateToken, async (req, res
   if (!server.members) server.members = []
   server.members = server.members.filter(m => m.id !== req.params.memberId)
   await setServers(servers)
-  
-  console.log(`[API] ${isSelf ? 'User left' : 'Kicked member'} ${req.params.memberId} from server ${server.name}`)
+
+  const kickedMemberId = req.params.memberId
+  const serverId = req.params.serverId
+
+  if (!isSelf) {
+    // Notify the kicked user directly so their client removes the server immediately
+    io.to(`user:${kickedMemberId}`).emit('member:kicked', {
+      serverId,
+      memberId: kickedMemberId,
+      userId: kickedMemberId,
+    })
+    // Notify all other server members that someone was kicked
+    io.to(`server:${serverId}`).emit('member:removed', {
+      serverId,
+      memberId: kickedMemberId,
+      userId: kickedMemberId,
+    })
+  }
+
+  console.log(`[API] ${isSelf ? 'User left' : 'Kicked member'} ${kickedMemberId} from server ${server.name}`)
   res.json({ success: true })
 })
 
@@ -804,17 +823,34 @@ router.post('/:serverId/bans/:memberId', authenticateToken, async (req, res) => 
     return res.status(403).json({ error: 'Not authorized' })
   }
   
+  const bannedMemberId = req.params.memberId
+  const banServerId = req.params.serverId
+
   if (!server.members) server.members = []
-  server.members = server.members.filter(m => m.id !== req.params.memberId)
+  server.members = server.members.filter(m => m.id !== bannedMemberId)
   if (!server.bans) server.bans = []
   server.bans.push({
-    userId: req.params.memberId,
+    userId: bannedMemberId,
     bannedBy: req.user.id,
     bannedAt: new Date().toISOString()
   })
   
   await setServers(servers)
-  console.log(`[API] Banned member ${req.params.memberId} from server ${server.name}`)
+
+  // Notify the banned user directly so their client removes the server immediately
+  io.to(`user:${bannedMemberId}`).emit('member:banned', {
+    serverId: banServerId,
+    memberId: bannedMemberId,
+    userId: bannedMemberId,
+  })
+  // Notify all other server members
+  io.to(`server:${banServerId}`).emit('member:removed', {
+    serverId: banServerId,
+    memberId: bannedMemberId,
+    userId: bannedMemberId,
+  })
+
+  console.log(`[API] Banned member ${bannedMemberId} from server ${server.name}`)
   res.json({ success: true })
 })
 
@@ -1276,6 +1312,111 @@ router.put('/:serverId/guild-tag', authenticateToken, async (req, res) => {
   io.to(`server:${req.params.serverId}`).emit('server:updated', servers[index])
   console.log(`[API] Updated guild tag for server ${req.params.serverId}: ${servers[index].guildTag}`)
   res.json({ guildTag: servers[index].guildTag || null, guildTagPrivate: servers[index].guildTagPrivate === true })
+})
+
+// ─── TIMEOUT ────────────────────────────────────────────────────────────────
+// POST /:serverId/members/:memberId/timeout
+// Body: { duration: <seconds>, reason: <string> }
+// duration = 0 → remove timeout
+router.post('/:serverId/members/:memberId/timeout', authenticateToken, async (req, res) => {
+  const { serverId, memberId } = req.params
+  const servers = getServers()
+  const index = servers.findIndex(s => s.id === serverId)
+  if (index === -1) return res.status(404).json({ error: 'Server not found' })
+  const server = servers[index]
+
+  if (!hasPermission(server, req.user.id, 'kick_members') && !hasPermission(server, req.user.id, 'ban_members')) {
+    return res.status(403).json({ error: 'Not authorized to timeout members' })
+  }
+
+  // Cannot timeout the server owner
+  if (memberId === server.ownerId) {
+    return res.status(400).json({ error: 'Cannot timeout the server owner' })
+  }
+
+  // Cannot timeout yourself
+  if (memberId === req.user.id) {
+    return res.status(400).json({ error: 'Cannot timeout yourself' })
+  }
+
+  const duration = parseInt(req.body.duration, 10) || 0
+  const reason = req.body.reason || null
+
+  const member = server.members?.find(m => m && m.id === memberId)
+  if (!member) return res.status(404).json({ error: 'Member not found' })
+
+  if (duration <= 0) {
+    // Remove timeout
+    member.timeoutUntil = null
+    member.timeoutReason = null
+  } else {
+    const timeoutUntil = new Date(Date.now() + duration * 1000).toISOString()
+    member.timeoutUntil = timeoutUntil
+    member.timeoutReason = reason
+  }
+
+  await setServers(servers)
+
+  // Notify the timed-out user
+  io.to(`user:${memberId}`).emit('member:timeout', {
+    serverId,
+    memberId,
+    timeoutUntil: member.timeoutUntil,
+    reason: member.timeoutReason,
+    moderatorId: req.user.id
+  })
+
+  // Notify all server members so they can update the member list
+  io.to(`server:${serverId}`).emit('member:updated', {
+    serverId,
+    member: { id: memberId, timeoutUntil: member.timeoutUntil, timeoutReason: member.timeoutReason }
+  })
+
+  console.log(`[API] ${duration <= 0 ? 'Removed timeout for' : 'Timed out'} member ${memberId} in server ${server.name}${duration > 0 ? ` for ${duration}s` : ''}`)
+  res.json({ success: true, memberId, timeoutUntil: member.timeoutUntil })
+})
+
+// ─── VOICE DISCONNECT ────────────────────────────────────────────────────────
+// POST /:serverId/members/:memberId/voice-disconnect
+// Forcibly disconnects a user from any voice channel in this server
+router.post('/:serverId/members/:memberId/voice-disconnect', authenticateToken, async (req, res) => {
+  const { serverId, memberId } = req.params
+  const servers = getServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!server) return res.status(404).json({ error: 'Server not found' })
+
+  if (!hasPermission(server, req.user.id, 'kick_members') && !hasPermission(server, req.user.id, 'ban_members')) {
+    return res.status(403).json({ error: 'Not authorized to disconnect members from voice' })
+  }
+
+  if (memberId === server.ownerId && req.user.id !== server.ownerId) {
+    return res.status(400).json({ error: 'Cannot disconnect the server owner from voice' })
+  }
+
+  // Emit to the target user's socket to force them to leave voice
+  io.to(`user:${memberId}`).emit('voice:force-disconnect', {
+    serverId,
+    moderatorId: req.user.id,
+    reason: req.body.reason || null
+  })
+
+  // Also clean up server-side voice state immediately so all other participants
+  // see the user leave right away (even if the client is slow to respond)
+  const allChannels = getAllChannels()
+  const serverChannels = allChannels[serverId] || []
+  const voiceChannelIds = serverChannels.filter(c => c.type === 'voice').map(c => c.id)
+  let disconnectedFrom = null
+  for (const channelId of voiceChannelIds) {
+    const participants = getVoiceChannelUsers(channelId)
+    if (participants.some(p => p.id === memberId)) {
+      cleanupVoiceUser(io, channelId, memberId, 'force-disconnect')
+      disconnectedFrom = channelId
+      break
+    }
+  }
+
+  console.log(`[API] Force-disconnected member ${memberId} from voice in server ${server.name}${disconnectedFrom ? ` (channel ${disconnectedFrom})` : ' (not in voice)'}`)
+  res.json({ success: true, memberId, channelId: disconnectedFrom })
 })
 
 export default router

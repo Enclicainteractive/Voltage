@@ -144,8 +144,6 @@ const hasPermission = (server, userId, permission) => {
 
 export const findChannelById = (channelId) => {
   const channels = loadChannels()
-  console.log(`[findChannelById] Looking for channelId: ${channelId}`)
-  console.log(`[findChannelById] Channels object keys: ${Object.keys(channels || {}).length}`)
   
   // Handle different channel data structures
   if (!channels) return null
@@ -156,27 +154,22 @@ export const findChannelById = (channelId) => {
     if (found) return found
   }
   
-  // If channels is an object with serverId keys
-  for (const [serverId, list] of Object.entries(channels)) {
+  // If channels is an object with serverId keys or flat { channelId: channelData }
+  for (const [key, list] of Object.entries(channels)) {
     if (!list) continue
     
-    // Handle array of channels
+    // Handle array of channels (grouped by serverId)
     if (Array.isArray(list)) {
       if (list.length === 0) continue
       const found = list.find(c => c && c.id === channelId)
-      if (found) {
-        console.log(`[findChannelById] Found channel in server ${serverId}:`, found.id)
-        return found
-      }
+      if (found) return found
     }
-    // Handle single channel object
+    // Handle flat format: key IS the channelId
     else if (list && list.id === channelId) {
-      console.log(`[findChannelById] Found channel in server ${serverId}:`, list.id)
       return list
     }
   }
   
-  console.log(`[findChannelById] Channel not found after checking ${Object.keys(channels).length} servers`)
   return null
 }
 
@@ -207,80 +200,45 @@ const getChannelServer = (channelId) => {
 
 // Check if user can view a channel - must be defined AFTER findChannelById and getChannelServer
 export const canViewChannel = (channelId, userId) => {
-  console.log(`[canViewChannel] channelId: ${channelId}, userId: ${userId}`)
-  
   const channel = findChannelById(channelId)
-  if (!channel) {
-    console.log(`[canViewChannel] Channel not found`)
-    return false
-  }
+  if (!channel) return false
   
   // For DM channels, check if user is part of the conversation
-  if (channel.type === 'dm' || channelId.startsWith('dm_')) {
-    console.log(`[canViewChannel] DM channel - allowing`)
-    return true
-  }
+  if (channel.type === 'dm' || channelId.startsWith('dm_')) return true
   
   // For server channels, check server membership
   const serverInfo = getChannelServer(channelId)
-  if (!serverInfo) {
-    console.log(`[canViewChannel] Server not found for channel`)
-    return false
-  }
-  console.log(`[canViewChannel] Server ID: ${serverInfo.serverId}`)
+  if (!serverInfo) return false
   
   // Load the specific server directly instead of using cached list
   const server = serverService.getServer(serverInfo.serverId)
-  if (!server) {
-    console.log(`[canViewChannel] Server ${serverInfo.serverId} not found in database`)
-    return false
-  }
-  console.log(`[canViewChannel] Server found: ${server.name}, ownerId: ${server.ownerId}`)
+  if (!server) return false
   
   // Check if user is the owner
-  if (server.ownerId === userId) {
-    console.log(`[canViewChannel] User is owner - allowing`)
-    return true
-  }
+  if (server.ownerId === userId) return true
   
   // Check if user is a member
   const member = server.members?.find(m => m && m.id === userId)
-  if (!member) {
-    console.log(`[canViewChannel] User not a member`)
-    return false
-  }
-  console.log(`[canViewChannel] Member found: ${JSON.stringify(member.roles)}`)
+  if (!member) return false
   
   // Check role permissions for view_channels
   // Get member's role IDs (can be array or single string)
   const roleIds = Array.isArray(member.roles) ? member.roles : (member.role ? [member.role] : [])
   
   // If member has no roles, allow by default (default member role)
-  if (roleIds.length === 0) {
-    console.log(`[canViewChannel] No roles, allowing`)
-    return true
-  }
+  if (roleIds.length === 0) return true
   
   // Check each role for view_channels permission
   for (const roleId of roleIds) {
     const role = server.roles?.find(r => r.id === roleId)
-    console.log(`[canViewChannel] Checking role ${roleId}:`, role?.permissions)
-    if (role?.permissions?.includes('view_channels') || role?.permissions?.includes('admin')) {
-      console.log(`[canViewChannel] Role has permission - allowing`)
-      return true
-    }
+    if (role?.permissions?.includes('view_channels') || role?.permissions?.includes('admin')) return true
   }
   
   // Check default @member role
   const defaultMemberRole = server.roles?.find(r => r.id === 'member')
-  console.log(`[canViewChannel] Default role:`, defaultMemberRole?.permissions)
-  if (defaultMemberRole?.permissions?.includes('view_channels')) {
-    console.log(`[canViewChannel] Default role has permission - allowing`)
-    return true
-  }
+  if (defaultMemberRole?.permissions?.includes('view_channels')) return true
   
   // No role has view_channels permission - deny
-  console.log(`[canViewChannel] No roles have permission - denying`)
   return false
 }
 
