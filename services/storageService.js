@@ -3,6 +3,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 import config from '../config/config.js'
+import circuitBreakerManager from './circuitBreaker.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
@@ -910,10 +911,31 @@ const initMysqlStorage = () => {
       database: storageConfig.database || 'voltchat',
       user: storageConfig.user || 'root',
       password: storageConfig.password || '',
-      connectionLimit: storageConfig.connectionLimit || 10,
+      // Enhanced connection pool configuration
+      connectionLimit: storageConfig.connectionLimit || 20,
+      acquireTimeout: storageConfig.acquireTimeout || 60000,
+      timeout: storageConfig.queryTimeout || 30000,
+      reconnect: true,
       charset: storageConfig.charset || 'utf8mb4',
       waitForConnections: true,
-      queueLimit: 0
+      queueLimit: storageConfig.queueLimit || 50,
+      // Connection pool health settings
+      idleTimeout: storageConfig.idleTimeout || 300000, // 5 minutes
+      maxIdle: storageConfig.maxIdle || 10,
+      // Query optimization
+      multipleStatements: false,
+      trace: process.env.NODE_ENV === 'development',
+      // SSL configuration if needed
+      ssl: storageConfig.ssl || false,
+      // Performance optimizations
+      typeCast: function castField(field, useDefaultTypeCasting) {
+        // Cast BIT(1) as boolean for better performance
+        if (field.type === 'BIT' && field.length === 1) {
+          const bytes = field.buffer()
+          return bytes ? bytes[0] === 1 : null
+        }
+        return useDefaultTypeCasting()
+      }
     })
     
     const createTables = async () => {
@@ -1197,11 +1219,37 @@ const initMysqlStorage = () => {
       }
     }
 
+    // Add connection pool monitoring
+    pool.on('connection', (connection) => {
+      console.log('[Storage] MySQL connection established:', connection.threadId)
+    })
+
+    pool.on('error', (err) => {
+      console.error('[Storage] MySQL pool error:', err.message)
+      if(err.code === 'PROTOCOL_CONNECTION_LOST') {
+        console.log('[Storage] Attempting to reconnect to MySQL...')
+      }
+    })
+
+    // Log pool metrics every 5 minutes in development
+    if (process.env.NODE_ENV === 'development') {
+      setInterval(() => {
+        const poolConfig = pool.pool.config
+        const poolStatus = {
+          activeConnections: pool.pool._allConnections.length,
+          freeConnections: pool.pool._freeConnections.length,
+          queuedRequests: pool.pool._connectionQueue ? pool.pool._connectionQueue.length : 0,
+          connectionLimit: poolConfig.connectionLimit
+        }
+        console.log('[Storage] MySQL pool status:', poolStatus)
+      }, 300000) // 5 minutes
+    }
+
     const ready = createTables().catch(err => {
       console.error('[Storage] Error creating MySQL tables:', err.message)
     })
     
-    console.log('[Storage] MySQL pool created')
+    console.log('[Storage] MySQL pool created with enhanced configuration')
     
     return {
       type: 'mysql',
@@ -1214,9 +1262,22 @@ const initMysqlStorage = () => {
           
           const schema = TABLE_SCHEMAS[safeTable]
           
-          // First, try to load from individual table
+          // First, try to load from individual table with circuit breaker
           try {
-            const [rows] = await pool.execute(`SELECT * FROM ${safeTable}`)
+            const [rows] = await circuitBreakerManager.executeWithFallback(
+              `mysql_query_${safeTable}`,
+              () => pool.execute(`SELECT * FROM ${safeTable}`),
+              () => {
+                console.warn(`[Storage] MySQL circuit breaker open for table ${safeTable}, using fallback`)
+                return [[], []] // Return empty result set
+              },
+              {
+                failureThreshold: 5,
+                resetTimeout: 30000,
+                onOpen: () => console.error(`[Storage] MySQL circuit breaker opened for table ${safeTable}`),
+                onClose: () => console.log(`[Storage] MySQL circuit breaker closed for table ${safeTable}`)
+              }
+            )
             if (rows.length > 0) {
               // Handle special data formats
               if (schema?.dataFormat === 'friends_list') {
@@ -1388,12 +1449,15 @@ const initMysqlStorage = () => {
       },
       save: async (table, data) => {
         const safeTable = assertSafeTableName(table)
-        try {
-          await ready
-          const conn = await pool.getConnection()
-          try {
-            // Check if individual table exists
-            const [tables] = await conn.query(`SHOW TABLES LIKE ?`, [safeTable])
+        
+        return await circuitBreakerManager.executeWithFallback(
+          `mysql-save-${safeTable}`,
+          async () => {
+            await ready
+            const conn = await pool.getConnection()
+            try {
+              // Check if individual table exists
+              const [tables] = await conn.query(`SHOW TABLES LIKE ?`, [safeTable])
             
             if (tables.length > 0) {
               // Save to individual table
@@ -1683,13 +1747,20 @@ const initMysqlStorage = () => {
               )
               return true
             }
-          } finally {
-            conn.release()
+            } finally {
+              conn.release()
+            }
+          },
+          // Fallback: return false when circuit is open
+          async () => {
+            console.warn(`[Storage] MySQL save circuit breaker open for ${safeTable}, using fallback`)
+            return false
+          },
+          {
+            failureThreshold: 5,
+            resetTimeout: 30000
           }
-        } catch (err) {
-          console.error(`[Storage] Error saving ${table}:`, err.message)
-          return false
-        }
+        )
       },
       close: async () => {
         await pool.end()
@@ -2637,12 +2708,15 @@ const initMariadbStorage = () => {
       },
       save: async (table, data) => {
         const safeTable = assertSafeTableName(table)
-        try {
-          await ready
-          const conn = await pool.getConnection()
-          try {
-            // Check if individual table exists
-            const tables = await conn.query(`SHOW TABLES LIKE ?`, [safeTable])
+        
+        return await circuitBreakerManager.executeWithFallback(
+          `mariadb-save-${safeTable}`,
+          async () => {
+            await ready
+            const conn = await pool.getConnection()
+            try {
+              // Check if individual table exists
+              const tables = await conn.query(`SHOW TABLES LIKE ?`, [safeTable])
             
             if (tables.length > 0) {
               // Save to individual table
@@ -3040,16 +3114,20 @@ const initMariadbStorage = () => {
               )
               return true
             }
-          } catch (err) {
-            console.error(`[Storage] Error saving ${table}:`, err.message)
+            } finally {
+              conn.release()
+            }
+          },
+          // Fallback: return false when circuit is open
+          async () => {
+            console.warn(`[Storage] MariaDB save circuit breaker open for ${safeTable}, using fallback`)
             return false
-          } finally {
-            conn.release()
+          },
+          {
+            failureThreshold: 5,
+            resetTimeout: 30000
           }
-        } catch (err) {
-          console.error(`[Storage] Error saving ${table}:`, err.message)
-          return false
-        }
+        )
       },
       close: async () => {
         await pool.end()

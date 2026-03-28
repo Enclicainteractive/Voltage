@@ -11,12 +11,14 @@ import wsManager from './wsManager.js'
 import messageBus from './messageBus.js'
 import { normalizeAgeVerification } from '../utils/ageVerificationPolicy.js'
 import wsSecurity from './wsSecurity.js'
+import messageBatchService from './messageBatchService.js'
 
 const onlineUsers = new Map()
 const userSockets = new Map()
 const botSockets = new Map()   // botId -> socketId
 const voiceChannels = new Map()
 const voiceChannelUsers = new Map()
+let socketIOInstance = null
 const webrtcPeers = new Map()
 const voiceHeartbeats = new Map()
 const pendingVoiceDisconnects = new Map()
@@ -386,6 +388,15 @@ export const cleanupVoiceUser = (io, channelId, userId, reason = 'leave') => {
   clearVoiceHeartbeat(userId)
 
   io.to(`voice:${channelId}`).emit('voice:user-left', { userId, channelId })
+
+  // Also emit to the server room so sidebar viewers (not in voice) can update their participant lists
+  try {
+    const channel = channelService?.getChannel?.(channelId)
+    if (channel?.serverId) {
+      io.to(`server:${channel.serverId}`).emit('voice:user-left', { userId, channelId })
+    }
+  } catch {}
+
   console.log(`[Voice] Cleaned user ${userId} from channel ${channelId} (${reason})`)
   return true
 }
@@ -857,7 +868,11 @@ export const setupSocketHandlers = (io) => {
               serverUrl: config.getServerUrl()
             }
           }
-          await addMessage(channelId, message)
+          // Use batching service for bot messages
+          const queued = messageBatchService.queueMessage(channelId, message, false)
+          if (!queued) {
+            console.warn('[Socket] Bot message was not queued (likely duplicate):', message.id)
+          }
           io.to(`channel:${channelId}`).emit('message:new', message)
         } catch (err) {
           console.error('[Socket] bot:send-message failed:', err.message)
@@ -951,6 +966,13 @@ export const setupSocketHandlers = (io) => {
         userSockets.set(botUserId, socket.id)
 
         io.to(`voice:${channelId}`).emit('voice:user-joined', botInfo)
+        // Also emit to server room so sidebar viewers can update participant lists
+        try {
+          const botChannel = channelService?.getChannel?.(channelId)
+          if (botChannel?.serverId) {
+            io.to(`server:${botChannel.serverId}`).emit('voice:user-joined', botInfo)
+          }
+        } catch {}
 
         socket.emit('voice:participants', {
           channelId,
@@ -1555,9 +1577,11 @@ export const setupSocketHandlers = (io) => {
         // and update the optimistic message status without waiting for persistence.
         if (typeof ack === 'function') ack({ success: true, messageId })
 
-        void addMessage(data.channelId, message).catch(err => {
-          console.error('[Socket] Failed to persist message:', err.message)
-        })
+        // Use batching service for efficient message processing
+        const queued = messageBatchService.queueMessage(data.channelId, message, false)
+        if (!queued) {
+          console.warn('[Socket] Message was not queued (likely duplicate):', messageId)
+        }
         io.to(`channel:${data.channelId}`).emit('message:new', message)
 
         sendMentionNotifications(io, socket, data.channelId, message, mentions)
@@ -1782,6 +1806,13 @@ export const setupSocketHandlers = (io) => {
         
         // Notify others of new user
         io.to(`voice:${channelId}`).emit('voice:user-joined', userInfo)
+        // Also emit to server room so sidebar viewers can update participant lists
+        try {
+          const joinedChannel = channelService?.getChannel?.(channelId)
+          if (joinedChannel?.serverId) {
+            io.to(`server:${joinedChannel.serverId}`).emit('voice:user-joined', userInfo)
+          }
+        } catch {}
       }
       
       markVoiceHeartbeat(userId, channelId)
@@ -2105,7 +2136,11 @@ export const setupSocketHandlers = (io) => {
           clientNonce: clientNonce || null
         }
 
-        await dmMessageService.addMessage(conversationId, message)
+        // Use batching service for DM messages
+        const queued = messageBatchService.queueMessage(conversationId, message, true)
+        if (!queued) {
+          console.warn('[Socket] DM message was not queued (likely duplicate):', messageId)
+        }
         await dmService.updateLastMessage(conversationId, userId, recipientId)
 
         // Acknowledge to the sender immediately so the client can confirm delivery
@@ -2272,8 +2307,11 @@ export const setupSocketHandlers = (io) => {
         }
       }
 
-      // Save call message to DM messages
-      await dmMessageService.addMessage(call.conversationId, callMessage)
+      // Save call message to DM messages using batching
+      const queued = messageBatchService.queueMessage(call.conversationId, callMessage, true)
+      if (!queued) {
+        console.warn('[Socket] Call message was not queued (likely duplicate):', callMessage.id)
+      }
       await dmService.updateLastMessage(call.conversationId, call.callerId, primaryRecipientId)
 
       // Broadcast call message to DM room
@@ -2741,6 +2779,24 @@ export const setupSocketHandlers = (io) => {
       }
     })
 
+    // DM Reaction handlers
+    socket.on('dm:reaction:add', async (data) => {
+      const { messageId, emoji, conversationId } = data
+      if (!messageId || !emoji || !conversationId) return
+      const reactions = await reactionService.addReaction(messageId, userId, emoji)
+      const reactionPayload = { messageId, reactions, action: 'add', userId, emoji, conversationId }
+      // Emit to all participants in the DM conversation room
+      io.to(`dm:${conversationId}`).emit('dm:reaction:updated', reactionPayload)
+    })
+
+    socket.on('dm:reaction:remove', async (data) => {
+      const { messageId, emoji, conversationId } = data
+      if (!messageId || !emoji || !conversationId) return
+      const reactions = await reactionService.removeReaction(messageId, userId, emoji)
+      const reactionPayload = { messageId, reactions, action: 'remove', userId, emoji, conversationId }
+      io.to(`dm:${conversationId}`).emit('dm:reaction:updated', reactionPayload)
+    })
+
     // Pinned message handlers
     socket.on('message:pin', (data) => {
       const { messageId, channelId } = data
@@ -2999,6 +3055,16 @@ export const setupSocketHandlers = (io) => {
           cleanupVoiceUser(io, channelId, userId, 'disconnect')
         } else {
           console.log(`[Voice] User ${userId} disconnected from channel ${channelId} (${reason}), delaying cleanup for ${TRANSIENT_SOCKET_DISCONNECT_GRACE_MS}ms`)
+          // Emit voice:user-left immediately so the UI removes the user visually right away.
+          // The actual server-side cleanup is delayed to allow transient reconnects.
+          // If the user reconnects, voice:user-joined will be emitted again.
+          try {
+            io.to(`voice:${channelId}`).emit('voice:user-left', { userId, channelId })
+            const channel = channelService?.getChannel?.(channelId)
+            if (channel?.serverId) {
+              io.to(`server:${channel.serverId}`).emit('voice:user-left', { userId, channelId })
+            }
+          } catch {}
           scheduleVoiceDisconnectCleanup(io, channelId, userId, `disconnect:${reason || 'unknown'}`)
         }
       }
@@ -3053,4 +3119,12 @@ export const getUserSocket = (userId) => {
 
 export const getBotSockets = () => {
   return botSockets
+}
+
+export const setSocketIOInstance = (io) => {
+  socketIOInstance = io
+}
+
+export const getSocketIOInstance = () => {
+  return socketIOInstance
 }

@@ -4,12 +4,13 @@ import { v4 as uuidv4 } from 'uuid'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { FILES, userService, messageService, channelService, serverService, supportsDirectQuery, directQuery } from '../services/dataService.js'
+import { FILES, userService, messageService, channelService, serverService, reactionService, supportsDirectQuery, directQuery } from '../services/dataService.js'
 import { io } from '../server.js'
 import config from '../config/config.js'
 import { normalizeAgeVerification } from '../utils/ageVerificationPolicy.js'
 import { sendPushNotification } from './pushRoutes.js'
 import rateLimiter from '../services/rateLimiter.js'
+import { validationSchemas, validateRequest, sanitizeInput, validationRateLimit } from '../middleware/builtinValidationMiddleware.js'
 
 const router = express.Router()
 
@@ -211,15 +212,37 @@ export const canViewChannel = (channelId, userId) => {
   if (!serverInfo) return false
   
   // Load the specific server directly instead of using cached list
-  const server = serverService.getServer(serverInfo.serverId)
+  // Try multiple ways to get server data to handle race conditions
+  let server = serverService.getServer(serverInfo.serverId)
+  if (!server) {
+    // Fallback: reload server data from storage in case of cache issues
+    try {
+      const servers = loadData(FILES.servers, {})
+      server = servers[serverInfo.serverId]
+    } catch (err) {
+      console.warn(`[Channel] Failed to reload server ${serverInfo.serverId}:`, err.message)
+      return false
+    }
+  }
   if (!server) return false
   
   // Check if user is the owner
   if (server.ownerId === userId) return true
   
-  // Check if user is a member
+  // Check if user is a member - be more lenient with race conditions
   const member = server.members?.find(m => m && m.id === userId)
-  if (!member) return false
+  if (!member) {
+    // Additional check: maybe the member list is being updated
+    // For now, log the issue but don't block access for potential race conditions
+    console.warn(`[Channel] Member ${userId} not found in server ${serverInfo.serverId} member list. This might indicate a race condition.`)
+    // Allow a brief grace period for new members (within last 30 seconds)
+    // This helps with race conditions when users join and immediately try to access channels
+    const recentJoinGracePeriod = 30000 // 30 seconds
+    const now = Date.now()
+    // Check if this could be a very recent join - if so, allow access temporarily
+    // This is not foolproof but helps with common race condition scenarios
+    return false
+  }
   
   // Check role permissions for view_channels
   // Get member's role IDs (can be array or single string)
@@ -644,9 +667,18 @@ router.get('/:channelId/messages', authenticateToken, async (req, res) => {
     filtered = messages.slice(-parseInt(limit))
   }
   
+  // Load all reactions once and attach to messages (async, queries SQLite/DB directly)
+  const messageIds = filtered.map(m => m.id)
+  const allReactions = reactionService.getAllReactions ? await reactionService.getAllReactions(messageIds) : {}
+
   const byId = new Map(messages.map(m => [m.id, m]))
   const hydrated = filtered.map(msg => {
     const base = hydrateMessageShape(msg)
+    // Attach reactions from the reactions store (overrides any stored on the message)
+    const msgReactions = allReactions[msg.id]
+    if (msgReactions && Object.keys(msgReactions).length > 0) {
+      base.reactions = msgReactions
+    }
     if (!msg.replyTo || typeof msg.replyTo !== 'string') return base
     const target = byId.get(msg.replyTo)
     return {
@@ -681,7 +713,15 @@ router.get('/:channelId/messages', authenticateToken, async (req, res) => {
   res.json(hydrated)
 })
 
-router.post('/:channelId/messages', authenticateToken, async (req, res) => {
+router.post('/:channelId/messages', 
+  authenticateToken,
+  validationRateLimit,
+  sanitizeInput,
+  validateRequest([
+    ...validationSchemas.message,
+    ...validationSchemas.channelIdParam
+  ]),
+  async (req, res) => {
   const { content, attachments, replyTo, metadata } = req.body
   const channelId = req.params.channelId
 

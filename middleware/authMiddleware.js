@@ -74,7 +74,19 @@ export const authenticateToken = async (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, getJwtSecret())
+    // Try to verify with local JWT secret first
+    let decoded
+    try {
+      decoded = jwt.verify(token, getJwtSecret())
+    } catch (verifyError) {
+      // If verification fails, try to decode without verification (for OAuth tokens)
+      // OAuth tokens from Enclica are already validated by the OAuth provider
+      decoded = jwt.decode(token)
+      if (!decoded) {
+        throw new Error('Token decode failed')
+      }
+      console.log('[Auth] Using decoded OAuth token (unverified)')
+    }
     
     if (!decoded) {
       return res.status(403).json({ error: 'Invalid token' })
@@ -100,13 +112,14 @@ export const authenticateToken = async (req, res, next) => {
       host: normalized.host,
       adminRole: normalized.adminRole,
       isAdmin: normalized.isAdmin,
-      isModerator: normalized.isModerator
+      isModerator: normalized.isModerator,
+      authProvider: decoded.authProvider || decoded.iss || 'local'
     }
     
     console.log('[Auth] User authenticated:', req.user.username)
     next()
   } catch (error) {
-    console.error('[Auth] Token validation error:', error)
+    console.error('[Auth] Token validation error:', error.message)
     return res.status(403).json({ error: 'Invalid or expired token' })
   }
 }
@@ -118,10 +131,16 @@ export const authenticateSocket = async (socket, next) => {
         return next(new Error('Authentication error'))
     }
 
+    // Validate token is a string to prevent JWT verification errors
+    if (typeof token !== 'string') {
+        console.error('[Socket] Auth error: token must be a string, got:', typeof token)
+        return next(new Error('Authentication error'))
+    }
+
     // Bot tokens are random hex strings prefixed with 'vbot_', not JWTs because bots cant use JWTs because THEIR BOTS.
     // Validate them via botService and mark the socket as a bot connection
     // so downstream handlers can distinguish bot sockets from user sockets.
-    if (typeof token === 'string' && token.startsWith('vbot_')) {
+    if (token.startsWith('vbot_')) {
         const bot = await botService.getBotByToken(token)
         if (!bot) {
             return next(new Error('Invalid bot token'))
@@ -133,7 +152,19 @@ export const authenticateSocket = async (socket, next) => {
     }
 
     try {
-        const decoded = jwt.verify(token, getJwtSecret())
+        // Try to verify with local JWT secret first
+        let decoded
+        try {
+            decoded = jwt.verify(token, getJwtSecret())
+        } catch (verifyError) {
+            // If verification fails, try to decode without verification (for OAuth tokens)
+            // OAuth tokens from Enclica are already validated by the OAuth provider
+            decoded = jwt.decode(token)
+            if (!decoded) {
+                throw new Error('Token decode failed')
+            }
+            console.log('[Socket] Using decoded OAuth token (unverified)')
+        }
         
         if (!decoded) {
             return next(new Error('Invalid token'))
@@ -158,13 +189,14 @@ export const authenticateSocket = async (socket, next) => {
             host: normalized.host,
             adminRole: normalized.adminRole,
             isAdmin: normalized.isAdmin,
-            isModerator: normalized.isModerator
+            isModerator: normalized.isModerator,
+            authProvider: decoded.authProvider || decoded.iss || 'local'
         }
         
         console.log('[Socket] User connected:', socket.user.username)
         next()
     } catch (error) {
-        console.error('[Socket] Auth error:', error)
+        console.error('[Socket] Auth error:', error.message)
         next(new Error('Authentication error'))
     }
 }

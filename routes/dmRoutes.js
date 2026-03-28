@@ -315,9 +315,8 @@ router.post('/', authenticateToken, async (req, res) => {
   
   const status = isBot ? botStatus : resolvePresenceStatus(userId, recipientProfile)
   
-  await userService.saveUser(req.user.id, {
-    username: req.user.username
-  })
+  // REMOVED: This saveUser call was unnecessary and could reset admin roles
+  // The dmService.getOrCreateConversation already handles all necessary updates
   
   console.log(`[API] DM conversation created/retrieved between ${req.user.id} and ${userId}`)
   res.json({

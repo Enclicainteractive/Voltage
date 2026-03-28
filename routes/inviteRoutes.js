@@ -3,6 +3,9 @@ import { authenticateToken, optionalAuth } from '../middleware/authMiddleware.js
 import { FILES, channelService, inviteService, serverService, saveData } from '../services/dataService.js'
 import { InviteEncoder, parseCrossHostInvite, createCrossHostInvite } from '../utils/inviteEncoder.js'
 import { federationService } from '../services/federationService.js'
+import { getSocketIOInstance } from '../services/socketService.js'
+import transactionService from '../services/transactionService.js'
+import lockService from '../services/lockService.js'
 import axios from 'axios'
 import config from '../config/config.js'
 
@@ -151,23 +154,77 @@ router.post('/:code/join', authenticateToken, async (req, res) => {
     return res.json(server) // Already a member, just return server
   }
   
-  // Add user to server
-  if (!server.members) server.members = []
-  server.members.push({
-    id: req.user.id,
-    username: req.user.username || req.user.email,
-    imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
-    avatar: resolveUserAvatar(req.user.id, req.user),
-    host: req.user.host || config.getHost(),
-    avatarHost: config.getImageServerUrl(),
-    roles: ['member'],
-    role: 'member',
-    status: 'online',
-    joinedAt: new Date().toISOString()
+  // Execute server join operation with distributed lock and transaction for maximum data consistency
+  await lockService.withLock(`server_join:${server.id}:${req.user.id}`, async () => {
+    await transactionService.executeTransaction(async (connection) => {
+      // Double-check membership within the lock to prevent duplicate joins
+      const reloadedServers = getServers()
+      const reloadedServer = reloadedServers.find(s => s.id === server.id)
+      const existingMember = reloadedServer.members?.find(m => m.id === req.user.id)
+      
+      if (existingMember) {
+        throw new Error('User already member of server')
+      }
+      
+      // Add user to server
+      if (!reloadedServer.members) reloadedServer.members = []
+      reloadedServer.members.push({
+        id: req.user.id,
+        username: req.user.username || req.user.email,
+        imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+        avatar: resolveUserAvatar(req.user.id, req.user),
+        host: req.user.host || config.getHost(),
+        avatarHost: config.getImageServerUrl(),
+        roles: ['member'],
+        role: 'member',
+        status: 'online',
+        joinedAt: new Date().toISOString()
+      })
+      
+      // Update the servers array with the modified server
+      const serverIndex = reloadedServers.findIndex(s => s.id === server.id)
+      if (serverIndex >= 0) {
+        reloadedServers[serverIndex] = reloadedServer
+        server = reloadedServer // Update reference for later use
+      }
+      
+      // Save server data within transaction
+      await saveServers(reloadedServers)
+      
+      // Update invite usage count (if limited)
+      const updatedInvite = inviteService.getInvite(req.params.code)
+      if (updatedInvite?.maxUses && updatedInvite.maxUses > 0) {
+        await inviteService.updateInviteUsage(req.params.code)
+      }
+      
+      console.log(`[API] User ${req.user.username} joined server ${server.name} via invite ${req.params.code}`)
+    }, { isolationLevel: 'READ COMMITTED' })
+  }, {
+    ttlMs: 10000, // 10 second lock
+    timeoutMs: 5000, // 5 second timeout
+    maxRetries: 2
   })
   
-  await saveServers(servers)
-  console.log(`[API] User ${req.user.username} joined server ${server.name} via invite ${req.params.code}`)
+  // Emit socket events to notify clients about the new member
+  try {
+    const io = getSocketIOInstance()
+    if (io) {
+      const newMember = server.members[server.members.length - 1]
+      // Notify all server members about the new member
+      io.to(`server:${server.id}`).emit('server:member-joined', {
+        serverId: server.id,
+        member: newMember
+      })
+      // Force refresh the server data for all members to prevent cache issues
+      io.to(`server:${server.id}`).emit('server:updated', {
+        serverId: server.id,
+        server: server
+      })
+    }
+  } catch (socketError) {
+    console.warn('[API] Failed to emit server join events:', socketError.message)
+  }
+  
   res.json(server)
 })
 

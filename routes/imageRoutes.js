@@ -11,7 +11,18 @@ const UPLOADS_DIR = cdnService.getUploadDir()
 const DATA_URL_PATTERN = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/
 
 const getStoredUserMedia = (userId, kind) => {
-  const profile = userService.getUser(userId)
+  // Try direct lookup first
+  let profile = userService.getUser(userId)
+  
+  // If not found, try resolving by remoteUserId or localUserId (federated users)
+  if (!profile) {
+    const allUsers = userService.getAllUsers?.() || {}
+    profile = Object.values(allUsers).find((u) => {
+      if (!u) return false
+      return u.id === userId || u.remoteUserId === userId || u.localUserId === userId
+    })
+  }
+  
   if (!profile) return null
   if (kind === 'banner') return String(profile.banner || '').trim() || null
   return String(profile.imageUrl || profile.imageurl || profile.avatar || '').trim() || null

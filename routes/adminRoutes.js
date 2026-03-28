@@ -1,6 +1,6 @@
 import express from 'express'
 import { authenticateToken } from '../middleware/authMiddleware.js'
-import { adminService, globalBanService, serverBanService, userService, discoveryService, serverService, FILES } from '../services/dataService.js'
+import { adminService, globalBanService, serverBanService, userService, discoveryService, serverService, channelService, messageService, FILES } from '../services/dataService.js'
 import config from '../config/config.js'
 import { getOnlineUsers } from '../services/socketService.js'
 import { supportsDirectQuery, directQuery } from '../services/dataService.js'
@@ -131,6 +131,120 @@ const computeMaintenanceStatus = (windowData) => {
     return { enabled: true, active: false, scheduled: true, status: 'scheduled', window: windowData }
   }
   return { enabled: true, active: true, scheduled: false, status: 'active', window: windowData }
+}
+
+const isTruthy = (value) => value === true || value === 1 || value === '1' || value === 'true'
+
+const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
+
+const getAvatarUrl = (userId) => {
+  const safeUserId = String(userId || '')
+  if (!safeUserId) return null
+  const baseUrl = safeUserId.startsWith('u_')
+    ? (config.getServerUrl() || config.getImageServerUrl())
+    : config.getImageServerUrl()
+  return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
+}
+
+const buildMemberSnapshot = (serverId, member = {}) => {
+  const profile = member?.id ? userService.getUser(member.id) : null
+  const username = member.username || profile?.username || profile?.displayName || profile?.email || member.id || 'Unknown user'
+  const avatar = member.avatar || member.imageUrl || member.avatarUrl || profile?.avatar
+  const resolvedAvatar = isExternalImage(avatar) ? avatar : getAvatarUrl(member.id)
+  const roles = Array.isArray(member.roles)
+    ? member.roles
+    : (member.role ? [member.role] : [])
+
+  return {
+    id: member.id,
+    username,
+    displayName: profile?.displayName || null,
+    avatar: resolvedAvatar,
+    status: member.status || profile?.status || 'offline',
+    joinedAt: member.joinedAt || null,
+    roles,
+    role: member.role || roles[0] || null,
+    isBot: isTruthy(member.isBot),
+    host: member.host || profile?.host || null,
+    guildTag: profile?.guildTag || null
+  }
+}
+
+const collectMessageEntries = (value, bucket, depth = 0) => {
+  if (!value || depth > 4) return
+  if (Array.isArray(value)) {
+    value.forEach(item => collectMessageEntries(item, bucket, depth + 1))
+    return
+  }
+  if (typeof value !== 'object') return
+  if ((value.channelId || value.id) && Object.prototype.hasOwnProperty.call(value, 'content')) {
+    bucket.push(value)
+    return
+  }
+  Object.values(value).forEach(item => collectMessageEntries(item, bucket, depth + 1))
+}
+
+const getAllMessageEntries = async () => {
+  const rawMessages = await loadData(FILES.messages, {})
+  const bucket = []
+  collectMessageEntries(rawMessages, bucket)
+  return bucket
+}
+
+const buildServerMetrics = async () => {
+  const serversData = await loadData(FILES.servers, {})
+  const servers = Array.isArray(serversData) ? serversData : Object.values(serversData || {})
+  const channelsByServer = channelService.getAllChannelsGrouped()
+  const messageEntries = await getAllMessageEntries()
+  const channelToServerId = {}
+
+  for (const [serverId, channels] of Object.entries(channelsByServer || {})) {
+    for (const channel of channels || []) {
+      if (channel?.id) channelToServerId[channel.id] = serverId
+    }
+  }
+
+  const serverMessageStats = {}
+  const channelMessageStats = {}
+  const now = Date.now()
+  const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000)
+
+  for (const server of servers) {
+    const serverChannels = channelsByServer[server.id] || []
+    serverMessageStats[server.id] = {
+      totalMessages: 0,
+      recentMessages7d: 0,
+      lastMessageAt: null,
+      channelCount: serverChannels.length
+    }
+  }
+
+  for (const message of messageEntries) {
+    const channelId = message?.channelId
+    if (!channelId) continue
+    channelMessageStats[channelId] = channelMessageStats[channelId] || { count: 0, lastMessageAt: null }
+    channelMessageStats[channelId].count += 1
+    const stamp = message.createdAt || message.timestamp || message.updatedAt || null
+    if (stamp && (!channelMessageStats[channelId].lastMessageAt || new Date(stamp) > new Date(channelMessageStats[channelId].lastMessageAt))) {
+      channelMessageStats[channelId].lastMessageAt = stamp
+    }
+    const serverId = channelToServerId[channelId]
+    if (!serverId || !serverMessageStats[serverId]) continue
+    serverMessageStats[serverId].totalMessages += 1
+    if (stamp) {
+      const ts = new Date(stamp).getTime()
+      if (!Number.isNaN(ts)) {
+        if (ts >= sevenDaysAgo) {
+          serverMessageStats[serverId].recentMessages7d += 1
+        }
+        if (!serverMessageStats[serverId].lastMessageAt || ts > new Date(serverMessageStats[serverId].lastMessageAt).getTime()) {
+          serverMessageStats[serverId].lastMessageAt = stamp
+        }
+      }
+    }
+  }
+
+  return { servers, channelsByServer, channelMessageStats, serverMessageStats }
 }
 
 const requireAdmin = (req, res, next) => {
@@ -322,10 +436,9 @@ router.put('/users/:userId/status', authenticateToken, requireModerator, async (
   res.json(user)
 })
 
-router.get('/servers', authenticateToken, requireModerator, (req, res) => {
+router.get('/servers', authenticateToken, requireModerator, async (req, res) => {
   const { search, limit = 50, offset = 0 } = req.query
-  const serversData = loadData(FILES.servers, {})
-  const servers = Array.isArray(serversData) ? serversData : Object.values(serversData || {})
+  const { servers, serverMessageStats } = await buildServerMetrics()
   
   let filtered = servers
   
@@ -339,10 +452,119 @@ router.get('/servers', authenticateToken, requireModerator, (req, res) => {
   
   const serversWithBanned = filtered.map(s => ({
     ...s,
-    isBanned: serverBanService.isServerBanned(s.id)
+    isBanned: serverBanService.isServerBanned(s.id),
+    memberCount: s.members?.length || 0,
+    joined: (s.members || []).some(member => member?.id === req.user.id),
+    owner: (() => {
+      const owner = userService.getUser(s.ownerId)
+      return owner ? {
+        id: owner.id,
+        username: owner.username || owner.displayName || owner.email || s.ownerId,
+        avatar: owner.avatar || getAvatarUrl(owner.id)
+      } : {
+        id: s.ownerId,
+        username: s.ownerId,
+        avatar: getAvatarUrl(s.ownerId)
+      }
+    })(),
+    metrics: serverMessageStats[s.id] || {
+      totalMessages: 0,
+      recentMessages7d: 0,
+      lastMessageAt: null,
+      channelCount: 0
+    }
   }))
   
   res.json({ servers: serversWithBanned, total })
+})
+
+router.get('/servers/:serverId', authenticateToken, requireModerator, async (req, res) => {
+  const { servers, channelsByServer, channelMessageStats, serverMessageStats } = await buildServerMetrics()
+  const server = servers.find(item => item.id === req.params.serverId)
+
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+
+  const owner = userService.getUser(server.ownerId)
+  const members = Array.isArray(server.members)
+    ? server.members.map(member => buildMemberSnapshot(server.id, member))
+    : []
+  const channels = (channelsByServer[server.id] || []).map(channel => {
+    const stats = channelMessageStats[channel.id] || { count: 0, lastMessageAt: null }
+    return {
+      ...channel,
+      messageCount: stats.count,
+      lastMessageAt: stats.lastMessageAt
+    }
+  }).sort((a, b) => {
+    const aPos = Number.isFinite(Number(a.position)) ? Number(a.position) : 999999
+    const bPos = Number.isFinite(Number(b.position)) ? Number(b.position) : 999999
+    return aPos - bPos
+  })
+
+  res.json({
+    ...server,
+    isBanned: serverBanService.isServerBanned(server.id),
+    joined: members.some(member => member.id === req.user.id),
+    owner: owner ? {
+      id: owner.id,
+      username: owner.username || owner.displayName || owner.email || server.ownerId,
+      avatar: owner.avatar || getAvatarUrl(owner.id)
+    } : {
+      id: server.ownerId,
+      username: server.ownerId,
+      avatar: getAvatarUrl(server.ownerId)
+    },
+    metrics: serverMessageStats[server.id] || {
+      totalMessages: 0,
+      recentMessages7d: 0,
+      lastMessageAt: null,
+      channelCount: channels.length
+    },
+    members,
+    channels
+  })
+})
+
+router.post('/servers/:serverId/join', authenticateToken, requireModerator, async (req, res) => {
+  const server = serverService.getServer(req.params.serverId)
+
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+
+  server.members = Array.isArray(server.members) ? server.members : []
+  const existingMember = server.members.find(member => member?.id === req.user.id)
+  if (existingMember) {
+    return res.status(400).json({ error: 'Already a member' })
+  }
+
+  const memberEntry = {
+    id: req.user.id,
+    username: req.user.username || req.user.email || req.user.id,
+    imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
+    avatar: isExternalImage(req.user?.avatar) ? req.user.avatar : getAvatarUrl(req.user.id),
+    host: req.user.host || config.getHost(),
+    avatarHost: config.getImageServerUrl(),
+    roles: ['member'],
+    role: 'member',
+    status: 'online',
+    joinedAt: new Date().toISOString()
+  }
+
+  server.members.push(memberEntry)
+  const updated = await serverService.updateServer(server.id, { members: server.members })
+  adminService.logAction(req.user.id, 'join_server_admin', req.params.serverId, { serverName: server.name })
+
+  res.json({
+    success: true,
+    server: {
+      id: updated?.id || server.id,
+      name: updated?.name || server.name
+    },
+    member: buildMemberSnapshot(server.id, memberEntry)
+  })
 })
 
 router.post('/servers/:serverId/ban', authenticateToken, requireModerator, (req, res) => {
@@ -534,7 +756,7 @@ router.get('/platform/health', authenticateToken, requireModerator, async (req, 
   const discoveryData = discoveryService.getSubmissions()
   
   // Get file storage usage
-  const filesData = loadData(FILES.files, {})
+  const filesData = await loadData(FILES.files, {})
   
   res.json({
     uptime: {
@@ -557,8 +779,8 @@ router.get('/platform/health', authenticateToken, requireModerator, async (req, 
 
 router.get('/platform/activity', authenticateToken, requireModerator, async (req, res) => {
   // Get recent activity stats
-  const messages = loadData(FILES.messages, {})
-  const dmMessages = loadData(FILES.dmMessages, {})
+  const messages = await loadData(FILES.messages, {})
+  const dmMessages = await loadData(FILES.dmMessages, {})
   
   let totalMessages = 0
   let totalDMMessages = 0
@@ -579,9 +801,9 @@ router.get('/platform/activity', authenticateToken, requireModerator, async (req
     }
   })
   
-  const serversData = loadData(FILES.servers, {})
+  const serversData = await loadData(FILES.servers, {})
   const servers = Array.isArray(serversData) ? serversData : Object.values(serversData || {})
-  const users = loadData(FILES.users, {})
+  const users = await loadData(FILES.users, {})
   
   res.json({
     totalMessages,

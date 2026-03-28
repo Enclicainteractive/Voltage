@@ -25,6 +25,8 @@ import { getStorage, resetStorage as resetStorageLayer } from './storageService.
 import redisService from './redisService.js'
 import circuitBreakerManager from './circuitBreaker.js'
 import { globalCoalescer, messageCache } from './cacheService.js'
+import transactionService from './transactionService.js'
+import lockService from './lockService.js'
 import {
   getAgeVerificationJurisdiction,
   getAgeVerificationJurisdictionCode,
@@ -175,6 +177,27 @@ const directQuery = async (sql, params = []) => {
   }
 
   try {
+    if (storageService?.type === 'sqlite' && storageService?.db) {
+      let result
+      if (isSelectQuery) {
+        result = storageService.db.prepare(sql).all(...params)
+      } else if (isInsertQuery) {
+        result = storageService.db.prepare(sql).run(...params)
+      } else {
+        result = storageService.db.prepare(sql).run(...params)
+      }
+
+      if (isSelectQuery && result) {
+        const cacheKey = getDirectQueryCacheKey(sql, params)
+        directQueryCache.set(cacheKey, { rows: result, timestamp: Date.now() })
+        setTimeout(() => {
+          directQueryCache.delete(cacheKey)
+        }, DIRECT_QUERY_CACHE_TTL + 500)
+      }
+
+      return result
+    }
+
     const result = await circuitBreakerManager.execute('db:query', async () => {
       const conn = await getPoolConnection()
       if (!conn) throw new Error('No pool connection available')
@@ -1151,38 +1174,135 @@ export const userService = {
   },
 
   async saveUser(userId, userData) {
-    const users = loadData(FILES.users, {})
-    const existingUser = users[userId]
-    users[userId] = {
-      ...existingUser,
-      ...userData,
-      id: userId,
+    // Always read fresh from DB to avoid cluster cache race conditions
+    // where multiple workers each have stale in-memory caches
+    const table = getTableName(FILES.users)
+    const freshUsers = loadFromIndividualTable(table, {})
+    // Update the in-memory cache with fresh data
+    storageCache[table] = cloneData(freshUsers)
+    const existingUser = freshUsers[userId]
+    
+    // CRITICAL: Preserve ALL existing user data, only override with explicitly provided fields
+    freshUsers[userId] = {
+      ...existingUser,  // Start with ALL existing data
+      ...userData,      // Override with new data
+      id: userId,       // Always ensure ID is set
+      // CRITICAL: Preserve admin/moderator flags - prefer existing over new
+      adminRole: existingUser?.adminRole ?? userData.adminRole ?? null,
       isAdmin: existingUser?.isAdmin ?? userData.isAdmin ?? 0,
       isModerator: existingUser?.isModerator ?? userData.isModerator ?? 0,
+      // CRITICAL: Preserve birthDate - prefer existing over new
+      birthDate: existingUser?.birthDate ?? userData.birthDate ?? null,
       updatedAt: new Date().toISOString()
     }
-    if (!users[userId].createdAt) {
-      users[userId].createdAt = new Date().toISOString()
+    if (!freshUsers[userId].createdAt) {
+      freshUsers[userId].createdAt = new Date().toISOString()
     }
-    await saveData(FILES.users, users)
-    return users[userId]
+    await saveData(FILES.users, freshUsers)
+    return freshUsers[userId]
   },
 
   async updateProfile(userId, updates) {
-    const users = loadData(FILES.users, {})
-    const existingUser = users[userId]
-    if (!existingUser) {
-      users[userId] = { id: userId, createdAt: new Date().toISOString() }
+    // Use atomic operation to prevent race conditions
+    return transactionService.executeTransaction(async (connection) => {
+      // Reload fresh data within transaction to prevent stale data issues
+      const users = loadData(FILES.users, {})
+      const existingUser = users[userId]
+      
+      if (!existingUser) {
+        users[userId] = { id: userId, createdAt: new Date().toISOString() }
+      }
+      
+      // CRITICAL: Preserve ALL existing user data, only override with explicitly provided fields
+      const updatedUser = {
+        ...existingUser,  // Start with ALL existing data
+        ...updates,       // Override with new data
+        id: userId,       // Always ensure ID is set
+        // CRITICAL: Preserve admin/moderator flags - prefer existing over new
+        adminRole: existingUser?.adminRole ?? updates.adminRole ?? null,
+        isAdmin: existingUser?.isAdmin ?? updates.isAdmin ?? 0,
+        isModerator: existingUser?.isModerator ?? updates.isModerator ?? 0,
+        // CRITICAL: Preserve birthDate - prefer existing over new
+        birthDate: existingUser?.birthDate ?? updates.birthDate ?? null,
+        updatedAt: new Date().toISOString()
+      }
+      
+      users[userId] = updatedUser
+      await saveData(FILES.users, users)
+      
+      console.log(`[Transaction] Updated profile for user ${userId}`)
+      return updatedUser
+    }, { isolationLevel: 'READ COMMITTED' })
+  },
+
+  /**
+   * Optimistic locking version of updateProfile for high-concurrency scenarios
+   */
+  async updateProfileOptimistic(userId, updates, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        // Load current version with timestamp
+        const users = loadData(FILES.users, {})
+        const existingUser = users[userId]
+        const currentVersion = existingUser?.updatedAt || new Date().toISOString()
+        
+        if (!existingUser) {
+          users[userId] = { id: userId, createdAt: new Date().toISOString() }
+        }
+        
+        // Create updated user with version check
+        const now = new Date().toISOString()
+        const updatedUser = {
+          ...existingUser,
+          ...updates,
+          id: userId,
+          // Preserve critical fields as before
+          adminRole: existingUser?.adminRole ?? updates.adminRole ?? null,
+          isAdmin: existingUser?.isAdmin ?? updates.isAdmin ?? 0,
+          isModerator: existingUser?.isModerator ?? updates.isModerator ?? 0,
+          birthDate: existingUser?.birthDate ?? updates.birthDate ?? null,
+          updatedAt: now,
+          version: currentVersion
+        }
+        
+        // Attempt atomic update
+        users[userId] = updatedUser
+        await saveData(FILES.users, users)
+        
+        // Verify the update wasn't overwritten by checking timestamp
+        const verifyUsers = loadData(FILES.users, {})
+        if (verifyUsers[userId]?.updatedAt === now) {
+          console.log(`[Optimistic] Updated profile for user ${userId} on attempt ${attempt}`)
+          return updatedUser
+        } else {
+          throw new Error('Concurrent modification detected')
+        }
+        
+      } catch (error) {
+        if (attempt === maxRetries) {
+          console.error(`[Optimistic] Failed to update profile for user ${userId} after ${maxRetries} attempts:`, error.message)
+          throw error
+        }
+        
+        // Wait before retry with exponential backoff
+        const delay = Math.min(100 * Math.pow(2, attempt - 1), 1000)
+        await new Promise(resolve => setTimeout(resolve, delay))
+        console.warn(`[Optimistic] Retry attempt ${attempt + 1} for user ${userId} profile update`)
+      }
     }
-    users[userId] = {
-      ...existingUser,
-      ...updates,
-      isAdmin: existingUser?.isAdmin ?? users[userId]?.isAdmin ?? updates.isAdmin ?? 0,
-      isModerator: existingUser?.isModerator ?? users[userId]?.isModerator ?? updates.isModerator ?? 0,
-      updatedAt: new Date().toISOString()
-    }
-    await saveData(FILES.users, users)
-    return users[userId]
+  },
+
+  /**
+   * Thread-safe profile update with distributed locking
+   */
+  async updateProfileSafe(userId, updates) {
+    return lockService.withLock(`user_profile:${userId}`, async () => {
+      return this.updateProfile(userId, updates)
+    }, {
+      ttlMs: 5000,
+      timeoutMs: 3000,
+      maxRetries: 3
+    })
   },
 
   async setStatus(userId, status, customStatus = null) {
@@ -1301,10 +1421,20 @@ export const userService = {
 
 export const friendService = {
   getFriends(userId) {
-    const friends = loadData(FILES.friends, {})
-    const userFriends = friends[userId]
+    if (supportsDirectQuery()) {
+      const table = storageCache.friends
+      if (table && typeof table === 'object') {
+        const cachedFriends = table[userId]
+        if (Array.isArray(cachedFriends)) {
+          return [...cachedFriends]
+        }
+      }
+    }
+
+    const friends = loadDataRef(FILES.friends, {})
+    const userFriends = friends?.[userId]
     if (Array.isArray(userFriends)) {
-      return userFriends
+      return [...userFriends]
     }
     return []
   },
@@ -1756,39 +1886,173 @@ export const dmMessageService = {
   }
 }
 
+// Maximum number of distinct emoji reactions per message (Discord parity)
+const MAX_REACTIONS_PER_MESSAGE = 20
+
+/**
+ * Load reactions for a specific message directly from the DB.
+ * Returns { emoji: [userId, ...], ... }
+ */
+const loadReactionsForMessage = async (messageId) => {
+  if (supportsDirectQuery()) {
+    try {
+      const rows = await directQuery(
+        'SELECT emoji, userIds FROM reactions WHERE messageId = ?',
+        [messageId]
+      )
+      if (rows === null) {
+        console.warn('[reactionService] directQuery returned null for loadReactionsForMessage')
+      } else {
+        const result = {}
+        for (const row of rows) {
+          if (!row.emoji) continue
+          try {
+            result[row.emoji] = typeof row.userIds === 'string' ? JSON.parse(row.userIds) : (row.userIds || [])
+          } catch {
+            result[row.emoji] = []
+          }
+        }
+        return result
+      }
+    } catch (err) {
+      console.error('[reactionService] loadReactionsForMessage directQuery failed:', err.message)
+    }
+  }
+  // Fallback: load from in-memory cache / full table
+  const reactions = loadData(FILES.reactions, {})
+  return reactions[messageId] || {}
+}
+
+/**
+ * Persist a single reaction row (upsert).
+ * Uses direct DB query for SQL backends, falls back to full-table save.
+ */
+const saveReactionRow = async (messageId, emoji, userIds) => {
+  const rowId = `${messageId}_${Buffer.from(emoji).toString('base64').slice(0, 40)}`
+  if (supportsDirectQuery()) {
+    try {
+      // Use INSERT OR REPLACE for SQLite, ON DUPLICATE KEY UPDATE for MySQL/MariaDB
+      const sql = isSqliteBackend()
+        ? `INSERT OR REPLACE INTO reactions (id, messageId, emoji, userIds, createdAt) VALUES (?, ?, ?, ?, ?)`
+        : `INSERT INTO reactions (id, messageId, emoji, userIds, createdAt) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE userIds = VALUES(userIds)`
+      const result = await directQuery(
+        sql,
+        [rowId, messageId, emoji, JSON.stringify(userIds), new Date().toISOString()]
+      )
+      if (result !== null) return true
+    } catch (err) {
+      console.error('[reactionService] saveReactionRow directQuery failed:', err.message)
+    }
+  }
+  // Fallback: full-table save
+  const reactions = loadData(FILES.reactions, {})
+  if (!reactions[messageId]) reactions[messageId] = {}
+  reactions[messageId][emoji] = userIds
+  await saveData(FILES.reactions, reactions)
+  return true
+}
+
+/**
+ * Delete a single reaction row when no users remain.
+ */
+const deleteReactionRow = async (messageId, emoji) => {
+  const rowId = `${messageId}_${Buffer.from(emoji).toString('base64').slice(0, 40)}`
+  if (supportsDirectQuery()) {
+    try {
+      const result = await directQuery(
+        'DELETE FROM reactions WHERE id = ?',
+        [rowId]
+      )
+      if (result !== null) return true
+    } catch (err) {
+      console.error('[reactionService] deleteReactionRow directQuery failed:', err.message)
+    }
+  }
+  // Fallback: full-table save
+  const reactions = loadData(FILES.reactions, {})
+  if (reactions[messageId]) {
+    delete reactions[messageId][emoji]
+    if (Object.keys(reactions[messageId]).length === 0) {
+      delete reactions[messageId]
+    }
+    await saveData(FILES.reactions, reactions)
+  }
+  return true
+}
+
 export const reactionService = {
   async getReactions(messageId) {
-    const reactions = loadData(FILES.reactions, {})
-    return reactions[messageId] || {}
+    return loadReactionsForMessage(messageId)
   },
 
   async addReaction(messageId, userId, emoji) {
-    const reactions = loadData(FILES.reactions, {})
-    if (!reactions[messageId]) reactions[messageId] = {}
-    if (!reactions[messageId][emoji]) reactions[messageId][emoji] = []
-    
-    if (!reactions[messageId][emoji].includes(userId)) {
-      reactions[messageId][emoji].push(userId)
+    const reactions = await loadReactionsForMessage(messageId)
+
+    // Enforce 20-reaction limit (distinct emojis per message)
+    const isNewEmoji = !reactions[emoji]
+    if (isNewEmoji && Object.keys(reactions).length >= MAX_REACTIONS_PER_MESSAGE) {
+      // Return current reactions without adding
+      return reactions
     }
-    
-    await saveData(FILES.reactions, reactions)
-    return reactions[messageId]
+
+    if (!reactions[emoji]) reactions[emoji] = []
+    if (!reactions[emoji].includes(userId)) {
+      reactions[emoji].push(userId)
+    }
+
+    await saveReactionRow(messageId, emoji, reactions[emoji])
+    return reactions
   },
 
   async removeReaction(messageId, userId, emoji) {
-    const reactions = loadData(FILES.reactions, {})
-    if (!reactions[messageId]?.[emoji]) return reactions[messageId] || {}
-    
-    reactions[messageId][emoji] = reactions[messageId][emoji].filter(id => id !== userId)
-    if (reactions[messageId][emoji].length === 0) {
-      delete reactions[messageId][emoji]
+    const reactions = await loadReactionsForMessage(messageId)
+    if (!reactions[emoji]) return reactions
+
+    reactions[emoji] = reactions[emoji].filter(id => id !== userId)
+    if (reactions[emoji].length === 0) {
+      delete reactions[emoji]
+      await deleteReactionRow(messageId, emoji)
+    } else {
+      await saveReactionRow(messageId, emoji, reactions[emoji])
     }
-    
-    await saveData(FILES.reactions, reactions)
-    return reactions[messageId]
+
+    return reactions
   },
-  
-  getAllReactions() {
+
+  async getAllReactions(messageIds) {
+    // If messageIds provided, only load reactions for those messages (efficient)
+    if (supportsDirectQuery()) {
+      try {
+        let rows
+        if (messageIds && messageIds.length > 0) {
+          // Query only for the specific message IDs
+          const placeholders = messageIds.map(() => '?').join(',')
+          rows = await directQuery(
+            `SELECT messageId, emoji, userIds FROM reactions WHERE messageId IN (${placeholders})`,
+            messageIds
+          )
+        } else {
+          rows = await directQuery('SELECT messageId, emoji, userIds FROM reactions', [])
+        }
+        if (rows !== null) {
+          const result = {}
+          for (const row of rows) {
+            if (!row.messageId || !row.emoji) continue
+            if (!result[row.messageId]) result[row.messageId] = {}
+            try {
+              result[row.messageId][row.emoji] = typeof row.userIds === 'string'
+                ? JSON.parse(row.userIds)
+                : (row.userIds || [])
+            } catch {
+              result[row.messageId][row.emoji] = []
+            }
+          }
+          return result
+        }
+      } catch (err) {
+        console.error('[reactionService] getAllReactions directQuery failed:', err.message)
+      }
+    }
     return loadData(FILES.reactions, {})
   }
 }
@@ -2428,6 +2692,50 @@ export const messageService = {
       }
     }
     return false
+  },
+
+  /**
+   * Create a message with transaction support for data consistency
+   */
+  async createMessageAtomic(message, options = {}) {
+    return transactionService.executeTransaction(async (connection) => {
+      // Create the message within the transaction
+      const createdMessage = await this.createMessage(message)
+      
+      // If this is a reply, ensure the parent message exists
+      if (message.replyTo && typeof message.replyTo === 'string') {
+        const parentMessage = await this.getMessage(message.replyTo)
+        if (!parentMessage) {
+          throw new Error('Parent message not found for reply')
+        }
+      }
+      
+      // Update channel last activity within transaction
+      if (options.updateChannelActivity !== false) {
+        await this.updateChannelActivity(message.channelId, message.timestamp)
+      }
+      
+      // Log message creation for audit trail
+      console.log(`[Transaction] Created message ${message.id} in channel ${message.channelId}`)
+      
+      return createdMessage
+    }, { isolationLevel: 'READ COMMITTED' })
+  },
+
+  /**
+   * Update channel last activity timestamp
+   */
+  async updateChannelActivity(channelId, timestamp) {
+    if (supportsDirectQuery()) {
+      try {
+        await directQuery(
+          'UPDATE channels SET updatedAt = ? WHERE id = ?',
+          [timestamp, channelId]
+        )
+      } catch (err) {
+        console.warn('[messageService] Failed to update channel activity:', err.message)
+      }
+    }
   },
   
   getAllMessages() {

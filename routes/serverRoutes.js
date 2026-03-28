@@ -858,12 +858,53 @@ router.post('/:serverId/bans/:memberId', authenticateToken, async (req, res) => 
 router.get('/:serverId/roles', authenticateToken, (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
-  
+
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
   }
-  
+
   res.json(server.roles || [])
+})
+
+// GET /api/servers/:serverId/my-role - returns the current user's highest role in the server
+router.get('/:serverId/my-role', authenticateToken, (req, res) => {
+  const servers = getServers()
+  const server = servers.find(s => s.id === req.params.serverId)
+
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+
+  const member = Array.isArray(server.members)
+    ? server.members.find(m => m?.id === req.user.id)
+    : null
+
+  if (!member) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
+  // Check if user is owner
+  const isOwner = server.ownerId === req.user.id
+
+  // Get member's assigned roles
+  const memberRoleIds = Array.isArray(member.roles) ? member.roles : []
+  const serverRoles = Array.isArray(server.roles) ? server.roles : []
+
+  // Find the highest role by position
+  const memberRoles = serverRoles
+    .filter(r => memberRoleIds.includes(r.id))
+    .sort((a, b) => (b.position ?? 0) - (a.position ?? 0))
+
+  const highestRole = memberRoles[0] || null
+
+  res.json({
+    role: highestRole,
+    roles: memberRoles,
+    isOwner,
+    permissions: isOwner
+      ? ['administrator']
+      : (highestRole?.permissions || [])
+  })
 })
 
 router.post('/:serverId/roles', authenticateToken, async (req, res) => {

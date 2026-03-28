@@ -15,11 +15,14 @@ import {
   serverService,
   channelService,
   messageService,
-  FILES
+  FILES,
+  directQuery,
+  supportsDirectQuery
 } from '../services/dataService.js'
 import { isUserOnline } from '../services/socketService.js'
 import { validateUsername, validateDisplayName } from '../utils/validation.js'
 import { AGE_VERIFICATION_JURISDICTIONS, getAgeVerificationJurisdiction, normalizeAgeVerification } from '../utils/ageVerificationPolicy.js'
+import { validationSchemas, validateRequest, sanitizeInput, validationRateLimit } from '../middleware/builtinValidationMiddleware.js'
 
 const toArray = (value) => {
   if (Array.isArray(value)) return value
@@ -171,6 +174,79 @@ const normalizeBirthDate = (value) => {
 
 const normalizeHost = (value) => federationService.normalizeHost?.(value) || String(value || '').toLowerCase()
 
+const resolveUserByAnyId = (rawUserId) => {
+  const requestedId = String(rawUserId || '').trim()
+  if (!requestedId) return null
+
+  const direct = userService.getUser(requestedId)
+  if (direct) return direct
+
+  const allUsers = userService.getAllUsers?.() || {}
+  const allValues = Object.values(allUsers)
+  return allValues.find((u) => {
+    if (!u) return false
+    return u.id === requestedId || u.remoteUserId === requestedId || u.localUserId === requestedId
+  }) || null
+}
+
+const getMutualFriendsFast = async (currentUserId, targetUserId) => {
+  if (supportsDirectQuery()) {
+    const rows = await directQuery(
+      `SELECT f1.friendId
+       FROM friends f1
+       INNER JOIN friends f2 ON f1.friendId = f2.friendId
+       WHERE f1.userId = ? AND f2.userId = ?`,
+      [currentUserId, targetUserId]
+    )
+    if (Array.isArray(rows)) {
+      return rows.map(row => row?.friendId).filter(Boolean)
+    }
+  }
+
+  const currentFriends = friendService.getFriends(currentUserId)
+  const targetFriendSet = new Set(friendService.getFriends(targetUserId))
+  return currentFriends.filter(friendId => targetFriendSet.has(friendId))
+}
+
+const getMutualServersFast = async (currentUserId, targetUserId) => {
+  if (supportsDirectQuery()) {
+    const rows = await directQuery(
+      `SELECT s.id, s.name, s.icon, COUNT(sm.userId) AS memberCount
+       FROM server_members sm1
+       INNER JOIN server_members sm2 ON sm1.serverId = sm2.serverId
+       INNER JOIN servers s ON s.id = sm1.serverId
+       LEFT JOIN server_members sm ON sm.serverId = s.id
+       WHERE sm1.userId = ? AND sm2.userId = ?
+       GROUP BY s.id, s.name, s.icon`,
+      [currentUserId, targetUserId]
+    )
+    if (Array.isArray(rows)) {
+      return rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        icon: row.icon,
+        memberCount: Number(row.memberCount) || 0
+      }))
+    }
+  }
+
+  const serversData = toArray(serverService.getAllServers())
+  return serversData
+    .filter(server => {
+      const members = Array.isArray(server.members) ? server.members : []
+      const hasCurrent = members.some(m => m?.id === currentUserId)
+      const hasTarget = members.some(m => m?.id === targetUserId)
+      return hasCurrent && hasTarget
+    })
+    .filter(Boolean)
+    .map(server => ({
+      id: server.id,
+      name: server.name,
+      icon: server.icon,
+      memberCount: server.members?.length || 0
+    }))
+}
+
 const parseFederatedHandle = (value) => {
   const raw = String(value || '').trim()
   if (!raw) return null
@@ -190,16 +266,56 @@ const buildAddress = (profile = {}) => {
 }
 
 // Ensure authenticated user's profile exists in storage
+// OPTIMIZATION: Only create profile if it truly doesn't exist
+// This prevents excessive "Auto-created profile" logs and unnecessary DB writes
 const ensureUserProfile = async (req, res, next) => {
-  const existingProfile = userService.getUser(req.user.id)
-  if (!existingProfile) {
-    await userService.saveUser(req.user.id, {
-      username: req.user.username,
-      displayName: req.user.displayName || req.user.username,
-      email: req.user.email,
-      host: req.user.host || config.getHost(),
-      avatarHost: config.getImageServerUrl()
-    })
+  try {
+    const existingProfile = userService.getUser(req.user.id)
+    if (!existingProfile) {
+      // Check if there's a cached/stored profile elsewhere to preserve admin status
+      const cachedProfile = await userService.getCachedUser?.(req.user.id)
+      
+      const newProfile = {
+        id: req.user.id,
+        username: req.user.username,
+        displayName: req.user.displayName || req.user.username,
+        email: req.user.email || null,
+        host: req.user.host || config.getHost(),
+        avatarHost: config.getImageServerUrl(),
+        authProvider: req.user.authProvider || 'local',
+        // CRITICAL: Preserve admin/moderator flags - prioritize cached profile over JWT token
+        // This prevents admin status from being lost when profiles are re-created
+        adminRole: cachedProfile?.adminRole || req.user.adminRole || null,
+        isAdmin: cachedProfile?.isAdmin ?? req.user.isAdmin ?? 0,
+        isModerator: cachedProfile?.isModerator ?? req.user.isModerator ?? 0,
+        // Preserve other important user details from cached profile if available
+        birthDate: cachedProfile?.birthDate || null,
+        ageVerification: cachedProfile?.ageVerification || null,
+        profileTheme: cachedProfile?.profileTheme || null,
+        createdAt: cachedProfile?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+      await userService.saveUser(req.user.id, newProfile)
+      console.log(`[Auth] Auto-created profile for user: ${req.user.username} (${req.user.id})`)
+    } else {
+      // Skip writes when the token-derived fields already match persisted state.
+      const desiredProfile = {
+        username: req.user.username,
+        displayName: req.user.displayName || existingProfile.displayName || req.user.username,
+        email: req.user.email || existingProfile.email || null,
+        host: req.user.host || existingProfile.host || config.getHost(),
+        authProvider: req.user.authProvider || existingProfile.authProvider || 'local',
+        adminRole: existingProfile.adminRole || req.user.adminRole || null,
+        isAdmin: existingProfile.isAdmin ?? req.user.isAdmin ?? 0,
+        isModerator: existingProfile.isModerator ?? req.user.isModerator ?? 0
+      }
+      const hasChanges = Object.entries(desiredProfile).some(([key, value]) => existingProfile?.[key] !== value)
+      if (hasChanges) {
+        await userService.updateProfile(req.user.id, desiredProfile)
+      }
+    }
+  } catch (err) {
+    console.error('[Auth] ensureUserProfile error:', err.message)
   }
   next()
 }
@@ -318,7 +434,11 @@ router.delete('/avatar', async (req, res) => {
 })
 
 // Update profile
-router.put('/profile', async (req, res) => {
+router.put('/profile', 
+  validationRateLimit,
+  sanitizeInput,
+  validateRequest(validationSchemas.userProfile),
+  async (req, res) => {
   const {
     displayName, bio, customStatus, socialLinks, banner, avatar, customUsername, birthDate,
     accentColor, profileEffect,
@@ -714,6 +834,59 @@ router.get('/:userId', async (req, res) => {
   })
 })
 
+// Profile alias - GET /:userId/profile is an alias for GET /:userId
+// This fixes 404s from clients calling /users/:userId/profile
+router.get('/:userId/profile', async (req, res) => {
+  // Reuse the same logic as /:userId by forwarding to that handler
+  req.params.userId = req.params.userId
+  const userId = req.params.userId
+  const profile = userService.getUser(userId)
+
+  if (!profile) {
+    return res.json({
+      id: userId,
+      username: 'Unknown User',
+      status: 'offline'
+    })
+  }
+
+  const isFriend = friendService.areFriends(req.user.id, userId)
+  const isBlocked = blockService.isBlocked(req.user.id, userId)
+  const liveStatus = resolvePresenceStatus(userId, profile)
+  const avatarUrl = resolveUserAvatar(userId, profile)
+  const bannerUrl = resolveStoredProfileImage(profile.banner, null)
+  const { clientCSS, clientCSSEnabled, passwordHash, serverNicks, email, ...publicProfile } = profile
+  const isOwn = req.user.id === userId
+
+  res.json({
+    ...publicProfile,
+    host: profile.host || config.getHost(),
+    avatarHost: profile.avatarHost || config.getImageServerUrl(),
+    imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+    avatar: avatarUrl,
+    banner: bannerUrl,
+    status: liveStatus,
+    address: buildAddress(profile),
+    isFriend,
+    isBlocked,
+    ...(isOwn ? { email: profile.email } : {}),
+    profileCSS: profile.profileCSS || null,
+    profileTemplate: profile.profileTemplate || 'default',
+    bannerEffect: profile.bannerEffect || 'none',
+    profileLayout: profile.profileLayout || 'standard',
+    badgeStyle: profile.badgeStyle || 'default',
+    accentColor: profile.accentColor || null,
+    profileTheme: profile.profileTheme || null,
+    profileBackground: profile.profileBackground || null,
+    profileAccentColor: profile.profileAccentColor || null,
+    profileFont: profile.profileFont || null,
+    profileAnimation: profile.profileAnimation || null,
+    profileBackgroundType: profile.profileBackgroundType || null,
+    profileBackgroundOpacity: profile.profileBackgroundOpacity ?? 100,
+    ...(isOwn ? { clientCSS: profile.clientCSS || null, clientCSSEnabled: profile.clientCSSEnabled !== false } : {})
+  })
+})
+
 // Send friend request
 router.post('/friend-request', async (req, res) => {
   const { username, userId } = req.body
@@ -822,9 +995,8 @@ router.post('/friend-request/:id/accept', async (req, res) => {
     return res.status(400).json({ error: result.error })
   }
   
-  await userService.saveUser(req.user.id, {
-    username: req.user.username
-  })
+  // REMOVED: This saveUser call was unnecessary and could reset admin roles
+  // The friendRequestService.acceptRequest already handles all necessary updates
 
   const remoteProfile = incomingRequest?.from ? userService.getUser(incomingRequest.from) : null
   const remoteHost = normalizeHost(remoteProfile?.host)
@@ -978,10 +1150,11 @@ router.post('/mark-read', async (req, res) => {
     if (!channelId) return res.status(400).json({ error: 'channelId required' })
 
     const userData = userService.getUser(userId) || {}
-    const lastRead = userData.lastRead || {}
+    const lastRead = { ...(userData.lastRead || {}) }
     lastRead[channelId] = Date.now()
 
-    await userService.saveUser(userId, { ...userData, lastRead })
+    // Use updateProfile instead of saveUser to avoid full user object serialization
+    await userService.updateProfile(userId, { lastRead })
     res.json({ success: true })
   } catch (err) {
     console.error('[API] Mark read error:', err)
@@ -998,10 +1171,8 @@ router.put('/settings/server-mute', async (req, res) => {
   const serverMutes = userData.serverMutes || {}
   serverMutes[serverId] = muted
   
-  await userService.saveUser(userId, {
-    ...userData,
-    serverMutes
-  })
+  // Use updateProfile instead of saveUser to avoid resetting admin roles
+  await userService.updateProfile(userId, { serverMutes })
   
   console.log(`[API] Server ${serverId} mute: ${muted} for user ${userId}`)
   res.json({ success: true })
@@ -1013,12 +1184,7 @@ router.get('/:userId/mutual-friends', async (req, res) => {
   const currentUserId = req.user.id
   
   try {
-    const currentUserFriends = friendService.getFriends(currentUserId)
-    const targetUserFriends = friendService.getFriends(targetUserId)
-    
-    const mutualFriends = currentUserFriends.filter(friendId => 
-      targetUserFriends.includes(friendId)
-    )
+    const mutualFriends = await getMutualFriendsFast(currentUserId, targetUserId)
     
     const friendsData = mutualFriends.map(friendId => {
       const profile = userService.getUser(friendId)
@@ -1108,22 +1274,7 @@ router.get('/:userId/mutual-servers', async (req, res) => {
   const currentUserId = req.user.id
   
   try {
-    const serversData = toArray(serverService.getAllServers())
-    const mutualServers = serversData
-      .filter(server => {
-        const members = Array.isArray(server.members) ? server.members : []
-        const hasCurrent = members.some(m => m?.id === currentUserId)
-        const hasTarget = members.some(m => m?.id === targetUserId)
-        return hasCurrent && hasTarget
-      })
-      .filter(Boolean)
-      .map(server => ({
-        id: server.id,
-        name: server.name,
-        icon: server.icon,
-        memberCount: server.members?.length || 0
-      }))
-    
+    const mutualServers = await getMutualServersFast(currentUserId, targetUserId)
     res.json(mutualServers)
   } catch (err) {
     console.error('[API] Get mutual servers error:', err)
@@ -1298,6 +1449,111 @@ router.delete('/comments/:commentId/like', authenticateToken, async (req, res) =
   } catch (err) {
     console.error('[API] Unlike profile comment error:', err)
     res.status(500).json({ error: 'Failed to unlike comment' })
+  }
+})
+
+// GET /api/users/me/preferences
+router.get('/me/preferences', authenticateToken, async (req, res) => {
+  try {
+    const user = userService.getUser(req.user.id)
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    res.json(user.preferences || {})
+  } catch (err) {
+    console.error('[API] Get preferences error:', err)
+    res.status(500).json({ error: 'Failed to get preferences' })
+  }
+})
+
+// PUT /api/users/me/preferences
+router.put('/me/preferences', authenticateToken, async (req, res) => {
+  try {
+    const user = userService.getUser(req.user.id)
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    const updated = { ...(user.preferences || {}), ...req.body }
+    await userService.updateProfile(req.user.id, { preferences: updated })
+    res.json(updated)
+  } catch (err) {
+    console.error('[API] Update preferences error:', err)
+    res.status(500).json({ error: 'Failed to update preferences' })
+  }
+})
+
+// GET /api/users/:userId/activity
+router.get('/:userId/activity', authenticateToken, async (req, res) => {
+  try {
+    const user = resolveUserByAnyId(req.params.userId)
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    // Return basic activity info - can be expanded later
+    res.json({
+      userId: req.params.userId,
+      lastSeen: user.lastSeen || user.updatedAt || null,
+      status: user.status || 'offline',
+      activity: user.activity || null
+    })
+  } catch (err) {
+    console.error('[API] Get user activity error:', err)
+    res.status(500).json({ error: 'Failed to get user activity' })
+  }
+})
+
+// GET /api/users/:userId/stats
+router.get('/:userId/stats', authenticateToken, async (req, res) => {
+  try {
+    const user = resolveUserByAnyId(req.params.userId)
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    res.json({
+      userId: req.params.userId,
+      joinedAt: user.createdAt || null,
+      messageCount: user.messageCount || 0,
+      friendCount: friendService.getFriends(user.id || req.params.userId).length
+    })
+  } catch (err) {
+    console.error('[API] Get user stats error:', err)
+    res.status(500).json({ error: 'Failed to get user stats' })
+  }
+})
+
+// GET /api/users/:userId/customization
+router.get('/:userId/customization', authenticateToken, async (req, res) => {
+  try {
+    const user = resolveUserByAnyId(req.params.userId)
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    res.json(user.customization || {})
+  } catch (err) {
+    console.error('[API] Get customization error:', err)
+    res.status(500).json({ error: 'Failed to get customization' })
+  }
+})
+
+// PUT /api/users/:userId/customization
+router.put('/:userId/customization', authenticateToken, async (req, res) => {
+  try {
+    if (req.params.userId !== req.user.id) {
+      return res.status(403).json({ error: 'Cannot update another user\'s customization' })
+    }
+    const user = userService.getUser(req.user.id)
+    if (!user) return res.status(404).json({ error: 'User not found' })
+    const updated = { ...(user.customization || {}), ...req.body }
+    await userService.updateProfile(req.user.id, { customization: updated })
+    res.json(updated)
+  } catch (err) {
+    console.error('[API] Update customization error:', err)
+    res.status(500).json({ error: 'Failed to update customization' })
+  }
+})
+
+// GET /api/users/:userId/banner - returns banner image URL for a user
+router.get('/:userId/banner', async (req, res) => {
+  try {
+    const user = resolveUserByAnyId(req.params.userId)
+    if (!user) {
+      return res.json({ banner: null })
+    }
+    const bannerUrl = resolveStoredProfileImage(user.banner, null)
+    res.json({ banner: bannerUrl, userId: req.params.userId })
+  } catch (err) {
+    console.error('[API] Get user banner error:', err)
+    res.status(500).json({ error: 'Failed to get user banner' })
   }
 })
 

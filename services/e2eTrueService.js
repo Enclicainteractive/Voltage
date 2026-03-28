@@ -48,15 +48,24 @@ const saveData = async (data) => {
   e2eTrueCache = { ...data }
   if (supportsDirectQuery()) {
     try {
-      await directQuery('DELETE FROM e2e_true_state')
+      // Use REPLACE or INSERT ... ON DUPLICATE KEY UPDATE to avoid duplicate key errors
       for (const [keyId, value] of Object.entries(data.deviceKeys || {})) {
-        await directQuery('INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?)', [`deviceKeys:${keyId}`, JSON.stringify(value), new Date().toISOString()])
+        await directQuery(
+          'INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE data = VALUES(data), updatedAt = VALUES(updatedAt)',
+          [`deviceKeys:${keyId}`, JSON.stringify(value), new Date().toISOString()]
+        )
       }
       for (const [keyId, value] of Object.entries(data.senderKeys || {})) {
-        await directQuery('INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?)', [`senderKeys:${keyId}`, JSON.stringify(value), new Date().toISOString()])
+        await directQuery(
+          'INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE data = VALUES(data), updatedAt = VALUES(updatedAt)',
+          [`senderKeys:${keyId}`, JSON.stringify(value), new Date().toISOString()]
+        )
       }
       for (const [keyId, value] of Object.entries(data.epochs || {})) {
-        await directQuery('INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?)', [`epochs:${keyId}`, JSON.stringify(value), new Date().toISOString()])
+        await directQuery(
+          'INSERT INTO e2e_true_state (id, data, updatedAt) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE data = VALUES(data), updatedAt = VALUES(updatedAt)',
+          [`epochs:${keyId}`, JSON.stringify(value), new Date().toISOString()]
+        )
       }
       console.log('[E2E-True] Saved to database')
       return true

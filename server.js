@@ -186,6 +186,14 @@ const gracefulShutdown = async (signal) => {
     // wait for connections or timeout
     setTimeout(async () => {
       console.log('[Shutdown] Closing HTTP server...')
+      
+      // Flush any pending message batches before shutdown
+      await messageBatchService.flushAll()
+      messageBatchService.stop()
+      console.log('[Shutdown] Message batching service stopped')
+      
+      healthService.stop()
+      console.log('[Shutdown] Health monitoring stopped')
       httpServer.close(async () => {
         console.log('[Shutdown] HTTP server closed')
         await redisService.disconnect()
@@ -231,15 +239,33 @@ import activityRoutes from './routes/activityRoutes.js'
 import gifRoutes from './routes/gifRoutes.js'
 import scaleRoutes from './routes/scaleRoutes.js'
 import automodRoutes from './routes/automodRoutes.js'
+import healthRoutes from './routes/healthRoutes.js'
 
+// Health monitoring service
+import healthService from './services/healthService.js'
+
+// Message batching service
+import messageBatchService from './services/messageBatchService.js'
+
+// Validation middleware
+import { validationRateLimit } from './middleware/builtinValidationMiddleware.js'
+
+// Enhanced error handling
+import { 
+  errorHandler, 
+  notFoundHandler, 
+  setupGlobalErrorHandlers 
+} from './middleware/errorHandlerMiddleware.js'
+import errorLogService from './services/errorLogService.js'
 
 import { authenticateSocket } from './middleware/authMiddleware.js'
 import scaleService from './services/scaleService.js'
-import { setupSocketHandlers } from './services/socketService.js'
+import { setupSocketHandlers, setSocketIOInstance } from './services/socketService.js'
 import { startSystemScheduler } from './services/systemMessageScheduler.js'
 import config from './config/config.js'
 import { initStorageAndDistribute } from './services/storageService.js'
-import dataService, { FILES, serverService } from './services/dataService.js'
+import dataService, { FILES, serverService, supportsDirectQuery, directQuery, saveData } from './services/dataService.js'
+import { getStorage } from './services/storageService.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -417,7 +443,16 @@ const io = new Server(httpServer, {
     origin: corsOrigin,
     credentials: true
   },
-  maxHttpBufferSize: 20 * 1024 * 1024 // 20MB — needed for drawing/activity payloads
+  maxHttpBufferSize: 20 * 1024 * 1024, // 20MB — needed for drawing/activity payloads
+  transports: ['websocket', 'polling'], // Prefer WebSocket first
+  allowEIO3: true,
+  // Connection state recovery - helps with session persistence across reconnects
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true // Skip auth middleware on recovery (already authenticated)
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000
 })
 
 // ── Redis Adapter for Socket.IO ────────────────────────────────────────────────
@@ -428,8 +463,21 @@ if (redisService.isReady()) {
   try {
     const { createAdapter } = await import('@socket.io/redis-adapter')
     const { pubClient, subClient } = redisService.getAdapterClients()
-    io.adapter(createAdapter(pubClient, subClient))
-    console.log('[Socket.IO] Redis adapter attached — cross-node socket events enabled')
+    
+    const adapter = createAdapter(pubClient, subClient, {
+      // Configure adapter for better session handling
+      key: 'socket.io',
+      requestsTimeout: 5000
+    })
+    
+    io.adapter(adapter)
+    
+    // Log connection errors for debugging
+    io.engine.on('connection_error', (err) => {
+      console.error('[Socket.IO] Connection error:', err.req?.url, err.message)
+    })
+    
+    console.log('[Socket.IO] Redis adapter attached with session persistence — cross-node socket events enabled')
   } catch (err) {
     console.warn('[Socket.IO] Could not attach Redis adapter:', err.message, '— running in single-node socket mode')
   }
@@ -538,6 +586,29 @@ app.use('/api', apiRateLimit)
 app.use(express.json({ limit: '2gb' }))
 app.use(express.urlencoded({ extended: true, limit: '2gb' }))
 
+// Global validation middleware - apply to all routes
+app.use(validationRateLimit)
+app.use(sanitizeInput)
+
+// Health metrics middleware - track all requests
+app.use((req, res, next) => {
+  const start = Date.now()
+  
+  res.on('finish', () => {
+    const duration = Date.now() - start
+    const success = res.statusCode >= 200 && res.statusCode < 400
+    
+    healthService.recordRequest(success)
+    
+    // Record slow requests as database queries for monitoring
+    if (duration > 1000) {
+      healthService.recordDatabaseQuery(duration, success)
+    }
+  })
+  
+  next()
+})
+
 app.get('/.well-known/voltchat', (req, res) => {
   res.json(buildFederationDiscoveryDocument())
 })
@@ -595,39 +666,45 @@ app.use('/api/gif', gifRoutes)
 app.use('/api/gifs', gifRoutes)
 app.use('/api/scale', scaleRoutes)
 app.use('/api', automodRoutes)
+app.use('/', healthRoutes) // Health checks accessible without /api prefix
 
-// Global error handler - catches any unhandled errors from routes
-app.use((err, req, res, next) => {
-  console.error('[Error] Unhandled error in route:', err.message)
-  console.error(err.stack)
-  securityLogger.logSecurityEvent('ROUTE_ERROR', {
-    path: req.path,
-    method: req.method,
-    error: err.message,
-    stack: err.stack
-  })
-  res.status(500).json({ error: 'Internal server error' })
-})
+// 404 handler for unknown routes
+app.use(notFoundHandler)
+
+// Enhanced global error handler
+app.use(errorHandler)
+
+// ─── Legacy path aliases (no /api/ prefix) ───────────────────────────────────
+// Some older clients and the frontend call these without the /api/ prefix.
+// Redirect them to the canonical /api/ routes so they work correctly.
+app.get('/users/:userId/profile', (req, res) => res.redirect(301, `/api/users/${req.params.userId}/profile`))
+app.get('/users/:userId/banner', (req, res) => res.redirect(301, `/api/users/${req.params.userId}/banner`))
+app.get('/users/:userId', (req, res) => res.redirect(301, `/api/users/${req.params.userId}`))
+app.get('/:userId/activity', (req, res) => res.redirect(301, `/api/users/${req.params.userId}/activity`))
+app.get('/:userId/stats', (req, res) => res.redirect(301, `/api/users/${req.params.userId}/stats`))
+app.get('/:userId/banner', (req, res) => res.redirect(301, `/api/users/${req.params.userId}/banner`))
+app.put('/profile', (req, res) => res.redirect(307, '/api/user/profile'))
+app.post('/friend-request', (req, res) => res.redirect(307, '/api/user/friend-request'))
+app.post('/mark-read', (req, res) => res.redirect(307, '/api/users/mark-read'))
 
 // Category routes at /api/categories
-// Optimize: Only save categories that have actually changed
 const getAllCategories = () => serverService.getAllCategoriesGrouped()
-const setAllCategories = async (categories) => {
-  if (!categories || typeof categories !== 'object') return
-  
-  for (const serverCategories of Object.values(categories)) {
-    if (!Array.isArray(serverCategories)) continue
-    for (const category of serverCategories) {
-      if (category?.id) {
-        // Get existing category to check if it changed
-        const existing = await serverService.getCategory?.(category.id) 
-        if (!existing || JSON.stringify(existing) !== JSON.stringify(category)) {
-          await serverService.updateCategory(category.id, category)
-        }
-      }
-    }
+const loadData = (file, defaultValue) => {
+  const storage = getStorage()
+  if (!storage) return defaultValue
+  try {
+    return storage.load(file, defaultValue)
+  } catch {
+    return defaultValue
   }
 }
+const getTableName = (file) => {
+  const fileToTable = {
+    [FILES.categories]: 'categories'
+  }
+  return fileToTable[file] || file
+}
+const storageCache = {}
 
 app.put('/api/categories/:categoryId', async (req, res) => {
   const allCategories = getAllCategories()
@@ -648,18 +725,13 @@ app.put('/api/categories/:categoryId', async (req, res) => {
     return res.status(404).json({ error: 'Category not found' })
   }
 
-  for (const categories of Object.values(allCategories)) {
-    if (!Array.isArray(categories)) continue
-      const idx = categories.findIndex(c => c.id === req.params.categoryId)
-      if (idx !== -1) {
-        categories[idx] = { ...categories[idx], ...req.body, updatedAt: new Date().toISOString() }
-        await setAllCategories(allCategories)
+  // Update only the specific category, not all categories
+  const updatedCategory = { ...foundCategory, ...req.body, updatedAt: new Date().toISOString() }
+  await serverService.updateCategory(req.params.categoryId, updatedCategory)
 
-        io.to(`server:${serverId}`).emit('category:updated', categories[idx])
-        console.log(`[API] Updated category ${req.params.categoryId}`)
-        return res.json(categories[idx])
-      }
-  }
+  io.to(`server:${serverId}`).emit('category:updated', updatedCategory)
+  console.log(`[API] Updated category ${req.params.categoryId}`)
+  return res.json(updatedCategory)
 })
 
 app.delete('/api/categories/:categoryId', async (req, res) => {
@@ -667,26 +739,56 @@ app.delete('/api/categories/:categoryId', async (req, res) => {
     return res.status(400).json({ error: 'Cannot delete uncategorized pseudo-category' })
   }
 
-  const allCategories = getAllCategories()
-  let serverId = null
-
-  for (const [sid, categories] of Object.entries(allCategories)) {
-    if (!Array.isArray(categories)) continue
-      const idx = categories.findIndex(c => c.id === req.params.categoryId)
-      if (idx !== -1) {
-        serverId = sid
-        break
+  // Use direct DB query to delete only the specific category
+  if (supportsDirectQuery()) {
+    try {
+      const result = await directQuery(
+        'DELETE FROM categories WHERE id = ?',
+        [req.params.categoryId]
+      )
+      
+      if (result === null || (result.affectedRows === 0 && result.length === 0)) {
+        return res.status(404).json({ error: 'Category not found' })
       }
+
+      // Update in-memory cache by removing the category
+      const table = getTableName(FILES.categories)
+      if (storageCache[table]) {
+        delete storageCache[table][req.params.categoryId]
+      }
+
+      // Find which server this category belonged to for socket event
+      const allCategories = getAllCategories()
+      for (const [sid, categories] of Object.entries(allCategories)) {
+        if (!Array.isArray(categories)) continue
+        const hadCategory = categories.some(c => c.id === req.params.categoryId)
+        if (hadCategory) {
+          io.to(`server:${sid}`).emit('category:deleted', { categoryId: req.params.categoryId, serverId: sid })
+          break
+        }
+      }
+
+      console.log(`[API] Deleted category ${req.params.categoryId}`)
+      return res.json({ success: true })
+    } catch (err) {
+      console.error('[API] Error deleting category:', err.message)
+      return res.status(500).json({ error: 'Failed to delete category' })
+    }
   }
 
-  if (!serverId) {
+  // Fallback: load all categories, filter out the one to delete, save back
+  const categories = loadData(FILES.categories, {})
+  if (!categories[req.params.categoryId]) {
     return res.status(404).json({ error: 'Category not found' })
   }
 
-  allCategories[serverId] = toGroupedItems(allCategories[serverId]).filter(c => c.id !== req.params.categoryId)
-  await setAllCategories(allCategories)
+  const serverId = categories[req.params.categoryId]?.serverId
+  delete categories[req.params.categoryId]
+  await saveData(FILES.categories, categories)
 
-  io.to(`server:${serverId}`).emit('category:deleted', { categoryId: req.params.categoryId, serverId })
+  if (serverId) {
+    io.to(`server:${serverId}`).emit('category:deleted', { categoryId: req.params.categoryId, serverId })
+  }
 
   console.log(`[API] Deleted category ${req.params.categoryId}`)
   res.json({ success: true })
@@ -812,6 +914,7 @@ app.get('/api/admin/security/bot-stats', requireAdmin, (req, res) => {
 })
 
 io.use(authenticateSocket)
+setSocketIOInstance(io)
 
 if (wsEnabled || (!apiEnabled && !fedEnabled && !workerEnabled)) {
   setupSocketHandlers(io)
@@ -829,9 +932,9 @@ export { io }
 
 const PORT = process.env.PORT || defaultPort
 
-// Only start the HTTP server if we're not in cluster mode, or if we're the primary process
-// In cluster mode, workers should NOT listen on the port - they handle requests forwarded from the master
-const shouldStartServer = !CLUSTER_MODE || (isMaster && !isWorker) || (isWorker && cluster.worker?.id === 1)
+// Only start the HTTP server if we're not in cluster mode, or if we're a worker
+// In cluster mode, ONLY workers listen on the port (master coordinates but doesn't bind)
+const shouldStartServer = !CLUSTER_MODE || isWorker
 
 // ─── ANSI color/style helpers ───────────────────────────────────────────────
 const c = {
@@ -990,6 +1093,18 @@ if (shouldStartServer) {
     const storage    = config.config.storage
 
     printBanner(serverName, version, mode, storage, PORT)
+    
+    // Start health monitoring
+    healthService.start()
+    console.log('[Health] Health monitoring service started')
+    
+    // Start message batching
+    messageBatchService.start()
+    console.log('[MessageBatch] Message batching service started')
+    
+    // Setup global error handlers
+    setupGlobalErrorHandlers()
+    console.log('[ErrorLog] Global error handlers configured')
   })
 } else {
   // In cluster mode, workers don't directly listen on the port
