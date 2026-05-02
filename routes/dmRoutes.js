@@ -50,11 +50,34 @@ const buildAddress = (profile = {}) => {
 
 const router = express.Router()
 
+const getAuthorizedConversation = (userId, conversationId) => {
+  if (!conversationId) return null
+  const conversation = dmService.getConversationForUser(userId, conversationId)
+  if (!conversation) return null
+
+  const participantIds = Array.isArray(conversation.participants)
+    ? conversation.participants.filter(Boolean)
+    : [userId, conversation.recipientId].filter(Boolean)
+
+  return participantIds.includes(userId) ? conversation : null
+}
+
+const extractReplyTargetId = (replyTo) => {
+  if (typeof replyTo === 'string') {
+    const id = replyTo.trim()
+    return id || null
+  }
+  if (replyTo && typeof replyTo === 'object' && typeof replyTo.id === 'string') {
+    const id = replyTo.id.trim()
+    return id || null
+  }
+  return null
+}
+
 const buildDMReplyReference = (conversationMessages, replyTo) => {
-  if (!replyTo) return null
-  if (typeof replyTo === 'object' && replyTo.id) return replyTo
-  if (typeof replyTo !== 'string') return null
-  const target = conversationMessages.find(m => m.id === replyTo)
+  const replyTargetId = extractReplyTargetId(replyTo)
+  if (!replyTargetId) return null
+  const target = conversationMessages.find(m => m.id === replyTargetId)
   return target
     ? {
         id: target.id,
@@ -64,9 +87,56 @@ const buildDMReplyReference = (conversationMessages, replyTo) => {
         timestamp: target.timestamp
       }
     : {
-        id: replyTo,
+        id: replyTargetId,
         deleted: true
       }
+}
+
+const sanitizeDMAttachment = (attachment) => {
+  if (typeof attachment === 'string') {
+    const url = attachment.trim()
+    return url ? { url } : null
+  }
+  if (!attachment || typeof attachment !== 'object') return null
+  const safe = {}
+  if (typeof attachment.id === 'string') safe.id = attachment.id
+  if (typeof attachment.url === 'string') safe.url = attachment.url
+  if (typeof attachment.proxyUrl === 'string') safe.proxyUrl = attachment.proxyUrl
+  if (typeof attachment.name === 'string') safe.name = attachment.name
+  if (typeof attachment.filename === 'string') safe.filename = attachment.filename
+  if (typeof attachment.contentType === 'string') safe.contentType = attachment.contentType
+  if (typeof attachment.mimeType === 'string') safe.mimeType = attachment.mimeType
+  if (Number.isFinite(Number(attachment.size))) safe.size = Number(attachment.size)
+  if (Number.isFinite(Number(attachment.width))) safe.width = Number(attachment.width)
+  if (Number.isFinite(Number(attachment.height))) safe.height = Number(attachment.height)
+  return Object.keys(safe).length > 0 ? safe : null
+}
+
+const sanitizeDMAttachments = (attachments) => {
+  if (!Array.isArray(attachments)) return []
+  return attachments
+    .map(sanitizeDMAttachment)
+    .filter(Boolean)
+    .slice(0, 10)
+}
+
+const serializeDMMessage = (message, conversationMessages = []) => {
+  if (!message || typeof message !== 'object') return null
+  const serialized = {
+    id: message.id,
+    conversationId: message.conversationId,
+    userId: message.userId,
+    username: message.username,
+    avatar: message.avatar || null,
+    content: typeof message.content === 'string' ? message.content : '',
+    attachments: sanitizeDMAttachments(message.attachments),
+    replyTo: buildDMReplyReference(conversationMessages, message.replyTo),
+    timestamp: message.timestamp
+  }
+  if (message.edited) serialized.edited = true
+  if (message.editedAt) serialized.editedAt = message.editedAt
+  if (message.deleted) serialized.deleted = true
+  return serialized
 }
 
 // Get all DM conversations
@@ -152,7 +222,7 @@ router.get('/', authenticateToken, async (req, res) => {
   // Sort by last message time
   enrichedConversations.sort((a, b) => new Date(b.lastMessageAt) - new Date(a.lastMessageAt))
   
-  console.log(`[API] Get DMs for ${req.user.username} - ${enrichedConversations.length} conversations${search ? ` (search: ${search})` : ''}`)
+  console.log(`[API] Get DMs for ${req.user.username} - ${enrichedConversations.length} conversations`)
   res.json(enrichedConversations)
 })
 
@@ -181,12 +251,10 @@ router.get('/search', authenticateToken, async (req, res) => {
       const username = user.username?.toLowerCase() || ''
       const displayName = user.displayName?.toLowerCase() || ''
       const customUsername = user.customUsername?.toLowerCase() || ''
-      const email = user.email?.toLowerCase() || ''
       
       return username.includes(searchLower) || 
              displayName.includes(searchLower) || 
-             customUsername.includes(searchLower) ||
-             email.includes(searchLower)
+             customUsername.includes(searchLower)
     })
     .slice(0, 20)
     .map(user => {
@@ -231,7 +299,7 @@ router.get('/search', authenticateToken, async (req, res) => {
   
   const results = [...userResults, ...botResults]
   
-  console.log(`[API] DM user search for "${q}" - ${results.length} results`)
+  console.log(`[API] DM user search - ${results.length} results`)
   res.json(results)
 })
 
@@ -336,12 +404,21 @@ router.post('/', authenticateToken, async (req, res) => {
 })
 
 // Get messages for a DM conversation
-router.get('/:conversationId/messages', authenticateToken, async (req, res) => {
+router.get('/:conversationId/messages', authenticateToken, async (req, res, next) => {
+  if (req.params.conversationId === 'search') {
+    return next()
+  }
+
+  const conversation = getAuthorizedConversation(req.user.id, req.params.conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
+
   const { limit = 50, search, before, offset = 0 } = req.query
   const parsedLimit = Math.max(1, Math.min(parseInt(limit, 10) || 50, 100))
   const parsedOffset = Math.max(0, parseInt(offset, 10) || 0)
   const conversationMessages = await dmMessageService.getMessagesForConversation(
-    req.params.conversationId,
+    conversation.id,
     Math.max(parsedLimit + parsedOffset, 100),
     before || null
   )
@@ -371,12 +448,11 @@ router.get('/:conversationId/messages', authenticateToken, async (req, res) => {
   }
   messages = messages.slice(-parsedLimit)
 
-  const hydrated = messages.map(msg => ({
-    ...msg,
-    replyTo: buildDMReplyReference(conversationMessages, msg.replyTo)
-  }))
+  const hydrated = messages
+    .map(msg => serializeDMMessage(msg, conversationMessages))
+    .filter(Boolean)
 
-  console.log(`[API] Get DM messages for ${req.params.conversationId} - ${hydrated.length} messages${search ? ` (search: ${search})` : ''}`)
+  console.log(`[API] Get DM messages for ${conversation.id} - ${hydrated.length} messages`)
   res.json(hydrated)
 })
 
@@ -428,7 +504,7 @@ router.get('/search/messages', authenticateToken, (req, res) => {
     }
   }
   
-  console.log(`[API] DM message search for "${q}" - ${results.length} conversations with matches`)
+  console.log(`[API] DM message search - ${results.length} conversations with matches`)
   res.json(results.slice(0, 20)) // Limit total results
 })
 
@@ -449,8 +525,7 @@ router.post('/:conversationId/messages', authenticateToken, async (req, res) => 
     return res.status(400).json({ error: 'Message content required' })
   }
   
-  const conversations = dmService.getConversations(req.user.id)
-  const conversation = conversations.find(c => c.id === conversationId)
+  const conversation = getAuthorizedConversation(req.user.id, conversationId)
   
   if (!conversation) {
     return res.status(404).json({ error: 'Conversation not found' })
@@ -465,24 +540,27 @@ router.post('/:conversationId/messages', authenticateToken, async (req, res) => 
       return res.status(400).json({ error: 'Cannot send message to one or more blocked users in this group' })
     }
   }
+
+  const recentMessages = dmMessageService.getMessages(conversation.id, 500)
+  const sanitizedAttachments = sanitizeDMAttachments(attachments)
   
   const message = {
     id: uuidv4(),
-    conversationId,
+    conversationId: conversation.id,
     userId: req.user.id,
     username: req.user.username,
     avatar: req.user.avatar || getImageUrl(req.user.id),
     content: content.trim(),
-    attachments: attachments || [],
-    replyTo: buildDMReplyReference(dmMessageService.getAllMessages()?.[conversationId] || [], replyTo),
+    attachments: sanitizedAttachments,
+    replyTo: buildDMReplyReference(recentMessages, replyTo),
     timestamp: new Date().toISOString()
   }
   
-  await dmMessageService.addMessage(conversationId, message)
-  await dmService.updateLastMessage(conversationId, req.user.id, conversation.recipientId)
+  await dmMessageService.addMessage(conversation.id, message)
+  await dmService.updateLastMessage(conversation.id, req.user.id, conversation.recipientId)
   
-  console.log(`[API] DM message sent in ${conversationId}`)
-  res.status(201).json(message)
+  console.log(`[API] DM message sent in ${conversation.id}`)
+  res.status(201).json(serializeDMMessage(message, recentMessages))
 })
 
 // Edit DM message
@@ -493,8 +571,13 @@ router.put('/:conversationId/messages/:messageId', authenticateToken, async (req
   if (!content?.trim()) {
     return res.status(400).json({ error: 'Message content required' })
   }
+
+  const conversation = getAuthorizedConversation(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
-  const messages = dmMessageService.getMessages(conversationId, 100)
+  const messages = dmMessageService.getAllMessages()?.[conversation.id] || []
   const message = messages.find(m => m.id === messageId)
   
   if (!message) {
@@ -505,16 +588,23 @@ router.put('/:conversationId/messages/:messageId', authenticateToken, async (req
     return res.status(403).json({ error: 'Cannot edit others messages' })
   }
   
-  const updated = await dmMessageService.editMessage(conversationId, messageId, content.trim())
+  const updated = await dmMessageService.editMessage(conversation.id, messageId, content.trim())
+  const refreshedMessages = dmMessageService.getAllMessages()?.[conversation.id] || []
+  const refreshedMessage = refreshedMessages.find(m => m.id === messageId) || updated
   console.log(`[API] DM message ${messageId} edited`)
-  res.json(updated)
+  res.json(serializeDMMessage(refreshedMessage, refreshedMessages))
 })
 
 // Delete DM message
 router.delete('/:conversationId/messages/:messageId', authenticateToken, async (req, res) => {
   const { conversationId, messageId } = req.params
+
+  const conversation = getAuthorizedConversation(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
-  const messages = dmMessageService.getMessages(conversationId, 100)
+  const messages = dmMessageService.getAllMessages()?.[conversation.id] || []
   const message = messages.find(m => m.id === messageId)
   
   if (!message) {
@@ -525,7 +615,7 @@ router.delete('/:conversationId/messages/:messageId', authenticateToken, async (
     return res.status(403).json({ error: 'Cannot delete others messages' })
   }
   
-  await dmMessageService.deleteMessage(conversationId, messageId)
+  await dmMessageService.deleteMessage(conversation.id, messageId)
   console.log(`[API] DM message ${messageId} deleted`)
   res.json({ success: true })
 })

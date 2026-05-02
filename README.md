@@ -328,6 +328,11 @@ services:
 - `GET /api/channels/:channelId/messages` - Get messages
 - `POST /api/channels/:channelId/messages` - Send message
 
+### Pinned Messages
+- `GET /api/channels/:channelId/pins` - Get pinned messages for a channel
+- `PUT /api/channels/:channelId/pins/:messageId` - Pin a message to channel
+- `DELETE /api/channels/:channelId/pins/:messageId` - Unpin a message from channel
+
 ### Self-Volt (Federation)
 - `GET /api/self-volt` - List connected self-volt servers
 - `POST /api/self-volt` - Add self-volt server

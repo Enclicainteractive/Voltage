@@ -1,5 +1,73 @@
 import { createClient } from 'redis'
 
+const ALLOWED_REDIS_PROTOCOLS = new Set(['redis:', 'rediss:'])
+
+const isPrivateRedisHost = (rawHost) => {
+  const host = String(rawHost || '').trim().toLowerCase().replace(/^\[|\]$/g, '')
+  if (!host) return false
+  if (host === 'localhost' || host === '::1' || host === '0.0.0.0') return true
+  if (host.startsWith('127.')) return true
+  if (host.startsWith('10.')) return true
+  if (host.startsWith('192.168.')) return true
+  if (host.startsWith('169.254.')) return true
+  if (host.startsWith('172.')) {
+    const second = Number.parseInt(host.split('.')[1], 10)
+    if (Number.isFinite(second) && second >= 16 && second <= 31) return true
+  }
+  // common internal DNS labels
+  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan')) return true
+  return false
+}
+
+const parseRedisUrl = (url) => {
+  try {
+    const parsed = new URL(url)
+    if (!ALLOWED_REDIS_PROTOCOLS.has(parsed.protocol)) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+const formatHostForRedisUrl = (rawHost) => {
+  const host = String(rawHost || '').trim()
+  if (!host) return 'localhost'
+  if (host.includes(':') && !host.startsWith('[') && !host.endsWith(']')) return `[${host}]`
+  return host
+}
+
+const buildRedisUrlFromConfig = (redisConfig = {}) => {
+  const host = formatHostForRedisUrl(redisConfig.host || 'localhost')
+  const port = Number.parseInt(redisConfig.port, 10)
+  const db = Number.parseInt(redisConfig.db, 10)
+  const password = redisConfig.password ? String(redisConfig.password) : ''
+  const protocol = redisConfig.tls === true || redisConfig.ssl === true ? 'rediss' : 'redis'
+  const safePort = Number.isFinite(port) && port > 0 ? port : 6379
+  const safeDb = Number.isFinite(db) && db >= 0 ? db : 0
+  const authSegment = password ? `:${encodeURIComponent(password)}@` : ''
+  return `${protocol}://${authSegment}${host}:${safePort}/${safeDb}`
+}
+
+const applyPasswordToRedisUrl = (url, rawPassword) => {
+  const password = rawPassword ? String(rawPassword) : ''
+  if (!password) return url
+  const parsed = parseRedisUrl(url)
+  if (!parsed || parsed.password) return url
+  parsed.password = password
+  return parsed.toString()
+}
+
+const resolveRedisConnectionInfo = (url, fallbackHost = 'localhost') => {
+  const parsed = parseRedisUrl(url)
+  if (!parsed) return null
+  return {
+    url: parsed.toString(),
+    host: parsed.hostname || fallbackHost,
+    protocol: parsed.protocol,
+    password: parsed.password || ''
+  }
+}
+
 class RedisService {
   constructor() {
     this.client = null
@@ -17,15 +85,52 @@ class RedisService {
     
     const redisConfig = cfg.config.cache?.redis || cfg.config.queue?.redis || cfg.config.storage?.redis || {}
 
-    let url = process.env.REDIS_URL || 
-      `redis://${redisConfig.host || 'localhost'}:${redisConfig.port || 6379}/${redisConfig.db || 0}`
+    const environmentPassword = process.env.REDIS_PASSWORD
+    let url = process.env.REDIS_URL || buildRedisUrlFromConfig(redisConfig)
+    if (!process.env.REDIS_URL && redisConfig.password) {
+      url = buildRedisUrlFromConfig(redisConfig)
+    }
+    url = applyPasswordToRedisUrl(url, environmentPassword || redisConfig.password)
 
-    if (redisConfig.password) {
-      url = `redis://:${redisConfig.password}@${redisConfig.host || 'localhost'}:${redisConfig.port || 6379}/${redisConfig.db || 0}`
+    const connectionInfo = resolveRedisConnectionInfo(url, redisConfig.host || 'localhost')
+    if (!connectionInfo) {
+      console.error(
+        '[Redis] Refusing to connect: REDIS_URL must use redis:// or rediss:// and be a valid URL'
+      )
+      return false
+    }
+
+    const resolvedRedisHost = connectionInfo.host
+    const hasPassword = Boolean(redisConfig.password) || Boolean(environmentPassword) || Boolean(connectionInfo.password)
+    const isRemoteHost = !isPrivateRedisHost(resolvedRedisHost)
+    const allowInsecureRedis = process.env.ALLOW_INSECURE_REDIS === 'true'
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !allowInsecureRedis &&
+      !hasPassword
+    ) {
+      console.error(
+        `[Redis] Refusing insecure production connection: host=${resolvedRedisHost}, password=missing. ` +
+        'Set ALLOW_INSECURE_REDIS=true only for temporary emergency bypass.'
+      )
+      return false
+    }
+
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !allowInsecureRedis &&
+      isRemoteHost &&
+      connectionInfo.protocol !== 'rediss:'
+    ) {
+      console.error(
+        `[Redis] Refusing insecure production connection: host=${resolvedRedisHost}, tls=disabled. ` +
+        'Use a rediss:// URL for remote Redis hosts or set ALLOW_INSECURE_REDIS=true only for temporary emergency bypass.'
+      )
+      return false
     }
 
     const clientOptions = {
-      url,
+      url: connectionInfo.url,
       socket: {
         reconnectStrategy: (retries) => {
           this.reconnectAttempts = retries

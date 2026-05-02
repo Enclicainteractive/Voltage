@@ -3,7 +3,9 @@ import rateLimit from 'express-rate-limit'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
+import net from 'net'
 import { fileURLToPath } from 'url'
+import config from '../config/config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, '..', 'data')
@@ -11,6 +13,180 @@ const DATA_DIR = path.join(__dirname, '..', 'data')
 const SECURITY_DIR = path.join(DATA_DIR, 'security')
 if (!fs.existsSync(SECURITY_DIR)) {
   fs.mkdirSync(SECURITY_DIR, { recursive: true })
+}
+
+const getRawHeaderCount = (req, name) => {
+  const rawHeaders = Array.isArray(req.rawHeaders) ? req.rawHeaders : []
+  let count = 0
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    if (String(rawHeaders[i]).toLowerCase() === name) {
+      count++
+    }
+  }
+  return count
+}
+
+const normalizeIpAddress = (rawIp) => {
+  if (!rawIp || typeof rawIp !== 'string') return null
+
+  let ip = rawIp.trim()
+  if (!ip) return null
+
+  // Handle bracketed IPv6 addresses such as [::1]:443.
+  if (ip.startsWith('[') && ip.includes(']')) {
+    ip = ip.slice(1, ip.indexOf(']'))
+  }
+
+  // Remove zone index from IPv6 addresses (e.g. fe80::1%lo0).
+  if (ip.includes('%')) {
+    ip = ip.split('%')[0]
+  }
+
+  // Normalize IPv4-mapped IPv6 notation.
+  if (ip.startsWith('::ffff:')) {
+    const mapped = ip.slice(7)
+    if (net.isIP(mapped) === 4) {
+      ip = mapped
+    }
+  }
+
+  if (net.isIP(ip)) {
+    return ip
+  }
+
+  // Strip "ip:port" for plain IPv4 socket format.
+  const ipv4WithPort = ip.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/)
+  if (ipv4WithPort && net.isIP(ipv4WithPort[1]) === 4) {
+    return ipv4WithPort[1]
+  }
+
+  return null
+}
+
+const configuredTrustedProxies = new Set(
+  String(process.env.TRUSTED_PROXY_IPS || '')
+    .split(',')
+    .map((ip) => normalizeIpAddress(ip))
+    .filter(Boolean)
+)
+
+const isTrustedProxyIp = (ip) => {
+  if (!ip) return false
+  if (configuredTrustedProxies.has(ip)) return true
+
+  if (net.isIP(ip) === 4) {
+    const parts = ip.split('.').map((part) => Number.parseInt(part, 10))
+    if (parts[0] === 10) return true
+    if (parts[0] === 127) return true
+    if (parts[0] === 192 && parts[1] === 168) return true
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
+    if (parts[0] === 169 && parts[1] === 254) return true
+    return false
+  }
+
+  const lower = ip.toLowerCase()
+  if (lower === '::1') return true
+  if (lower.startsWith('fc') || lower.startsWith('fd')) return true // Unique local addresses.
+  if (lower.startsWith('fe80:')) return true // Link-local.
+
+  return false
+}
+
+const getSocketRemoteIp = (req) => {
+  return normalizeIpAddress(
+    req.socket?.remoteAddress ||
+      req.connection?.remoteAddress ||
+      req.ip ||
+      ''
+  )
+}
+
+const getForwardedClientIp = (req) => {
+  const remoteIp = getSocketRemoteIp(req)
+  if (!isTrustedProxyIp(remoteIp)) return null
+
+  const forwardedFor = req.headers['x-forwarded-for']
+  if (typeof forwardedFor !== 'string') return null
+
+  const chain = forwardedFor
+    .split(',')
+    .map((candidate) => normalizeIpAddress(candidate))
+    .filter(Boolean)
+
+  return chain[0] || null
+}
+
+const hasSuspiciousRequestFraming = (req) => {
+  const contentLength = req.headers['content-length']
+  const transferEncoding = req.headers['transfer-encoding']
+
+  // Duplicate framing headers are a classic request smuggling primitive.
+  if (getRawHeaderCount(req, 'content-length') > 1) return true
+  if (getRawHeaderCount(req, 'transfer-encoding') > 1) return true
+
+  if (contentLength !== undefined && transferEncoding !== undefined) {
+    return true
+  }
+
+  if (contentLength !== undefined) {
+    const rawValue = Array.isArray(contentLength)
+      ? contentLength.join(',')
+      : String(contentLength)
+    const normalized = rawValue.trim()
+    if (!/^\d+$/.test(normalized)) return true
+    const parsed = Number(normalized)
+    if (!Number.isSafeInteger(parsed)) return true
+  }
+
+  if (transferEncoding !== undefined) {
+    const rawValue = Array.isArray(transferEncoding)
+      ? transferEncoding.join(',')
+      : String(transferEncoding)
+
+    const encodings = rawValue
+      .split(',')
+      .map((encoding) => encoding.trim().toLowerCase())
+      .filter(Boolean)
+
+    if (encodings.length !== 1 || encodings[0] !== 'chunked') {
+      return true
+    }
+  }
+
+  return false
+}
+
+const rejectSuspiciousRequestFraming = (req, res) => {
+  if (!hasSuspiciousRequestFraming(req)) return false
+  const clientIp = getClientIp(req)
+  console.warn(`[Security] Rejected malformed request framing from ${clientIp}`)
+  res.status(400).json({ error: 'Malformed request framing' })
+  return true
+}
+
+export const getClientIp = (req) => {
+  return getForwardedClientIp(req) || getSocketRemoteIp(req) || 'unknown'
+}
+
+const getSocketClientIp = (socket) => {
+  const remoteIp = normalizeIpAddress(
+    socket.request?.socket?.remoteAddress ||
+      socket.handshake?.address ||
+      socket.conn?.remoteAddress ||
+      ''
+  )
+
+  const forwardedFor = socket.handshake?.headers?.['x-forwarded-for']
+  if (typeof forwardedFor === 'string' && isTrustedProxyIp(remoteIp)) {
+    const firstForwardedIp = forwardedFor
+      .split(',')
+      .map((candidate) => normalizeIpAddress(candidate))
+      .filter(Boolean)[0]
+
+    if (firstForwardedIp) return firstForwardedIp
+  }
+
+  return remoteIp || 'unknown'
 }
 
 class SecurityManager {
@@ -156,10 +332,20 @@ export const securityHeaders = helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "blob:"],
+      // Removed 'unsafe-eval' (enables eval/Function-like execution from any
+      // injected script) and 'blob:' (allows fetched/created blobs to execute
+      // as scripts). Kept 'unsafe-inline' for now because Vite-built apps
+      // emit inline bootstrap snippets; removing it requires a nonce-based
+      // CSP wired through the HTML response.
+      // TODO: migrate to a nonce-based CSP and drop 'unsafe-inline' from
+      // scriptSrc and styleSrc.
+      scriptSrc: ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", "data:", "blob:"],
       fontSrc: ["'self'"],
+      // TODO: federation requires arbitrary cross-origin wss/https, so this
+      // stays broad for now. Tighten once we have an allow-list of federated
+      // peers we can pin.
       connectSrc: ["'self'", "wss:", "https:"],
       frameSrc: ["'none'"],
       objectSrc: ["'none'"],
@@ -182,11 +368,15 @@ export const securityHeaders = helmet({
       payment: ['() => false'],
     },
   },
+  // TODO: enabling COEP ('require-corp') would give us cross-origin isolation
+  // (and access to high-resolution timers / SharedArrayBuffer), but it tends
+  // to break embedded media, third-party iframes, and federation assets.
+  // Re-evaluate once all media sources serve appropriate CORP/COEP headers.
   crossOriginEmbedderPolicy: false,
 })
 
 export const ipFilter = (req, res, next) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown'
+  const ip = getClientIp(req)
 
   if (securityManager.isWhitelisted(ip)) {
     return next()
@@ -207,10 +397,10 @@ export const strictRateLimit = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later' },
   keyGenerator: (req) => {
-    return req.ip || req.socket.remoteAddress
+    return getClientIp(req)
   },
   skip: (req) => {
-    return securityManager.isWhitelisted(req.ip)
+    return securityManager.isWhitelisted(getClientIp(req))
   },
 })
 
@@ -221,7 +411,7 @@ export const authRateLimit = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many authentication attempts, please try again later' },
   keyGenerator: (req) => {
-    return `${req.ip}:auth`
+    return `${getClientIp(req)}:auth`
   },
 })
 
@@ -232,7 +422,7 @@ export const loginRateLimit = rateLimit({
   legacyHeaders: false,
   message: { error: 'Account locked due to too many failed login attempts' },
   keyGenerator: (req) => {
-    return `${req.ip}:login`
+    return `${getClientIp(req)}:login`
   },
 })
 
@@ -242,12 +432,15 @@ export const apiRateLimit = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'API rate limit exceeded' },
+  keyGenerator: (req) => {
+    return `${getClientIp(req)}:api`
+  },
 })
 
 export const websocketRateLimit = new Map()
 
 export const wsRateLimiter = (socket, next) => {
-  const ip = socket.handshake.address || 'unknown'
+  const ip = getSocketClientIp(socket)
   const now = Date.now()
   const windowMs = 60000
   const maxMessages = 120
@@ -306,6 +499,10 @@ export const sanitizeInput = (req, res, next) => {
 }
 
 export const validateContentType = (req, res, next) => {
+  if (rejectSuspiciousRequestFraming(req, res)) {
+    return
+  }
+
   if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
     const contentType = req.headers['content-type']
     
@@ -336,8 +533,24 @@ export const preventClickjacking = (req, res, next) => {
 }
 
 export const requestSizeLimit = (req, res, next) => {
-  const contentLength = parseInt(req.headers['content-length'] || '0', 10)
-  const maxSize = 100000 * 1024 * 1024
+  if (rejectSuspiciousRequestFraming(req, res)) {
+    return
+  }
+
+  const rawContentLength = req.headers['content-length']
+  // Read from config; default to 10MB. Was previously 100GB which made this
+  // middleware effectively a no-op. Genuinely large uploads should go through
+  // a multipart upload route with its own (multer-managed) larger limit.
+  const maxSize = config.config.limits?.maxRequestSize || (10 * 1024 * 1024)
+
+  if (rawContentLength === undefined) {
+    return next()
+  }
+
+  const contentLength = Number(String(rawContentLength).trim())
+  if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+    return res.status(400).json({ error: 'Invalid Content-Length' })
+  }
 
   if (contentLength > maxSize) {
     return res.status(413).json({ error: 'Payload too large' })

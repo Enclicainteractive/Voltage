@@ -62,6 +62,7 @@ const PERMISSIONS = [
   'add_reactions',
   'mention_everyone',
   'manage_threads',
+  'manage_invites',
   'create_invites',
   'connect',
   'speak',
@@ -163,6 +164,12 @@ const getServers = () => {
   const data = serverService.getAllServers()
   return Array.isArray(data) ? data : Object.values(data || {})
 }
+const getServersFresh = async () => {
+  const data = typeof serverService.getAllServersFresh === 'function'
+    ? await serverService.getAllServersFresh()
+    : serverService.getAllServers()
+  return Array.isArray(data) ? data : Object.values(data || {})
+}
 const setServers = async (servers) => {
   // Convert array to record format and save ALL servers in ONE operation
   const serverRecord = toServerRecord(servers)
@@ -170,6 +177,12 @@ const setServers = async (servers) => {
 }
 
 const getAllChannels = () => channelService.getAllChannelsGrouped()
+const getAllChannelsFresh = async () => {
+  if (typeof channelService.getAllChannelsGroupedFresh === 'function') {
+    return await channelService.getAllChannelsGroupedFresh()
+  }
+  return getAllChannels()
+}
 const setAllChannels = async (channels) => {
   // Flatten grouped channels and save ALL in ONE operation
   const flatChannels = toFlatRecord(channels)
@@ -224,11 +237,251 @@ const hasPermission = (server, userId, permission) => {
   return perms.has(permission) || perms.has('admin')
 }
 
-router.get('/', authenticateToken, (req, res) => {
-  const allServers = getServers()
+const isServerMember = (server, userId) => {
+  if (!server) return false
+  if (server.ownerId === userId) return true
+  return Array.isArray(server.members) && server.members.some(m => m.id === userId)
+}
+
+const SERVER_MUTABLE_FIELDS = new Set([
+  'name',
+  'icon',
+  'description',
+  'themeColor',
+  'bannerUrl',
+  'defaultChannelId',
+  'discovery',
+  'public'
+])
+
+const pickAllowedServerUpdates = (payload = {}) => {
+  const updates = {}
+  for (const field of SERVER_MUTABLE_FIELDS) {
+    if (payload[field] !== undefined) {
+      updates[field] = payload[field]
+    }
+  }
+  return updates
+}
+
+const VALID_PERMISSION_SET = new Set(PERMISSIONS)
+const RESERVED_ROLE_IDS = new Set(['owner', 'member'])
+const ROLE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
+const INVITE_CODE_RE = /^[A-Z0-9]{4,64}$/
+const MAX_INVITE_USES = 100000
+const MAX_TIMEOUT_SECONDS = 60 * 60 * 24 * 28 // 28 days
+
+const ROLE_MUTABLE_FIELDS = new Set(['name', 'color', 'permissions', 'position'])
+const CATEGORY_MUTABLE_FIELDS = new Set(['name', 'position'])
+
+const normalizeInviteCode = (value) => {
+  if (typeof value !== 'string') return null
+  const code = value.trim().toUpperCase()
+  if (!INVITE_CODE_RE.test(code)) return null
+  return code
+}
+
+const isUserBanned = (server, userId) => {
+  if (!server || !userId || !Array.isArray(server.bans)) return false
+  return server.bans.some(entry => entry?.userId === userId)
+}
+
+const getRolePosition = (role) => {
+  const parsed = Number(role?.position)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+const getMemberRoleIds = (member) => {
+  if (!member) return []
+  if (Array.isArray(member.roles)) return member.roles.filter(roleId => typeof roleId === 'string' && roleId)
+  if (typeof member.role === 'string' && member.role.trim()) return [member.role]
+  return []
+}
+
+const getMemberHighestRolePosition = (server, userId) => {
+  if (!server || !userId) return -1
+  if (server.ownerId === userId) return Number.MAX_SAFE_INTEGER
+
+  const member = Array.isArray(server.members) ? server.members.find(m => m?.id === userId) : null
+  if (!member) return -1
+
+  const memberRoleIds = getMemberRoleIds(member)
+  let highestPosition = -1
+  for (const roleId of memberRoleIds) {
+    const role = server.roles?.find(item => item?.id === roleId)
+    if (!role) continue
+    highestPosition = Math.max(highestPosition, getRolePosition(role))
+  }
+  return highestPosition
+}
+
+const canManageTargetMember = (server, actorId, targetId) => {
+  if (!server || !actorId || !targetId) return false
+  if (actorId === targetId) return false
+  if (server.ownerId === actorId) return true
+  if (server.ownerId === targetId) return false
+
+  const actorPosition = getMemberHighestRolePosition(server, actorId)
+  const targetPosition = getMemberHighestRolePosition(server, targetId)
+  if (actorPosition < 0) return false
+  return actorPosition > targetPosition
+}
+
+const canManageRoleId = (server, actorId, roleId) => {
+  if (!server || !actorId || !roleId) return false
+  if (server.ownerId === actorId) return true
+  if (roleId === 'owner') return false
+
+  const actorPosition = getMemberHighestRolePosition(server, actorId)
+  if (actorPosition < 0) return false
+
+  const targetRole = server.roles?.find(item => item?.id === roleId)
+  if (!targetRole) return false
+
+  return actorPosition > getRolePosition(targetRole)
+}
+
+const canGrantPermissions = (server, actorId, permissions = []) => {
+  if (!server || !actorId) return false
+  if (server.ownerId === actorId) return true
+
+  const actorPermissions = computePermissions(server, actorId)
+  for (const permission of permissions) {
+    if (!actorPermissions.has(permission)) {
+      return false
+    }
+  }
+  return true
+}
+
+const parseInviteOptions = (payload = {}) => {
+  const options = {}
+
+  if (payload.maxUses !== undefined && payload.maxUses !== null && payload.maxUses !== '') {
+    const parsed = Number.parseInt(payload.maxUses, 10)
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > MAX_INVITE_USES) {
+      throw new Error(`maxUses must be an integer between 0 and ${MAX_INVITE_USES}`)
+    }
+    options.maxUses = parsed
+  }
+
+  if (payload.expiresAt !== undefined) {
+    if (payload.expiresAt === null || payload.expiresAt === '') {
+      options.expiresAt = null
+    } else {
+      const expiresAt = new Date(payload.expiresAt)
+      if (Number.isNaN(expiresAt.getTime())) {
+        throw new Error('expiresAt must be a valid date')
+      }
+      options.expiresAt = expiresAt.toISOString()
+    }
+  }
+
+  return options
+}
+
+const sanitizePermissionList = (permissions) => {
+  if (!Array.isArray(permissions)) {
+    throw new Error('permissions must be an array')
+  }
+  const sanitized = []
+  const seen = new Set()
+  for (const permission of permissions) {
+    if (typeof permission !== 'string') continue
+    const normalized = permission.trim().toLowerCase()
+    if (!normalized || !VALID_PERMISSION_SET.has(normalized) || seen.has(normalized)) continue
+    seen.add(normalized)
+    sanitized.push(normalized)
+  }
+  return sanitized
+}
+
+const pickAllowedRoleUpdates = (payload = {}, { allowCustomId = false } = {}) => {
+  const updates = {}
+  for (const field of ROLE_MUTABLE_FIELDS) {
+    if (payload[field] !== undefined) {
+      updates[field] = payload[field]
+    }
+  }
+
+  if (allowCustomId && payload.id !== undefined) {
+    updates.id = payload.id
+  }
+
+  if (updates.permissions !== undefined) {
+    updates.permissions = sanitizePermissionList(updates.permissions)
+  }
+  if (updates.position !== undefined) {
+    const parsed = Number(updates.position)
+    if (!Number.isFinite(parsed)) throw new Error('position must be a number')
+    updates.position = parsed
+  }
+  if (updates.name !== undefined && typeof updates.name !== 'string') {
+    throw new Error('name must be a string')
+  }
+  if (updates.color !== undefined && typeof updates.color !== 'string') {
+    throw new Error('color must be a string')
+  }
+  if (updates.id !== undefined) {
+    if (typeof updates.id !== 'string' || !ROLE_ID_RE.test(updates.id) || RESERVED_ROLE_IDS.has(updates.id)) {
+      throw new Error('Invalid role id')
+    }
+  }
+
+  return updates
+}
+
+const pickAllowedCategoryUpdates = (payload = {}) => {
+  const updates = {}
+  for (const field of CATEGORY_MUTABLE_FIELDS) {
+    if (payload[field] !== undefined) {
+      updates[field] = payload[field]
+    }
+  }
+  if (updates.name !== undefined && typeof updates.name !== 'string') {
+    throw new Error('name must be a string')
+  }
+  if (updates.position !== undefined) {
+    const parsed = Number(updates.position)
+    if (!Number.isFinite(parsed)) throw new Error('position must be a number')
+    updates.position = parsed
+  }
+  return updates
+}
+
+const emitServerJoined = (userId, server, member, source = 'join') => {
+  if (!userId || !server?.id) return
+  const joinedPayload = {
+    ...server,
+    __addToList: true,
+    joinedVia: source
+  }
+  io.to(`user:${userId}`).emit('server:updated', joinedPayload)
+  io.to(`user:${userId}`).emit('server:joined', {
+    serverId: server.id,
+    source,
+    server: joinedPayload
+  })
+  if (member?.id) {
+    io.to(`server:${server.id}`).emit('member:joined', {
+      serverId: server.id,
+      member
+    })
+  }
+  io.to(`server:${server.id}`).emit('server:updated', server)
+}
+
+const emitServerLeft = (userId, serverId, reason = 'left') => {
+  if (!userId || !serverId) return
+  io.to(`user:${userId}`).emit('server:left', { serverId, reason })
+}
+
+router.get('/', authenticateToken, async (req, res) => {
+  const allServers = await getServersFresh()
   const userId = req.user.id
   
   const userServers = allServers.filter(server => {
+    if (server?.ownerId === userId) return true
     const members = server.members || []
     return members.some(m => m.id === userId)
   })
@@ -238,11 +491,15 @@ router.get('/', authenticateToken, (req, res) => {
 })
 
 router.get('/:serverId/members', authenticateToken, async (req, res) => {
-  const servers = getServers()
+  const servers = await getServersFresh()
   const server = servers.find(s => s.id === req.params.serverId)
-  
+
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
+  }
+
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
   }
 
   // Enrich member objects with host/avatarHost/guildTag/nick from user profile
@@ -278,12 +535,16 @@ router.get('/:serverId/members', authenticateToken, async (req, res) => {
   res.json([...enrichedMembers, ...botMembers])
 })
 
-router.get('/:serverId/online-members', authenticateToken, (req, res) => {
-  const servers = getServers()
+router.get('/:serverId/online-members', authenticateToken, async (req, res) => {
+  const servers = await getServersFresh()
   const server = servers.find(s => s.id === req.params.serverId)
-  
+
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
+  }
+
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
   }
 
   const serverMemberIds = new Set(Array.isArray(server.members) ? server.members.map(m => m.id) : [])
@@ -303,14 +564,18 @@ router.get('/:serverId/online-members', authenticateToken, (req, res) => {
 })
 
 router.get('/:serverId', authenticateToken, async (req, res) => {
-  const servers = getServers()
+  const servers = await getServersFresh()
   let server = servers.find(s => s.id === req.params.serverId)
-  
+
   if (!server) {
     console.log(`[API] Server not found: ${req.params.serverId}`)
     return res.status(404).json({ error: 'Server not found' })
   }
-  
+
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!server.roles || server.roles.length === 0) {
     const memberRoleId = uuidv4()
     const adminRoleId = uuidv4()
@@ -389,7 +654,7 @@ router.post('/', authenticateToken, async (req, res) => {
     createdAt: new Date().toISOString()
   }
   
-  const servers = getServers()
+  const servers = await getServersFresh()
   servers.push(newServer)
   await setServers(servers)
   
@@ -411,11 +676,20 @@ router.post('/', authenticateToken, async (req, res) => {
   }
   
   const channels = [generalChannel, voiceChannel]
-  const allChannels = getAllChannels()
+  const allChannels = await getAllChannelsFresh()
   allChannels[serverId] = channels
   await setAllChannels(allChannels)
   
   newServer.defaultChannelId = generalChannel.id
+  const createdServerIndex = servers.findIndex(entry => entry.id === serverId)
+  if (createdServerIndex >= 0) {
+    servers[createdServerIndex] = {
+      ...servers[createdServerIndex],
+      defaultChannelId: generalChannel.id
+    }
+    await setServers(servers)
+  }
+  emitServerJoined(req.user.id, newServer, newServer.members?.[0] || null, 'create')
   
   console.log(`[API] Created server: ${name} with ${channels.length} default channels`)
   res.status(201).json(newServer)
@@ -433,8 +707,13 @@ router.put('/:serverId', authenticateToken, async (req, res) => {
   if (!hasPermission(server, req.user.id, 'manage_server')) {
     return res.status(403).json({ error: 'Not authorized' })
   }
-  
-  servers[index] = { ...servers[index], ...req.body, updatedAt: new Date().toISOString() }
+
+  const safeUpdates = pickAllowedServerUpdates(req.body)
+  if (Object.keys(safeUpdates).length === 0) {
+    return res.status(400).json({ error: 'No mutable server fields provided' })
+  }
+
+  servers[index] = { ...servers[index], ...safeUpdates, updatedAt: new Date().toISOString() }
   await setServers(servers)
   
   const updatedServer = servers[index]
@@ -448,6 +727,14 @@ router.delete('/:serverId', authenticateToken, async (req, res) => {
   const serverId = req.params.serverId
   
   const servers = getServers()
+  const server = servers.find(s => s.id === serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  if (server.ownerId !== req.user.id) {
+    return res.status(403).json({ error: 'Only the owner can delete this server' })
+  }
+
   const filtered = servers.filter(s => s.id !== serverId)
   await setServers(filtered)
   
@@ -481,8 +768,17 @@ router.delete('/:serverId', authenticateToken, async (req, res) => {
   res.json({ success: true })
 })
 
-router.get('/:serverId/channels', authenticateToken, (req, res) => {
-  const allChannels = getAllChannels()
+router.get('/:serverId/channels', authenticateToken, async (req, res) => {
+  const servers = await getServersFresh()
+  const server = servers.find(s => s.id === req.params.serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
+  const allChannels = await getAllChannelsFresh()
   const channels = allChannels[req.params.serverId] || []
   console.log(`[API] Get channels for server ${req.params.serverId} - returned ${channels.length} channels`)
   res.json(channels)
@@ -571,12 +867,23 @@ router.put('/:serverId/channels/order', authenticateToken, async (req, res) => {
 import { inviteService } from '../services/dataService.js'
 
 router.get('/:serverId/invites', authenticateToken, (req, res) => {
+  const servers = getServers()
+  const server = servers.find(s => s.id === req.params.serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+  if (!hasPermission(server, req.user.id, 'create_invites')) {
+    return res.status(403).json({ error: 'Not authorized to view invites' })
+  }
+
   const invites = inviteService.getServerInvites(req.params.serverId)
   res.json(invites)
 })
 
 router.post('/:serverId/invites', authenticateToken, async (req, res) => {
-  const { maxUses, expiresAt } = req.body
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
@@ -584,7 +891,14 @@ router.post('/:serverId/invites', authenticateToken, async (req, res) => {
     return res.status(403).json({ error: 'Not authorized to create invites' })
   }
 
-  const invite = await inviteService.createInvite(req.params.serverId, req.user.id, { maxUses, expiresAt })
+  let inviteOptions = {}
+  try {
+    inviteOptions = parseInviteOptions(req.body || {})
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
+
+  const invite = await inviteService.createInvite(req.params.serverId, req.user.id, inviteOptions)
   console.log(`[API] Created invite for server ${req.params.serverId}: ${invite.code}`)
   res.status(201).json(invite)
 })
@@ -597,32 +911,64 @@ router.delete('/:serverId/invites/:code', authenticateToken, async (req, res) =>
     return res.status(403).json({ error: 'Not authorized to delete invites' })
   }
 
-  await inviteService.deleteInvite(req.params.code)
-  console.log(`[API] Deleted invite ${req.params.code}`)
+  const inviteCode = normalizeInviteCode(req.params.code)
+  if (!inviteCode) {
+    return res.status(400).json({ error: 'Invalid invite code' })
+  }
+
+  const invite = inviteService.getInvite(inviteCode)
+  if (!invite || invite.serverId !== req.params.serverId) {
+    return res.status(404).json({ error: 'Invite not found' })
+  }
+
+  await inviteService.deleteInvite(inviteCode)
+  console.log(`[API] Deleted invite ${inviteCode}`)
   res.json({ success: true })
 })
 
 router.post('/invites/:code/join', authenticateToken, async (req, res) => {
-  const result = await inviteService.useInvite(req.params.code)
-  
-  if (result.error) {
-    return res.status(400).json({ error: result.error })
+  const inviteCode = normalizeInviteCode(req.params.code)
+  if (!inviteCode) {
+    return res.status(400).json({ error: 'Invalid invite code' })
+  }
+
+  const invite = inviteService.getInvite(inviteCode)
+  if (!invite) {
+    return res.status(400).json({ error: 'Invite not found' })
+  }
+  if (invite.expiresAt && new Date(invite.expiresAt) < new Date()) {
+    return res.status(400).json({ error: 'Invite expired' })
+  }
+  if (invite.maxUses && invite.uses >= invite.maxUses) {
+    return res.status(400).json({ error: 'Invite expired' })
   }
   
-  const servers = getServers()
-  const server = servers.find(s => s.id === result.serverId)
+  const servers = await getServersFresh()
+  const server = servers.find(s => s.id === invite.serverId)
   
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
   }
+
+  if (isUserBanned(server, req.user.id)) {
+    return res.status(403).json({ error: 'You are banned from this server' })
+  }
   
   const existingMember = server.members?.find(m => m.id === req.user.id)
   if (existingMember) {
-    return res.status(400).json({ error: 'Already a member' })
+    return res.json(server)
+  }
+
+  const result = await inviteService.useInvite(inviteCode)
+  if (result.error) {
+    return res.status(400).json({ error: result.error })
+  }
+  if (result.serverId !== server.id) {
+    return res.status(403).json({ error: 'Invite/server mismatch' })
   }
   
   if (!server.members) server.members = []
-  server.members.push({
+  const joinedMember = {
     id: req.user.id,
     username: req.user.username,
     imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
@@ -633,32 +979,92 @@ router.post('/invites/:code/join', authenticateToken, async (req, res) => {
     role: 'member',
     status: 'online',
     joinedAt: new Date().toISOString()
-  })
+  }
+  server.members.push(joinedMember)
   
   await setServers(servers)
+  emitServerJoined(req.user.id, server, joinedMember, 'invite')
   console.log(`[API] User ${req.user.username} joined server ${server.name}`)
   res.json(server)
 })
 
 router.post('/:serverId/join', authenticateToken, async (req, res) => {
-  const servers = getServers()
+  const servers = await getServersFresh()
   const server = servers.find(s => s.id === req.params.serverId)
-  
+
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
   }
-  
-  if (!discoveryService.isInDiscovery(server.id)) {
-    return res.status(403).json({ error: 'Server not available for direct join' })
+
+  if (isUserBanned(server, req.user.id)) {
+    return res.status(403).json({ error: 'You are banned from this server' })
   }
-  
+
+  // SECURITY (VULN-1: invite bypass): a direct POST to /:serverId/join must
+  // never be enough on its own to add the caller to `server.members`. We
+  // require ONE of the following conditions to be true before granting
+  // membership:
+  //   1. The caller is already a member (idempotent re-join — return current
+  //      server state without mutating anything).
+  //   2. The caller supplied a valid `inviteCode` body param that resolves
+  //      to a non-expired, non-exhausted invite for THIS server.
+  //   3. The server has been explicitly published to discovery (i.e. it is
+  //      a public/discovery-listed server). Anything else → 403.
+  //
+  // Without this check, any authenticated user could enumerate server UUIDs
+  // and silently add themselves to private servers.
+
+  // (1) Idempotent re-join for existing members.
   const existingMember = server.members?.find(m => m.id === req.user.id)
   if (existingMember) {
-    return res.status(400).json({ error: 'Already a member' })
+    return res.json(server)
   }
-  
+
+  // (2) Invite-based join: caller must explicitly present a valid invite
+  //     for this exact server.
+  const inviteCode = normalizeInviteCode(req.body?.inviteCode) || normalizeInviteCode(req.body?.code)
+
+  let inviteAuthorized = false
+  let consumedInviteCode = null
+  if (inviteCode) {
+    const invite = inviteService.getInvite(inviteCode)
+    if (invite && invite.serverId === server.id) {
+      // Validate expiry / max uses BEFORE consuming.
+      const expired = invite.expiresAt && new Date(invite.expiresAt) < new Date()
+      const exhausted = invite.maxUses && invite.uses >= invite.maxUses
+      if (!expired && !exhausted) {
+        inviteAuthorized = true
+        consumedInviteCode = inviteCode
+      }
+    }
+  }
+
+  // (3) Discovery / public-server fallback.
+  const isPublic = inviteAuthorized
+    || discoveryService.isInDiscovery(server.id)
+    || server.discovery === true
+    || server.public === true
+
+  if (!inviteAuthorized && !isPublic) {
+    return res.status(403).json({ error: 'Invite required' })
+  }
+
+  // Consume the invite (increment uses) only after we know we will actually
+  // add the user, so a failed mutation doesn't burn an invite slot.
+  if (consumedInviteCode) {
+    const consumeResult = await inviteService.useInvite(consumedInviteCode)
+    if (consumeResult?.error) {
+      return res.status(400).json({ error: consumeResult.error })
+    }
+    if (consumeResult?.serverId && consumeResult.serverId !== server.id) {
+      // Defense-in-depth: useInvite returned a different server than the
+      // caller targeted. Refuse rather than cross-add.
+      return res.status(403).json({ error: 'Invite required' })
+    }
+  }
+
   if (!server.members) server.members = []
-  server.members.push({
+  const joinedMember = {
     id: req.user.id,
     username: req.user.username,
     imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
@@ -669,10 +1075,12 @@ router.post('/:serverId/join', authenticateToken, async (req, res) => {
     role: 'member',
     status: 'online',
     joinedAt: new Date().toISOString()
-  })
-  
+  }
+  server.members.push(joinedMember)
+
   await setServers(servers)
-  console.log(`[API] User ${req.user.username} joined server ${server.name} directly`)
+  emitServerJoined(req.user.id, server, joinedMember, consumedInviteCode ? 'invite' : 'direct')
+  console.log(`[API] User ${req.user.username} joined server ${server.name} ${consumedInviteCode ? `via invite ${consumedInviteCode}` : 'directly'}`)
   res.json(server)
 })
 
@@ -683,18 +1091,33 @@ router.delete('/:serverId/members/:memberId', authenticateToken, async (req, res
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
   }
-  
-  // User leaving their own server - allow without permission check
+
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   const isSelf = req.params.memberId === req.user.id
   const isOwner = server.ownerId === req.user.id
+  const targetMember = server.members?.find(m => m.id === req.params.memberId)
+
+  if (!targetMember) {
+    return res.status(404).json({ error: 'Member not found' })
+  }
+
+  if (isSelf && isOwner) {
+    return res.status(400).json({ error: 'Owner cannot leave. Transfer ownership first.' })
+  }
   
   if (!isSelf && !hasPermission(server, req.user.id, 'kick_members')) {
     return res.status(403).json({ error: 'Not authorized' })
   }
-  
-  // Prevent owner from leaving without transferring
-  if (isOwner && !isSelf) {
-    return res.status(400).json({ error: 'Owner cannot kick themselves. Transfer ownership first.' })
+
+  if (!isSelf && !canManageTargetMember(server, req.user.id, req.params.memberId)) {
+    return res.status(403).json({ error: 'Cannot moderate a member with an equal or higher role' })
+  }
+
+  if (req.params.memberId === server.ownerId && req.user.id !== server.ownerId) {
+    return res.status(403).json({ error: 'Cannot remove the server owner' })
   }
   
   if (!server.members) server.members = []
@@ -703,6 +1126,15 @@ router.delete('/:serverId/members/:memberId', authenticateToken, async (req, res
 
   const kickedMemberId = req.params.memberId
   const serverId = req.params.serverId
+
+  if (isSelf) {
+    emitServerLeft(kickedMemberId, serverId, 'self-remove')
+    io.to(`server:${serverId}`).emit('member:removed', {
+      serverId,
+      memberId: kickedMemberId,
+      userId: kickedMemberId
+    })
+  }
 
   if (!isSelf) {
     // Notify the kicked user directly so their client removes the server immediately
@@ -725,7 +1157,7 @@ router.delete('/:serverId/members/:memberId', authenticateToken, async (req, res
 
 // User leaves server themselves
 router.post('/:serverId/leave', authenticateToken, async (req, res) => {
-  const servers = getServers()
+  const servers = await getServersFresh()
   const server = servers.find(s => s.id === req.params.serverId)
   
   if (!server) {
@@ -735,10 +1167,20 @@ router.post('/:serverId/leave', authenticateToken, async (req, res) => {
   if (server.ownerId === req.user.id) {
     return res.status(400).json({ error: 'Cannot leave your own server. Transfer ownership first or delete the server.' })
   }
+
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
   
   if (!server.members) server.members = []
   server.members = server.members.filter(m => m.id !== req.user.id)
   await setServers(servers)
+  emitServerLeft(req.user.id, req.params.serverId, 'left')
+  io.to(`server:${req.params.serverId}`).emit('member:removed', {
+    serverId: req.params.serverId,
+    memberId: req.user.id,
+    userId: req.user.id
+  })
   
   console.log(`[API] User ${req.user.username} left server ${server.name}`)
   res.json({ success: true })
@@ -756,15 +1198,33 @@ router.put('/:serverId/members/:memberId', authenticateToken, async (req, res) =
   if (!hasPermission(server, req.user.id, 'manage_roles')) {
     return res.status(403).json({ error: 'Not authorized to manage roles' })
   }
+
+  if (req.params.memberId === server.ownerId) {
+    return res.status(400).json({ error: 'Cannot edit owner roles' })
+  }
   
   const member = server.members?.find(m => m.id === req.params.memberId)
   if (!member) {
     return res.status(404).json({ error: 'Member not found' })
   }
 
+  if (!canManageTargetMember(server, req.user.id, req.params.memberId)) {
+    return res.status(403).json({ error: 'Cannot edit roles for a member with an equal or higher role' })
+  }
+
   const nextRoles = Array.isArray(roles) ? roles : (role ? [role] : [])
+  if (!Array.isArray(nextRoles) || nextRoles.some(entry => typeof entry !== 'string')) {
+    return res.status(400).json({ error: 'roles must be an array of role IDs' })
+  }
   const validRoleIds = new Set(Array.isArray(server.roles) ? server.roles.map(r => r.id) : [])
   const filtered = nextRoles.filter(r => validRoleIds.has(r) && r !== 'owner')
+
+  for (const roleId of filtered) {
+    if (!canManageRoleId(server, req.user.id, roleId)) {
+      return res.status(403).json({ error: `Cannot assign role ${roleId}` })
+    }
+  }
+
   member.roles = filtered
   member.role = member.roles[0] || null
   
@@ -826,6 +1286,20 @@ router.post('/:serverId/bans/:memberId', authenticateToken, async (req, res) => 
   const bannedMemberId = req.params.memberId
   const banServerId = req.params.serverId
 
+  const targetMember = Array.isArray(server.members) ? server.members.find(m => m?.id === bannedMemberId) : null
+  if (!targetMember) {
+    return res.status(404).json({ error: 'Member not found' })
+  }
+  if (bannedMemberId === server.ownerId) {
+    return res.status(403).json({ error: 'Cannot ban the server owner' })
+  }
+  if (!canManageTargetMember(server, req.user.id, bannedMemberId)) {
+    return res.status(403).json({ error: 'Cannot ban a member with an equal or higher role' })
+  }
+  if (isUserBanned(server, bannedMemberId)) {
+    return res.status(409).json({ error: 'Member already banned' })
+  }
+
   if (!server.members) server.members = []
   server.members = server.members.filter(m => m.id !== bannedMemberId)
   if (!server.bans) server.bans = []
@@ -861,6 +1335,10 @@ router.get('/:serverId/roles', authenticateToken, (req, res) => {
 
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
+  }
+
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
   }
 
   res.json(server.roles || [])
@@ -918,13 +1396,43 @@ router.post('/:serverId/roles', authenticateToken, async (req, res) => {
   if (!hasPermission(server, req.user.id, 'manage_roles')) {
     return res.status(403).json({ error: 'Not authorized to create roles' })
   }
+
+  let roleInput = {}
+  try {
+    roleInput = pickAllowedRoleUpdates(req.body || {}, { allowCustomId: true })
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
+
+  const roleName = typeof roleInput.name === 'string' ? roleInput.name.trim() : ''
+  if (!roleName) {
+    return res.status(400).json({ error: 'Role name is required' })
+  }
+
+  const roleId = roleInput.id || uuidv4()
+  if (Array.isArray(server.roles) && server.roles.some(role => role.id === roleId)) {
+    return res.status(409).json({ error: 'Role ID already exists' })
+  }
+
+  const rolePosition = roleInput.position ?? (server.roles?.length || 0)
+  if (server.ownerId !== req.user.id) {
+    const actorPosition = getMemberHighestRolePosition(server, req.user.id)
+    if (rolePosition >= actorPosition) {
+      return res.status(403).json({ error: 'Cannot create roles at or above your highest role' })
+    }
+  }
+
+  const rolePermissions = Array.isArray(roleInput.permissions) ? roleInput.permissions : []
+  if (!canGrantPermissions(server, req.user.id, rolePermissions)) {
+    return res.status(403).json({ error: 'Cannot grant permissions you do not have' })
+  }
   
   const newRole = {
-    id: req.body.id || uuidv4(),
-    name: req.body.name,
-    color: req.body.color || '#1fb6ff',
-    permissions: req.body.permissions || [],
-    position: req.body.position ?? (server.roles?.length || 0)
+    id: roleId,
+    name: roleName,
+    color: roleInput.color || '#1fb6ff',
+    permissions: rolePermissions,
+    position: rolePosition
   }
   
   if (!server.roles) server.roles = []
@@ -957,10 +1465,41 @@ router.put('/:serverId/roles/:roleId', authenticateToken, async (req, res) => {
   if (roleIndex === -1) {
     return res.status(404).json({ error: 'Role not found' })
   }
+
+  if (!canManageRoleId(server, req.user.id, req.params.roleId)) {
+    return res.status(403).json({ error: 'Cannot edit this role' })
+  }
+
+  let safeRoleUpdates = {}
+  try {
+    safeRoleUpdates = pickAllowedRoleUpdates(req.body || {})
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
+
+  if (Object.keys(safeRoleUpdates).length === 0) {
+    return res.status(400).json({ error: 'No mutable role fields provided' })
+  }
+
+  if (safeRoleUpdates.permissions && !canGrantPermissions(server, req.user.id, safeRoleUpdates.permissions)) {
+    return res.status(403).json({ error: 'Cannot grant permissions you do not have' })
+  }
+  if (safeRoleUpdates.position !== undefined && server.ownerId !== req.user.id) {
+    const actorPosition = getMemberHighestRolePosition(server, req.user.id)
+    if (safeRoleUpdates.position >= actorPosition) {
+      return res.status(403).json({ error: 'Cannot move roles at or above your highest role' })
+    }
+  }
+  if (safeRoleUpdates.name !== undefined) {
+    safeRoleUpdates.name = safeRoleUpdates.name.trim()
+    if (!safeRoleUpdates.name) {
+      return res.status(400).json({ error: 'Role name cannot be empty' })
+    }
+  }
   
   server.roles[roleIndex] = {
     ...server.roles[roleIndex],
-    ...req.body,
+    ...safeRoleUpdates,
     id: req.params.roleId // Ensure ID doesn't change
   }
   
@@ -987,6 +1526,17 @@ router.delete('/:serverId/roles/:roleId', authenticateToken, async (req, res) =>
   if (!server.roles) {
     server.roles = []
   }
+
+  const roleToDelete = server.roles.find(role => role.id === req.params.roleId)
+  if (!roleToDelete) {
+    return res.status(404).json({ error: 'Role not found' })
+  }
+  if (req.params.roleId === 'owner') {
+    return res.status(400).json({ error: 'Cannot delete owner role' })
+  }
+  if (!canManageRoleId(server, req.user.id, req.params.roleId)) {
+    return res.status(403).json({ error: 'Cannot delete this role' })
+  }
   
   server.roles = server.roles.filter(r => r.id !== req.params.roleId)
   
@@ -1008,14 +1558,18 @@ router.delete('/:serverId/roles/:roleId', authenticateToken, async (req, res) =>
   res.json({ success: true })
 })
 
-router.get('/:serverId/emojis', (req, res) => {
+router.get('/:serverId/emojis', authenticateToken, (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
-  
+
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
   }
-  
+
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   // Add host info to each emoji for global format
   const emojisWithHost = Array.isArray(server.emojis) ? server.emojis.map(emoji => ({
     ...emoji,
@@ -1023,7 +1577,7 @@ router.get('/:serverId/emojis', (req, res) => {
     serverId: server.id,
     serverName: server.name
   })) : []
-  
+
   res.json(emojisWithHost)
 })
 
@@ -1042,6 +1596,9 @@ router.post('/:serverId/emojis', authenticateToken, async (req, res) => {
   }
   
   const server = servers[serverIndex]
+  if (!hasPermission(server, req.user.id, 'manage_emojis')) {
+    return res.status(403).json({ error: 'Not authorized to manage emojis' })
+  }
   
   if (!server.emojis) {
     server.emojis = []
@@ -1085,6 +1642,13 @@ router.delete('/:serverId/emojis/:emojiId', authenticateToken, async (req, res) 
   }
   
   const server = servers[serverIndex]
+  if (!hasPermission(server, req.user.id, 'manage_emojis')) {
+    return res.status(403).json({ error: 'Not authorized to manage emojis' })
+  }
+  const emojiExists = Array.isArray(server.emojis) && server.emojis.some(e => e.id === req.params.emojiId)
+  if (!emojiExists) {
+    return res.status(404).json({ error: 'Emoji not found' })
+  }
   server.emojis = Array.isArray(server.emojis) ? server.emojis.filter(e => e.id !== req.params.emojiId) : []
   servers[serverIndex] = server
   await setServers(servers)
@@ -1134,6 +1698,15 @@ router.get('/emojis/global', authenticateToken, (req, res) => {
 
 // Category routes
 router.get('/:serverId/categories', authenticateToken, (req, res) => {
+  const servers = getServers()
+  const server = servers.find(s => s.id === req.params.serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   const allCategories = getAllCategories()
   const categories = allCategories[req.params.serverId] || []
   console.log(`[API] Get categories for server ${req.params.serverId} - returned ${categories.length} categories`)
@@ -1234,23 +1807,42 @@ router.put('/categories/:categoryId', authenticateToken, async (req, res) => {
 
   const servers = getServers()
   const server = servers.find(s => s.id === serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
   if (!hasPermission(server, req.user.id, 'manage_channels')) {
     return res.status(403).json({ error: 'Not authorized to edit categories' })
   }
 
-  // Update category
-  for (const categories of Object.values(allCategories)) {
-    if (!Array.isArray(categories)) continue
-    const idx = categories.findIndex(c => c.id === req.params.categoryId)
-    if (idx !== -1) {
-      categories[idx] = { ...categories[idx], ...req.body, updatedAt: new Date().toISOString() }
-      await setAllCategories(allCategories)
-      
-      io.to(`server:${serverId}`).emit('category:updated', categories[idx])
-      console.log(`[API] Updated category ${req.params.categoryId}`)
-      return res.json(categories[idx])
-    }
+  let safeUpdates = {}
+  try {
+    safeUpdates = pickAllowedCategoryUpdates(req.body || {})
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
   }
+  if (Object.keys(safeUpdates).length === 0) {
+    return res.status(400).json({ error: 'No mutable category fields provided' })
+  }
+
+  const serverCategories = toGroupedItems(allCategories[serverId])
+  const categoryIndex = serverCategories.findIndex(c => c.id === req.params.categoryId)
+  if (categoryIndex === -1) {
+    return res.status(404).json({ error: 'Category not found' })
+  }
+
+  serverCategories[categoryIndex] = {
+    ...serverCategories[categoryIndex],
+    ...safeUpdates,
+    id: req.params.categoryId,
+    serverId,
+    updatedAt: new Date().toISOString()
+  }
+  allCategories[serverId] = serverCategories
+  await setAllCategories(allCategories)
+
+  io.to(`server:${serverId}`).emit('category:updated', serverCategories[categoryIndex])
+  console.log(`[API] Updated category ${req.params.categoryId}`)
+  return res.json(serverCategories[categoryIndex])
 })
 
 router.delete('/categories/:categoryId', authenticateToken, async (req, res) => {
@@ -1308,6 +1900,7 @@ router.get('/:serverId/guild-tag', authenticateToken, async (req, res) => {
   const servers = getServers()
   const server = servers.find(s => s.id === req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
+  if (!isServerMember(server, req.user.id)) return res.status(403).json({ error: 'Not authorized' })
   res.json({
     guildTag: server.guildTag || null,
     guildTagPrivate: server.guildTagPrivate === true
@@ -1380,13 +1973,26 @@ router.post('/:serverId/members/:memberId/timeout', authenticateToken, async (re
     return res.status(400).json({ error: 'Cannot timeout yourself' })
   }
 
-  const duration = parseInt(req.body.duration, 10) || 0
-  const reason = req.body.reason || null
+  const hasDuration = req.body?.duration !== undefined && req.body?.duration !== null && req.body?.duration !== ''
+  const duration = hasDuration ? Number.parseInt(req.body.duration, 10) : 0
+  if (!Number.isInteger(duration)) {
+    return res.status(400).json({ error: 'duration must be an integer number of seconds' })
+  }
+  const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
+    ? req.body.reason.trim().slice(0, 500)
+    : null
 
   const member = server.members?.find(m => m && m.id === memberId)
   if (!member) return res.status(404).json({ error: 'Member not found' })
+  if (!canManageTargetMember(server, req.user.id, memberId)) {
+    return res.status(403).json({ error: 'Cannot timeout a member with an equal or higher role' })
+  }
 
-  if (duration <= 0) {
+  if (duration < 0 || duration > MAX_TIMEOUT_SECONDS) {
+    return res.status(400).json({ error: `duration must be between 0 and ${MAX_TIMEOUT_SECONDS} seconds` })
+  }
+
+  if (duration === 0) {
     // Remove timeout
     member.timeoutUntil = null
     member.timeoutReason = null
@@ -1434,11 +2040,19 @@ router.post('/:serverId/members/:memberId/voice-disconnect', authenticateToken, 
     return res.status(400).json({ error: 'Cannot disconnect the server owner from voice' })
   }
 
+  const member = Array.isArray(server.members) ? server.members.find(m => m?.id === memberId) : null
+  if (!member) {
+    return res.status(404).json({ error: 'Member not found' })
+  }
+  if (!canManageTargetMember(server, req.user.id, memberId)) {
+    return res.status(403).json({ error: 'Cannot disconnect a member with an equal or higher role' })
+  }
+
   // Emit to the target user's socket to force them to leave voice
   io.to(`user:${memberId}`).emit('voice:force-disconnect', {
     serverId,
     moderatorId: req.user.id,
-    reason: req.body.reason || null
+    reason: typeof req.body?.reason === 'string' && req.body.reason.trim() ? req.body.reason.trim().slice(0, 500) : null
   })
 
   // Also clean up server-side voice state immediately so all other participants

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { authenticateToken, requireOwner } from '../middleware/authMiddleware.js'
+import { adminService } from '../services/dataService.js'
 import config from '../config/config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -23,6 +24,17 @@ const DRIVER_PACKAGE_BY_STORAGE = {
   redis: 'redis'
 }
 const INSTALL_ALLOWLIST = new Set(Object.values(DRIVER_PACKAGE_BY_STORAGE))
+const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+const SENSITIVE_CONFIG_KEY_PATTERN = /(password|secret|token|apikey|privatekey|accesskey)/i
+const SENSITIVE_CONFIG_KEY_EXCEPTIONS = new Set([
+  'tokenUrl',
+  'authUrl',
+  'userInfoUrl',
+  'revokeUrl',
+  'endpoint',
+  'publicUrl',
+  'imageServerUrl'
+])
 
 const router = express.Router()
 
@@ -38,6 +50,67 @@ const checkPackageInstalled = async (packageName) => {
   } catch {
     return false
   }
+}
+
+const normalizeText = (value) => typeof value === 'string' ? value.trim() : ''
+
+const parseBoundedInt = (value, fallback, { min = 0, max = 1000 } = {}) => {
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isFinite(parsed)) return fallback
+  if (parsed < min) return min
+  if (parsed > max) return max
+  return parsed
+}
+
+const maskConfigSecrets = (value, depth = 0) => {
+  if (depth > 20) return null
+  if (Array.isArray(value)) {
+    return value.map(item => maskConfigSecrets(item, depth + 1))
+  }
+  if (!value || typeof value !== 'object') return value
+
+  const masked = {}
+  for (const [key, innerValue] of Object.entries(value)) {
+    if (RESERVED_OBJECT_KEYS.has(key)) continue
+    if (SENSITIVE_CONFIG_KEY_PATTERN.test(key) && !SENSITIVE_CONFIG_KEY_EXCEPTIONS.has(key)) {
+      masked[key] = innerValue ? '(hidden)' : innerValue
+      continue
+    }
+    masked[key] = maskConfigSecrets(innerValue, depth + 1)
+  }
+  return masked
+}
+
+const getConfiguredAdminEntries = () => {
+  return (config.config.security?.adminUsers || [])
+    .map(entry => normalizeText(entry))
+    .filter(Boolean)
+}
+
+const isConfiguredAdminUser = (userId) => {
+  const entries = getConfiguredAdminEntries()
+  if (entries.length === 0) return false
+
+  const normalizedId = normalizeText(userId)
+  const lowerEntries = new Set(entries.map(entry => entry.toLowerCase()))
+
+  if (normalizedId && (entries.includes(normalizedId) || lowerEntries.has(normalizedId.toLowerCase()))) {
+    return true
+  }
+  return false
+}
+
+const requireTrustedAdmin = (req, res, next) => {
+  const userId = normalizeText(req.user?.id || req.user?.userId)
+  if (!userId) {
+    return res.status(403).json({ error: 'Admin access required' })
+  }
+
+  if (isConfiguredAdminUser(userId) || adminService.isAdmin(userId)) {
+    return next()
+  }
+
+  return res.status(403).json({ error: 'Admin access required' })
 }
 
 // Get full config (with sensitive data filtered)
@@ -176,22 +249,10 @@ router.get('/raw', authenticateToken, requireOwner, (req, res) => {
   const configPath = path.join(__dirname, '..', 'config.json')
   if (fs.existsSync(configPath)) {
     const configData = JSON.parse(fs.readFileSync(configPath, 'utf8'))
-    // Mask sensitive values
-    const masked = JSON.parse(JSON.stringify(configData))
-    if (masked.security?.jwtSecret) masked.security.jwtSecret = '(hidden)'
-    if (masked.storage?.mysql?.password) masked.storage.mysql.password = '(hidden)'
-    if (masked.storage?.mariadb?.password) masked.storage.mariadb.password = '(hidden)'
-    if (masked.storage?.postgres?.password) masked.storage.postgres.password = '(hidden)'
-    if (masked.storage?.cockroachdb?.password) masked.storage.cockroachdb.password = '(hidden)'
-    if (masked.storage?.mssql?.password) masked.storage.mssql.password = '(hidden)'
-    if (masked.storage?.mongodb?.password) masked.storage.mongodb.password = '(hidden)'
-    if (masked.storage?.redis?.password) masked.storage.redis.password = '(hidden)'
-    if (masked.cdn?.s3?.secretAccessKey) masked.cdn.s3.secretAccessKey = '(hidden)'
-    if (masked.cache?.redis?.password) masked.cache.redis.password = '(hidden)'
-    if (masked.queue?.redis?.password) masked.queue.redis.password = '(hidden)'
+    const masked = maskConfigSecrets(configData)
     res.json(masked)
   } else {
-    res.json(config.config)
+    res.json(maskConfigSecrets(config.config))
   }
 })
 
@@ -295,7 +356,7 @@ router.post('/import', authenticateToken, requireOwner, (req, res) => {
 })
 
 // Get available options/limits
-router.get('/schema', (req, res) => {
+router.get('/schema', authenticateToken, requireTrustedAdmin, (req, res) => {
   res.json({
     server: {
       mode: ['mainline', 'self-volt', 'federated'],
@@ -342,7 +403,7 @@ router.get('/schema', (req, res) => {
 })
 
 // Get default config template
-router.get('/template', (req, res) => {
+router.get('/template', authenticateToken, requireTrustedAdmin, (req, res) => {
   res.json({
     server: {
       name: 'Volt',
@@ -396,7 +457,7 @@ router.get('/template', (req, res) => {
 })
 
 // Get config metadata/info
-router.get('/info', (req, res) => {
+router.get('/info', authenticateToken, requireTrustedAdmin, (req, res) => {
   res.json({
     configPath: path.join(__dirname, '..', 'config.json'),
     configExists: fs.existsSync(path.join(__dirname, '..', 'config.json')),
@@ -497,8 +558,8 @@ router.get('/issues', authenticateToken, requireOwner, async (req, res) => {
 
 router.get('/logs', authenticateToken, requireOwner, async (req, res) => {
   try {
-    const lines = Number.parseInt(req.query.lines, 10) || 200
-    const maxFiles = Number.parseInt(req.query.maxFiles, 10) || 6
+    const lines = parseBoundedInt(req.query.lines, 200, { min: 10, max: 2000 })
+    const maxFiles = parseBoundedInt(req.query.maxFiles, 6, { min: 1, max: 20 })
     const files = []
 
     if (fs.existsSync(LOGS_DIR)) {

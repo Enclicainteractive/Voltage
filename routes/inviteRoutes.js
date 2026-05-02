@@ -4,7 +4,6 @@ import { FILES, channelService, inviteService, serverService, saveData } from '.
 import { InviteEncoder, parseCrossHostInvite, createCrossHostInvite } from '../utils/inviteEncoder.js'
 import { federationService } from '../services/federationService.js'
 import { getSocketIOInstance } from '../services/socketService.js'
-import transactionService from '../services/transactionService.js'
 import lockService from '../services/lockService.js'
 import axios from 'axios'
 import config from '../config/config.js'
@@ -27,6 +26,109 @@ const resolveUserAvatar = (userId, profile = null) => {
 }
 
 const router = express.Router()
+const LOCAL_INVITE_CODE_RE = /^[A-Z0-9]{4,64}$/
+
+const normalizeLocalInviteCode = (value) => {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().toUpperCase()
+  if (!LOCAL_INVITE_CODE_RE.test(normalized)) return null
+  return normalized
+}
+
+const getInviteStateError = (invite) => {
+  if (!invite || typeof invite !== 'object') return 'Invite not found'
+  if (invite.expiresAt && new Date(invite.expiresAt) < new Date()) {
+    return 'Invite expired'
+  }
+  if (invite.maxUses && invite.uses >= invite.maxUses) {
+    return 'Invite expired'
+  }
+  return null
+}
+
+const isUserBanned = (server, userId) => {
+  if (!server || !userId || !Array.isArray(server.bans)) return false
+  return server.bans.some(entry => entry?.userId === userId)
+}
+
+const buildJoinedMember = (user) => ({
+  id: user.id,
+  username: user.username || user.email,
+  imageUrl: user?.imageUrl || user?.imageurl || user?.avatarUrl || user?.avatarURL || (isExternalImage(user?.avatar) ? user.avatar : null),
+  avatar: resolveUserAvatar(user.id, user),
+  host: user.host || config.getHost(),
+  avatarHost: config.getImageServerUrl(),
+  roles: ['member'],
+  role: 'member',
+  status: 'online',
+  joinedAt: new Date().toISOString()
+})
+
+const mapJoinError = (error) => {
+  switch (error?.message) {
+    case 'INVITE_NOT_FOUND':
+      return { status: 400, error: 'Invite not found' }
+    case 'INVITE_EXPIRED':
+      return { status: 400, error: 'Invite expired' }
+    case 'SERVER_NOT_FOUND':
+      return { status: 404, error: 'Server not found' }
+    case 'INVITE_MISMATCH':
+      return { status: 403, error: 'Invite/server mismatch' }
+    case 'USER_BANNED':
+      return { status: 403, error: 'You are banned from this server' }
+    default:
+      return null
+  }
+}
+
+const joinLocalInviteForUser = async (inviteCode, user) => {
+  let server = null
+  let memberAdded = false
+
+  await lockService.withLock(`invite_join:${inviteCode}`, async () => {
+    const invite = inviteService.getInvite(inviteCode)
+    if (!invite) throw new Error('INVITE_NOT_FOUND')
+    const inviteStateError = getInviteStateError(invite)
+    if (inviteStateError) throw new Error('INVITE_EXPIRED')
+
+    const servers = getServers()
+    const serverIndex = servers.findIndex(item => item.id === invite.serverId)
+    if (serverIndex < 0) throw new Error('SERVER_NOT_FOUND')
+
+    const targetServer = servers[serverIndex]
+    if (isUserBanned(targetServer, user.id)) throw new Error('USER_BANNED')
+
+    const existingMember = targetServer.members?.find(member => member.id === user.id)
+    if (existingMember) {
+      server = targetServer
+      return
+    }
+
+    const consumeResult = await inviteService.useInvite(inviteCode)
+    if (consumeResult?.error) {
+      if (consumeResult.error === 'Invite not found') throw new Error('INVITE_NOT_FOUND')
+      if (consumeResult.error === 'Invite expired') throw new Error('INVITE_EXPIRED')
+      throw new Error('INVITE_EXPIRED')
+    }
+    if (consumeResult.serverId !== targetServer.id) {
+      throw new Error('INVITE_MISMATCH')
+    }
+
+    if (!targetServer.members) targetServer.members = []
+    targetServer.members.push(buildJoinedMember(user))
+    servers[serverIndex] = targetServer
+
+    await saveServers(servers)
+    server = targetServer
+    memberAdded = true
+  }, {
+    ttlMs: 10000,
+    timeoutMs: 5000,
+    maxRetries: 2
+  })
+
+  return { server, memberAdded }
+}
 
 const getServers = () => {
   const data = serverService.getAllServers()
@@ -42,6 +144,29 @@ const saveServers = async (servers) => {
   }
   // Use bulk save instead of iterating through each server
   await saveData(FILES.servers, record)
+}
+
+const getMemberRoles = (server, userId) => {
+  const member = server?.members?.find(item => item?.id === userId)
+  if (!member) return []
+  if (Array.isArray(member.roles)) return member.roles
+  return member.role ? [member.role] : []
+}
+
+const canCreateInvites = (server, userId) => {
+  if (!server || !userId) return false
+  if (server.ownerId === userId) return true
+
+  const roleIds = getMemberRoles(server, userId)
+  return roleIds.some(roleId => {
+    const role = server.roles?.find(item => item?.id === roleId)
+    if (!role?.permissions) return false
+    return role.permissions.includes('all') ||
+      role.permissions.includes('admin') ||
+      role.permissions.includes('manage_server') ||
+      role.permissions.includes('manage_invites') ||
+      role.permissions.includes('create_invites')
+  })
 }
 
 const syncRemoteChannels = (serverId, remoteHost, channels = []) => {
@@ -94,7 +219,12 @@ const fetchRemoteServerSnapshot = async (baseUrl, serverId) => {
 
 // Get invite info (public - for invite page)
 router.get('/:code', optionalAuth, (req, res) => {
-  const invite = inviteService.getInvite(req.params.code)
+  const code = normalizeLocalInviteCode(req.params.code)
+  if (!code) {
+    return res.status(404).json({ error: 'Invalid or expired invite' })
+  }
+
+  const invite = inviteService.getInvite(code)
   
   if (!invite) {
     return res.status(404).json({ error: 'Invalid or expired invite' })
@@ -123,90 +253,43 @@ router.get('/:code', optionalAuth, (req, res) => {
       onlineCount
     },
     inviter: inviter ? {
-      id: inviter.id,
       username: inviter.username,
       imageUrl: inviter?.imageUrl || inviter?.imageurl || inviter?.avatarUrl || inviter?.avatarURL || null,
       avatar: resolveUserAvatar(inviter.id, inviter)
     } : null,
     expiresAt: invite.expiresAt,
-    uses: invite.uses
+    uses: invite.uses,
+    maxUses: invite.maxUses || 0
   })
 })
 
 // Join server via invite
 router.post('/:code/join', authenticateToken, async (req, res) => {
-  const result = await inviteService.useInvite(req.params.code)
-  
-  if (result.error) {
-    return res.status(400).json({ error: result.error })
+  const code = normalizeLocalInviteCode(req.params.code)
+  if (!code) {
+    return res.status(400).json({ error: 'Invalid invite code' })
   }
-  
-  const servers = getServers()
-  const server = servers.find(s => s.id === result.serverId)
-  
-  if (!server) {
-    return res.status(404).json({ error: 'Server not found' })
+
+  let joined
+  try {
+    joined = await joinLocalInviteForUser(code, req.user)
+  } catch (error) {
+    const mapped = mapJoinError(error)
+    if (mapped) {
+      return res.status(mapped.status).json({ error: mapped.error })
+    }
+    console.error('[API] Invite join error:', error)
+    return res.status(500).json({ error: 'Failed to join server' })
   }
-  
-  // Check if already a member
-  const existingMember = server.members?.find(m => m.id === req.user.id)
-  if (existingMember) {
-    return res.json(server) // Already a member, just return server
+
+  const { server, memberAdded } = joined
+
+  if (memberAdded) {
+    console.log(`[API] User ${req.user.username} joined server ${server.name} via invite ${code}`)
   }
-  
-  // Execute server join operation with distributed lock and transaction for maximum data consistency
-  await lockService.withLock(`server_join:${server.id}:${req.user.id}`, async () => {
-    await transactionService.executeTransaction(async (connection) => {
-      // Double-check membership within the lock to prevent duplicate joins
-      const reloadedServers = getServers()
-      const reloadedServer = reloadedServers.find(s => s.id === server.id)
-      const existingMember = reloadedServer.members?.find(m => m.id === req.user.id)
-      
-      if (existingMember) {
-        throw new Error('User already member of server')
-      }
-      
-      // Add user to server
-      if (!reloadedServer.members) reloadedServer.members = []
-      reloadedServer.members.push({
-        id: req.user.id,
-        username: req.user.username || req.user.email,
-        imageUrl: req.user?.imageUrl || req.user?.imageurl || req.user?.avatarUrl || req.user?.avatarURL || (isExternalImage(req.user?.avatar) ? req.user.avatar : null),
-        avatar: resolveUserAvatar(req.user.id, req.user),
-        host: req.user.host || config.getHost(),
-        avatarHost: config.getImageServerUrl(),
-        roles: ['member'],
-        role: 'member',
-        status: 'online',
-        joinedAt: new Date().toISOString()
-      })
-      
-      // Update the servers array with the modified server
-      const serverIndex = reloadedServers.findIndex(s => s.id === server.id)
-      if (serverIndex >= 0) {
-        reloadedServers[serverIndex] = reloadedServer
-        server = reloadedServer // Update reference for later use
-      }
-      
-      // Save server data within transaction
-      await saveServers(reloadedServers)
-      
-      // Update invite usage count (if limited)
-      const updatedInvite = inviteService.getInvite(req.params.code)
-      if (updatedInvite?.maxUses && updatedInvite.maxUses > 0) {
-        await inviteService.updateInviteUsage(req.params.code)
-      }
-      
-      console.log(`[API] User ${req.user.username} joined server ${server.name} via invite ${req.params.code}`)
-    }, { isolationLevel: 'READ COMMITTED' })
-  }, {
-    ttlMs: 10000, // 10 second lock
-    timeoutMs: 5000, // 5 second timeout
-    maxRetries: 2
-  })
   
   // Emit socket events to notify clients about the new member
-  try {
+  if (memberAdded) try {
     const io = getSocketIOInstance()
     if (io) {
       const newMember = server.members[server.members.length - 1]
@@ -233,7 +316,7 @@ router.get('/cross-host/:code', optionalAuth, async (req, res) => {
   try {
     const decoded = parseCrossHostInvite(req.params.code)
     
-    if (!decoded) {
+    if (!decoded || !decoded.key) {
       return res.status(400).json({ error: 'Invalid invite code' })
     }
 
@@ -242,7 +325,7 @@ router.get('/cross-host/:code', optionalAuth, async (req, res) => {
     
     // Local invite encoded as cross-host
     if (serverHost === currentHost) {
-      const invite = inviteService.getInvite(decoded.key || decoded.serverId)
+      const invite = inviteService.getInvite(decoded.key)
       if (!invite) {
         return res.status(404).json({ error: 'Invite not found' })
       }
@@ -260,37 +343,17 @@ router.get('/cross-host/:code', optionalAuth, async (req, res) => {
     // Auto-peer with remote host
     const peerResult = await ensureFederationPeer(baseUrl)
 
-    // Fetch invite info from the remote host
+    // Fetch invite info from the remote host.
     let remoteInvite = null
-    if (decoded.key) {
-      try {
-        const inviteRes = await axios.get(`${baseUrl}/api/invites/${decoded.key}`, { timeout: 8000 })
-        remoteInvite = inviteRes.data
-      } catch { /* remote invite lookup failed, try server info */ }
-    }
-
-    // If no invite code, try to get server info directly
-    if (!remoteInvite && decoded.serverId) {
-      try {
-        remoteInvite = { server: await fetchRemoteServerSnapshot(baseUrl, decoded.serverId) }
-      } catch { /* fallback to local data */ }
-    }
-
-    // Fallback: check local data for a federated copy
-    if (!remoteInvite) {
-      const servers = getServers()
-      const localCopy = servers.find(s => s.id === decoded.serverId)
-      if (localCopy) {
-        remoteInvite = {
-          server: {
-            id: localCopy.id,
-            name: localCopy.name,
-            icon: localCopy.icon,
-            memberCount: localCopy.members?.length || 0,
-            onlineCount: localCopy.members?.filter(m => m.status === 'online').length || 0
-          }
-        }
+    try {
+      const inviteRes = await axios.get(`${baseUrl}/api/invites/${encodeURIComponent(decoded.key)}`, { timeout: 8000 })
+      remoteInvite = inviteRes.data
+      const remoteInviteState = getInviteStateError(remoteInvite)
+      if (remoteInviteState) {
+        return res.status(400).json({ error: remoteInviteState })
       }
+    } catch {
+      remoteInvite = null
     }
 
     if (!remoteInvite) {
@@ -323,7 +386,7 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
   try {
     const decoded = parseCrossHostInvite(req.params.code)
     
-    if (!decoded) {
+    if (!decoded || !decoded.key) {
       return res.status(400).json({ error: 'Invalid invite code' })
     }
 
@@ -331,13 +394,20 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
     const currentHost = config.getHost()
     
     if (serverHost === currentHost) {
-      const result = await inviteService.useInvite(decoded.key || decoded.serverId)
-      if (result.error) {
-        return res.status(400).json({ error: result.error })
+      const localInviteCode = normalizeLocalInviteCode(decoded.key)
+      if (!localInviteCode) {
+        return res.status(400).json({ error: 'Invalid invite code' })
       }
-      const servers = getServers()
-      const server = servers.find(s => s.id === result.serverId)
-      return res.json(server)
+      try {
+        const joined = await joinLocalInviteForUser(localInviteCode, req.user)
+        return res.json(joined.server)
+      } catch (error) {
+        const mapped = mapJoinError(error)
+        if (mapped) {
+          return res.status(mapped.status).json({ error: mapped.error })
+        }
+        throw error
+      }
     }
 
     // Remote host - auto-peer and fetch details
@@ -349,30 +419,28 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
 
     // Try to use the invite on the remote host
     let remoteServer = null
-    if (decoded.key) {
-      try {
-        const inviteRes = await axios.get(`${baseUrl}/api/invites/${decoded.key}`, { timeout: 8000 })
-        remoteServer = inviteRes.data?.server || inviteRes.data
-      } catch { /* fallback */ }
+    let remoteInvite = null
+    try {
+      const inviteRes = await axios.get(`${baseUrl}/api/invites/${encodeURIComponent(decoded.key)}`, { timeout: 8000 })
+      remoteInvite = inviteRes.data
+      const remoteInviteState = getInviteStateError(remoteInvite)
+      if (remoteInviteState) {
+        return res.status(400).json({ error: remoteInviteState })
+      }
+      remoteServer = remoteInvite?.server || remoteInvite
+    } catch {
+      remoteServer = null
     }
 
-    // Fallback to server info endpoint
-    if (!remoteServer && decoded.serverId) {
-      try {
-        remoteServer = await fetchRemoteServerSnapshot(baseUrl, decoded.serverId)
-      } catch { /* fallback to local */ }
-    }
-
-    if (!remoteServer) {
-      const servers = getServers()
-      remoteServer = servers.find(s => s.id === decoded.serverId)
-    }
-
-    if (!remoteServer?.id && !decoded.serverId) {
+    if (!remoteServer?.id) {
       return res.status(404).json({ error: 'Server not found' })
     }
 
-    const serverId = remoteServer?.id || decoded.serverId
+    if (decoded.serverId && remoteServer.id !== decoded.serverId) {
+      return res.status(400).json({ error: 'Invite/server mismatch' })
+    }
+
+    const serverId = remoteServer.id
     const servers = getServers()
     let localServer = servers.find(s => s.id === serverId && s.remoteHost === serverHost)
 
@@ -428,12 +496,30 @@ router.post('/cross-host/:code/join', authenticateToken, async (req, res) => {
 router.get('/cross-host/:code/generate-link', authenticateToken, (req, res) => {
   const decoded = parseCrossHostInvite(req.params.code)
   
-  if (!decoded) {
+  if (!decoded || !decoded.key) {
     return res.status(400).json({ error: 'Invalid invite code' })
   }
 
   const currentHost = config.getHost()
-  const linkData = createCrossHostInvite(decoded.serverId, decoded.channelId, currentHost, req.params.code)
+  if (decoded.host !== currentHost) {
+    return res.status(403).json({ error: 'Can only generate links for local invites' })
+  }
+
+  const invite = inviteService.getInvite(decoded.key)
+  if (!invite || invite.serverId !== decoded.serverId) {
+    return res.status(404).json({ error: 'Invite not found' })
+  }
+
+  const servers = getServers()
+  const server = servers.find(s => s.id === invite.serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+  if (!canCreateInvites(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not authorized to use this invite' })
+  }
+
+  const linkData = createCrossHostInvite(decoded.serverId, decoded.channelId, currentHost, decoded.key)
   
   res.json({
     code: linkData,
@@ -509,8 +595,12 @@ router.get('/resolve-external', optionalAuth, async (req, res) => {
 
     let inviteInfo
     try {
-      const inviteRes = await axios.get(`${baseUrl}/api/invites/${code}`, { timeout: 8000 })
+      const inviteRes = await axios.get(`${baseUrl}/api/invites/${encodeURIComponent(String(code))}`, { timeout: 8000 })
       inviteInfo = inviteRes.data
+      const remoteInviteState = getInviteStateError(inviteInfo)
+      if (remoteInviteState) {
+        return res.status(400).json({ error: remoteInviteState })
+      }
     } catch (err) {
       return res.status(404).json({ error: 'Invite not found on remote host' })
     }
@@ -545,7 +635,11 @@ router.post('/resolve-external/join', authenticateToken, async (req, res) => {
     await ensureFederationPeer(baseUrl)
 
     const servers = getServers()
-    const inviteRes = await axios.get(`${baseUrl}/api/invites/${code}`, { timeout: 8000 })
+    const inviteRes = await axios.get(`${baseUrl}/api/invites/${encodeURIComponent(String(code))}`, { timeout: 8000 })
+    const inviteStateError = getInviteStateError(inviteRes.data)
+    if (inviteStateError) {
+      return res.status(400).json({ error: inviteStateError })
+    }
     const remoteServer = inviteRes.data?.server?.id
       ? await fetchRemoteServerSnapshot(baseUrl, inviteRes.data.server.id).catch(() => inviteRes.data.server)
       : (inviteRes.data?.server || inviteRes.data)

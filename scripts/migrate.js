@@ -31,15 +31,13 @@ const TABLE_TO_JSON_FILE = Object.fromEntries(
 )
 
 const STORAGE_TYPES = {
-  json: { name: 'JSON Files', color: '\x1b[34m' },
+  json: { name: 'JSON Files (import source only)', color: '\x1b[34m' },
   sqlite: { name: 'SQLite', color: '\x1b[36m' },
   mysql: { name: 'MySQL', color: '\x1b[35m' },
   mariadb: { name: 'MariaDB', color: '\x1b[33m' },
   postgres: { name: 'PostgreSQL', color: '\x1b[32m' },
   cockroachdb: { name: 'CockroachDB', color: '\x1b[35m' },
-  mssql: { name: 'SQL Server', color: '\x1b[31m' },
-  mongodb: { name: 'MongoDB', color: '\x1b[32m' },
-  redis: { name: 'Redis', color: '\x1b[31m' }
+  mssql: { name: 'SQL Server', color: '\x1b[31m' }
 }
 
 const RESET = '\x1b[0m'
@@ -379,91 +377,6 @@ class MigrationManager {
     this.log('PostgreSQL migration complete!', 'success')
   }
 
-  async migrateToMongodb(configObj) {
-    this.logHeader('Migrating to MongoDB')
-    
-    let mongo
-    try {
-      mongo = require('mongodb')
-    } catch (e) {
-      throw new Error('mongodb not installed. Run: npm install mongodb')
-    }
-    
-    const uri = configObj.connectionString || 
-      `mongodb://${configObj.host}:${configObj.port || 27017}/${configObj.database}`
-    
-    const client = new mongo.MongoClient(uri)
-    await client.connect()
-    
-    const db = client.db(configObj.database)
-    
-    const tables = Object.keys(this.data)
-    
-    for (const table of tables) {
-      const collection = db.collection(table)
-      await collection.deleteMany({})
-      
-      const records = this.data[table]
-      const bulkOps = []
-      
-      for (const [id, data] of Object.entries(records)) {
-        bulkOps.push({
-          replaceOne: {
-            filter: { _id: id },
-            replacement: { _id: id, ...data },
-            upsert: true
-          }
-        })
-      }
-      
-      if (bulkOps.length > 0) {
-        await collection.bulkWrite(bulkOps)
-      }
-      
-      this.log(`  Migrated ${Object.keys(records).length} records to ${table}`, 'success')
-    }
-    
-    await client.close()
-    this.log('MongoDB migration complete!', 'success')
-  }
-
-  async migrateToRedis(configObj) {
-    this.logHeader('Migrating to Redis')
-    
-    let redis
-    try {
-      redis = require('redis')
-    } catch (e) {
-      throw new Error('redis not installed. Run: npm install redis')
-    }
-    
-    const client = redis.createClient({
-      socket: {
-        host: configObj.host,
-        port: configObj.port || 6379
-      },
-      password: configObj.password || undefined
-    })
-    
-    await client.connect()
-    
-    const prefix = configObj.keyPrefix || 'voltchat:'
-    const tables = Object.keys(this.data)
-    
-    for (const table of tables) {
-      const records = this.data[table]
-      
-      for (const [id, data] of Object.entries(records)) {
-        await client.set(`${prefix}${table}:${id}`, JSON.stringify(data))
-      }
-      
-      this.log(`  Migrated ${Object.keys(records).length} records to ${prefix}${table}:*`, 'success')
-    }
-    
-    await client.quit()
-    this.log('Redis migration complete!', 'success')
-  }
-
   getStorageTypeConfig(type) {
     return config.config.storage?.[type] || {}
   }
@@ -587,27 +500,8 @@ A backup will be created automatically before migration.
         password: await ask('Password: ') || '',
         ssl: (await ask('Use SSL? (y/N): ')).toLowerCase() === 'y'
       }
-    } else if (targetType === 'mongodb') {
-      console.log('\nMongoDB Configuration:')
-      targetConfig = {
-        host: await ask('Host (default: localhost): ') || 'localhost',
-        port: parseInt(await ask('Port (default: 27017): ')) || 27017,
-        database: await ask('Database name: ') || 'voltchat',
-        user: await ask('Username (leave empty for no auth): ') || '',
-        password: await ask('Password: ') || '',
-        authSource: await ask('Auth source (default: admin): ') || 'admin'
-      }
-    } else if (targetType === 'redis') {
-      console.log('\nRedis Configuration:')
-      targetConfig = {
-        host: await ask('Host (default: localhost): ') || 'localhost',
-        port: parseInt(await ask('Port (default: 6379): ')) || 6379,
-        password: await ask('Password (leave empty for no auth): ') || '',
-        db: parseInt(await ask('Database number (default: 0): ')) || 0,
-        keyPrefix: await ask('Key prefix (default: voltchat:): ') || 'voltchat:'
-      }
     }
-    
+
     console.log('\n')
     const confirm = await ask(`Migrate from ${STORAGE_TYPES[currentType].name} to ${STORAGE_TYPES[targetType].name}? (y/N): `)
     
@@ -630,12 +524,8 @@ A backup will be created automatically before migration.
         await this.migrateToMysql(targetConfig)
       } else if (targetType === 'postgres' || targetType === 'cockroachdb') {
         await this.migrateToPostgres(targetConfig)
-      } else if (targetType === 'mongodb') {
-        await this.migrateToMongodb(targetConfig)
-      } else if (targetType === 'redis') {
-        await this.migrateToRedis(targetConfig)
       }
-      
+
       console.log('\n')
       this.logHeader('Migration Complete!')
       console.log('\nTo use the new database, update your config.json:')
@@ -767,38 +657,6 @@ async function main() {
       break
     }
     
-    case 'to-mongodb': {
-      const configObj = {
-        host: args[1] || 'localhost',
-        port: parseInt(args[2]) || 27017,
-        database: args[3] || 'voltchat',
-        user: args[4] || '',
-        password: args[5] || ''
-      }
-      await migration.createBackup(path.dirname(DATA_DIR))
-      await migration.getSourceData()
-      await migration.migrateToMongodb(configObj)
-      console.log('\nConfig to use:')
-      console.log(migration.generateConfigJson('mongodb', configObj))
-      break
-    }
-    
-    case 'to-redis': {
-      const configObj = {
-        host: args[1] || 'localhost',
-        port: parseInt(args[2]) || 6379,
-        password: args[3] || '',
-        db: parseInt(args[4]) || 0,
-        keyPrefix: args[5] || 'voltchat:'
-      }
-      await migration.createBackup(path.dirname(DATA_DIR))
-      await migration.getSourceData()
-      await migration.migrateToRedis(configObj)
-      console.log('\nConfig to use:')
-      console.log(migration.generateConfigJson('redis', configObj))
-      break
-    }
-    
     default: {
       console.log(`
 ${BOLD}VoltChat Database Migration Tool${RESET}
@@ -813,13 +671,11 @@ ${BOLD}Status & Backup:${RESET}
   npm run migrate -- backup [dir]    - Create a backup
 
 ${BOLD}Quick Migration Commands:${RESET}
-  npm run migrate -- to-json [dir]       - Migrate to JSON files
+  npm run migrate -- to-json [dir]       - Export data to JSON files (import path only)
   npm run migrate -- to-sqlite [path]   - Migrate to SQLite
   npm run migrate -- to-mysql            - Migrate to MySQL
   npm run migrate -- to-mariadb          - Migrate to MariaDB
   npm run migrate -- to-postgres        - Migrate to PostgreSQL
-  npm run migrate -- to-mongodb         - Migrate to MongoDB
-  npm run migrate -- to-redis           - Migrate to Redis
 
 ${BOLD}Legacy Commands:${RESET}
   npm run migrate -- json-to-sqlite [sourceDir] [targetDb]

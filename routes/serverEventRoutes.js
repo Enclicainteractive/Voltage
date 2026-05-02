@@ -86,6 +86,11 @@ router.put('/servers/:serverId/events/:eventId', authenticateToken, async (req, 
   if (!server) return res.status(404).json({ error: 'Server not found' })
   if (!canManageEvents(server, req.user.id)) return res.status(403).json({ error: 'Not authorized' })
 
+  const existing = serverEventService.getEvent(req.params.eventId)
+  if (!existing || existing.serverId !== req.params.serverId) {
+    return res.status(404).json({ error: 'Event not found' })
+  }
+
   const updated = await serverEventService.updateEvent(req.params.eventId, {
     title: req.body.title,
     description: req.body.description,
@@ -108,6 +113,11 @@ router.delete('/servers/:serverId/events/:eventId', authenticateToken, async (re
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
   if (!canManageEvents(server, req.user.id)) return res.status(403).json({ error: 'Not authorized' })
+
+  const existing = serverEventService.getEvent(req.params.eventId)
+  if (!existing || existing.serverId !== req.params.serverId) {
+    return res.status(404).json({ error: 'Event not found' })
+  }
 
   const deleted = await serverEventService.deleteEvent(req.params.eventId)
   if (!deleted || deleted.serverId !== req.params.serverId) {

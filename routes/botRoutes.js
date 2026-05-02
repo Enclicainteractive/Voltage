@@ -3,9 +3,84 @@ import zlib from 'zlib'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { botService } from '../services/botService.js'
 import { io } from '../server.js'
-import { channelService, messageService, serverService, userService } from '../services/dataService.js'
+import { adminService, channelService, messageService, serverService, userService } from '../services/dataService.js'
 import { addMessage, loadMessages, pendingMessageWrites, scheduleMessageFlush } from './channelRoutes.js'
 import { getBotSockets } from '../services/socketService.js'
+
+const isServerMember = (server, userId) => (
+  server?.ownerId === userId ||
+  (Array.isArray(server?.members) && server.members.some(m => m.id === userId))
+)
+
+const toOwnerBot = (bot, { includeToken = false } = {}) => {
+  if (!bot || typeof bot !== 'object') return bot
+  const { token, tokenHash, webhookSecret, ...safe } = bot
+  if (includeToken && token) return { ...safe, token }
+  return safe
+}
+
+/**
+ * Strip sensitive fields (owner identity + install footprint + internal config)
+ * from a bot record before returning it in public/listing responses.
+ */
+const toPublicBot = (bot) => {
+  const ownerSafe = toOwnerBot(bot)
+  if (!ownerSafe || typeof ownerSafe !== 'object') return ownerSafe
+  const {
+    ownerId,
+    installedServers,
+    servers,
+    permissions,
+    intents,
+    commands,
+    webhookUrl,
+    updatedAt,
+    lastActive,
+    ...rest
+  } = ownerSafe
+  return rest
+}
+
+/**
+ * Returns true when the requester should be allowed to see the full bot
+ * record (owner identity + installed-server list).
+ */
+const canSeeFullBot = (bot, userId) => {
+  if (!bot || !userId) return false
+  if (bot.ownerId === userId) return true
+  try {
+    if (adminService?.isAdmin && adminService.isAdmin(userId)) return true
+  } catch {
+    // adminService unavailable — treat as non-admin
+  }
+  return false
+}
+
+const canViewBot = (bot, userId) => {
+  if (!bot || !userId) return false
+  if (canSeeFullBot(bot, userId)) return true
+  if (bot.public) return true
+  const installedServerIds = Array.isArray(bot.servers)
+    ? bot.servers
+    : (Array.isArray(bot.installedServers) ? bot.installedServers : [])
+  if (installedServerIds.length === 0) return false
+  const servers = getServers()
+  return installedServerIds.some((serverId) => {
+    const server = servers.find(s => s.id === serverId)
+    return isServerMember(server, userId)
+  })
+}
+
+const botSharesServerWithUser = (bot, userId) => {
+  if (!bot || !userId) return false
+  const installedServerIds = new Set(Array.isArray(bot.servers) ? bot.servers : [])
+  if (installedServerIds.size === 0) return false
+  const servers = getServers()
+  return servers.some((server) => (
+    installedServerIds.has(server.id) &&
+    (server.ownerId === userId || (Array.isArray(server.members) && server.members.some(m => m.id === userId)))
+  ))
+}
 
 /**
  * Get all servers as an array. Uses dataService instead of direct fs access.
@@ -45,6 +120,43 @@ const canManageServer = (server, userId) => {
   return false
 }
 
+const toSafeMember = (member) => ({
+  id: member?.id || null,
+  username: member?.username || null,
+  avatar: member?.avatar || null,
+  roles: Array.isArray(member?.roles) ? member.roles : [],
+  role: member?.role || (Array.isArray(member?.roles) ? member.roles[0] || null : null),
+  status: member?.status || 'offline',
+  isBot: Boolean(member?.isBot)
+})
+
+const resolveBotChannelAccess = (bot, channelId) => {
+  const channel = channelService.getChannel(channelId)
+  if (!channel) return { status: 404, error: 'Channel not found' }
+
+  const serverId = channel.serverId
+  if (!serverId || typeof serverId !== 'string') {
+    return { status: 403, error: 'Channel is not associated with a server' }
+  }
+  if (!Array.isArray(bot?.servers) || !bot.servers.includes(serverId)) {
+    return { status: 403, error: 'Bot not in this server' }
+  }
+  return { channel, serverId }
+}
+
+const getMessageChannelId = (message) => (
+  typeof message?.channelId === 'string' ? message.channelId : null
+)
+
+const ensureMessageInChannel = async (messageId, channelId) => {
+  const message = await messageService.getMessage(messageId)
+  if (!message) return { status: 404, error: 'Message not found' }
+  if (getMessageChannelId(message) !== channelId) {
+    return { status: 403, error: 'Message does not belong to this channel' }
+  }
+  return { message }
+}
+
 const router = express.Router()
 
 // Middleware to authenticate bot token
@@ -67,7 +179,7 @@ const authenticateBot = async (req, res, next) => {
 // List my bots
 router.get('/my', authenticateToken, async (req, res) => {
   const bots = await botService.getBotsByOwner(req.user.id)
-  res.json(bots)
+  res.json((Array.isArray(bots) ? bots : []).map((bot) => toOwnerBot(bot)))
 })
 
 // Create a bot
@@ -81,14 +193,20 @@ router.post('/', authenticateToken, async (req, res) => {
     name, description, avatar, prefix, permissions, intents, webhookUrl, public: req.body.public
   })
 
-  res.json(bot)
+  res.json(toOwnerBot(bot, { includeToken: true }))
 })
 
 // Get bot details
 router.get('/:botId', authenticateToken, async (req, res) => {
   const bot = await botService.getBot(req.params.botId)
   if (!bot) return res.status(404).json({ error: 'Bot not found' })
-  res.json(bot)
+  if (!canViewBot(bot, req.user.id)) {
+    return res.status(403).json({ error: 'Not authorized to view this bot' })
+  }
+  // Only the bot's owner or platform admins see ownerId / installedServers /
+  // servers list. Everyone else gets the public projection.
+  if (canSeeFullBot(bot, req.user.id)) return res.json(toOwnerBot(bot))
+  res.json(toPublicBot(bot))
 })
 
 // Update bot
@@ -96,7 +214,7 @@ router.put('/:botId', authenticateToken, async (req, res) => {
   const result = await botService.updateBot(req.params.botId, req.user.id, req.body)
   if (!result) return res.status(404).json({ error: 'Bot not found' })
   if (result.error) return res.status(403).json(result)
-  res.json(result)
+  res.json(toOwnerBot(result))
 })
 
 // Delete bot
@@ -122,6 +240,9 @@ router.post('/:botId/servers/:serverId', authenticateToken, async (req, res) => 
 
   const bot = await botService.getBot(req.params.botId)
   if (!bot) return res.status(404).json({ error: 'Bot not found' })
+  if (!bot.public && !canSeeFullBot(bot, req.user.id)) {
+    return res.status(403).json({ error: 'Bot is private and cannot be installed by this user' })
+  }
 
   await botService.addBotToServer(req.params.botId, req.params.serverId)
   
@@ -175,19 +296,42 @@ router.delete('/:botId/servers/:serverId', authenticateToken, async (req, res) =
 
 // Get bots in a server
 router.get('/server/:serverId', authenticateToken, async (req, res) => {
+  // Membership gate — only members of this server should be able to enumerate
+  // its installed bots. Mirrors isServerMember() pattern from serverRoutes.js
+  // (intentionally inlined to avoid cross-route coupling).
+  const servers = getServers()
+  const server = servers.find(s => s.id === req.params.serverId)
+  if (!server) return res.status(404).json({ error: 'Server not found' })
+  const isMember = server.ownerId === req.user.id ||
+    (Array.isArray(server.members) && server.members.some(m => m.id === req.user.id))
+  if (!isMember) return res.status(403).json({ error: 'Not a member of this server' })
+
   const bots = await botService.getServerBots(req.params.serverId)
-  res.json(bots)
+  // Strip ownerId / installedServers / servers from each bot unless the
+  // requester is that bot's owner or a platform admin.
+  const sanitized = (Array.isArray(bots) ? bots : []).map((bot) =>
+    canSeeFullBot(bot, req.user.id) ? toOwnerBot(bot) : toPublicBot(bot)
+  )
+  res.json(sanitized)
 })
 
 // Browse public bots
 router.get('/public/browse', authenticateToken, async (req, res) => {
-  res.json(await botService.getAllPublicBots())
+  // Public directory: NEVER leak ownerId or which servers a bot is installed
+  // in. Even a logged-in user iterating this list should not be able to
+  // enumerate server UUIDs through the bot footprint.
+  const bots = await botService.getAllPublicBots()
+  const sanitized = (Array.isArray(bots) ? bots : []).map(toPublicBot)
+  res.json(sanitized)
 })
 
 // Get bot profile (public-safe, for display in UI)
 router.get('/:botId/profile', authenticateToken, async (req, res) => {
   const bot = await botService.getBot(req.params.botId)
   if (!bot) return res.status(404).json({ error: 'Bot not found' })
+  if (!canViewBot(bot, req.user.id)) {
+    return res.status(403).json({ error: 'Not authorized to view this bot profile' })
+  }
   res.json({
     id: bot.id,
     username: bot.name,
@@ -205,6 +349,11 @@ router.get('/:botId/profile', authenticateToken, async (req, res) => {
 
 // Get bot commands
 router.get('/:botId/commands', authenticateToken, async (req, res) => {
+  const bot = await botService.getBot(req.params.botId)
+  if (!bot) return res.status(404).json({ error: 'Bot not found' })
+  if (!canViewBot(bot, req.user.id)) {
+    return res.status(403).json({ error: 'Not authorized to view this bot commands list' })
+  }
   res.json(await botService.getBotCommands(req.params.botId))
 })
 
@@ -227,10 +376,9 @@ router.post('/api/channels/:channelId/messages', authenticateBot, async (req, re
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
   }
 
   const { content, embeds, attachments, ui } = req.body
@@ -268,10 +416,9 @@ router.get('/api/channels/:channelId/messages', authenticateBot, async (req, res
     return res.status(403).json({ error: 'Missing messages:read permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
   }
 
   const limit = parseInt(req.query.limit, 10) || 50
@@ -321,7 +468,7 @@ router.get('/api/servers/:serverId/members', authenticateBot, async (req, res) =
   const server = servers.find(s => s.id === req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
 
-  res.json(server.members || [])
+  res.json((server.members || []).map(toSafeMember))
 })
 
 // Bot: add reaction
@@ -330,10 +477,14 @@ router.post('/api/channels/:channelId/messages/:messageId/reactions', authentica
     return res.status(403).json({ error: 'Missing reactions:add permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
+  }
+
+  const messageAccess = await ensureMessageInChannel(req.params.messageId, req.params.channelId)
+  if (messageAccess.error) {
+    return res.status(messageAccess.status).json({ error: messageAccess.error })
   }
 
   const { emoji } = req.body
@@ -410,20 +561,18 @@ router.get('/api/channels/:channelId', authenticateBot, async (req, res) => {
   if (!await botService.hasPermission(req.bot.id, 'channels:read')) {
     return res.status(403).json({ error: 'Missing channels:read permission' })
   }
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in that server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
   }
-  res.json(channel)
+  res.json(channelAccess.channel)
 })
 
 // Bot: typing indicator (fire-and-forget; clients display it briefly)
 router.post('/api/channels/:channelId/typing', authenticateBot, (req, res) => {
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
   }
 
   io.to(`channel:${req.params.channelId}`).emit('user:typing', {
@@ -444,10 +593,18 @@ router.put('/api/channels/:channelId/messages/:messageId', authenticateBot, asyn
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
+  }
+  const { serverId } = channelAccess
+
+  const messageAccess = await ensureMessageInChannel(req.params.messageId, req.params.channelId)
+  if (messageAccess.error) {
+    return res.status(messageAccess.status).json({ error: messageAccess.error })
+  }
+  if (messageAccess.message.userId !== req.bot.id) {
+    return res.status(403).json({ error: 'Bots can only edit their own messages' })
   }
 
   const { content, embeds, ui } = req.body
@@ -531,10 +688,14 @@ router.delete('/api/channels/:channelId/messages/:messageId', authenticateBot, a
     return res.status(403).json({ error: 'Missing messages:delete permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
+  }
+
+  const messageAccess = await ensureMessageInChannel(req.params.messageId, req.params.channelId)
+  if (messageAccess.error) {
+    return res.status(messageAccess.status).json({ error: messageAccess.error })
   }
 
   await messageService.deleteMessage(req.params.messageId)
@@ -550,10 +711,13 @@ router.post('/api/channels/:channelId/messages/:messageId/pin', authenticateBot,
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
+  }
+  const messageAccess = await ensureMessageInChannel(req.params.messageId, req.params.channelId)
+  if (messageAccess.error) {
+    return res.status(messageAccess.status).json({ error: messageAccess.error })
   }
 
   io.to(`channel:${req.params.channelId}`).emit('message:pinned', {
@@ -569,10 +733,13 @@ router.delete('/api/channels/:channelId/messages/:messageId/pin', authenticateBo
     return res.status(403).json({ error: 'Missing messages:send permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
+  }
+  const messageAccess = await ensureMessageInChannel(req.params.messageId, req.params.channelId)
+  if (messageAccess.error) {
+    return res.status(messageAccess.status).json({ error: messageAccess.error })
   }
 
   io.to(`channel:${req.params.channelId}`).emit('message:unpinned', {
@@ -591,10 +758,13 @@ router.delete('/api/channels/:channelId/messages/:messageId/reactions', authenti
     return res.status(403).json({ error: 'Missing reactions:add permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
+  }
+  const messageAccess = await ensureMessageInChannel(req.params.messageId, req.params.channelId)
+  if (messageAccess.error) {
+    return res.status(messageAccess.status).json({ error: messageAccess.error })
   }
 
   const { emoji } = req.body
@@ -623,7 +793,7 @@ router.get('/api/servers/:serverId/members/:userId', authenticateBot, async (req
   if (!server) return res.status(404).json({ error: 'Server not found' })
   const member = Array.isArray(server.members) ? server.members.find(m => m.id === req.params.userId) : undefined
   if (!member) return res.status(404).json({ error: 'Member not found' })
-  res.json(member)
+  res.json(toSafeMember(member))
 })
 
 router.delete('/api/servers/:serverId/members/:userId', authenticateBot, async (req, res) => {
@@ -750,8 +920,8 @@ router.get('/api/servers/:serverId/roles', authenticateBot, async (req, res) => 
 })
 
 router.post('/api/servers/:serverId/members/:userId/roles/:roleId', authenticateBot, async (req, res) => {
-  if (!await botService.hasPermission(req.bot.id, 'members:manage')) {
-    return res.status(403).json({ error: 'Missing members:manage permission' })
+  if (!await botService.hasPermission(req.bot.id, 'roles:manage')) {
+    return res.status(403).json({ error: 'Missing roles:manage permission' })
   }
   if (!req.bot.servers.includes(req.params.serverId)) {
     return res.status(403).json({ error: 'Bot not in this server' })
@@ -760,6 +930,8 @@ router.post('/api/servers/:serverId/members/:userId/roles/:roleId', authenticate
   const idx = servers.findIndex(s => s.id === req.params.serverId)
   if (idx === -1) return res.status(404).json({ error: 'Server not found' })
 
+  const role = (servers[idx].roles || []).find(r => r.id === req.params.roleId)
+  if (!role) return res.status(404).json({ error: 'Role not found' })
   const member = (servers[idx].members || []).find(m => m.id === req.params.userId)
   if (!member) return res.status(404).json({ error: 'Member not found' })
 
@@ -778,8 +950,8 @@ router.post('/api/servers/:serverId/members/:userId/roles/:roleId', authenticate
 })
 
 router.delete('/api/servers/:serverId/members/:userId/roles/:roleId', authenticateBot, async (req, res) => {
-  if (!await botService.hasPermission(req.bot.id, 'members:manage')) {
-    return res.status(403).json({ error: 'Missing members:manage permission' })
+  if (!await botService.hasPermission(req.bot.id, 'roles:manage')) {
+    return res.status(403).json({ error: 'Missing roles:manage permission' })
   }
   if (!req.bot.servers.includes(req.params.serverId)) {
     return res.status(403).json({ error: 'Bot not in this server' })
@@ -788,6 +960,8 @@ router.delete('/api/servers/:serverId/members/:userId/roles/:roleId', authentica
   const idx = servers.findIndex(s => s.id === req.params.serverId)
   if (idx === -1) return res.status(404).json({ error: 'Server not found' })
 
+  const role = (servers[idx].roles || []).find(r => r.id === req.params.roleId)
+  if (!role) return res.status(404).json({ error: 'Role not found' })
   const member = (servers[idx].members || []).find(m => m.id === req.params.userId)
   if (!member) return res.status(404).json({ error: 'Member not found' })
 
@@ -803,6 +977,9 @@ router.delete('/api/servers/:serverId/members/:userId/roles/:roleId', authentica
 })
 
 router.post('/migrate-to-members', authenticateToken, async (req, res) => {
+  if (!adminService.isAdmin(req.user.id)) {
+    return res.status(403).json({ error: 'Admin privileges required' })
+  }
   const servers = getServers()
   const result = await botService.syncBotsWithServerMembers(servers, saveServers)
   res.json({ success: true, ...result })
@@ -814,10 +991,9 @@ router.post('/api/channels/:channelId/messages/bulk-delete', authenticateBot, as
     return res.status(403).json({ error: 'Missing messages:delete permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
   }
 
   const { messageIds } = req.body
@@ -853,6 +1029,13 @@ router.post('/api/channels/:channelId/messages/bulk-delete', authenticateBot, as
 router.post('/api/dm/:userId', authenticateBot, async (req, res) => {
   if (!await botService.hasPermission(req.bot.id, 'messages:send')) {
     return res.status(403).json({ error: 'Missing messages:send permission' })
+  }
+  if (!botSharesServerWithUser(req.bot, req.params.userId)) {
+    return res.status(403).json({ error: 'Bot does not share a server with this user' })
+  }
+  const targetUser = userService.getUser(req.params.userId)
+  if (!targetUser) {
+    return res.status(404).json({ error: 'User not found' })
   }
 
   const { content, embeds, attachments, ui } = req.body
@@ -918,11 +1101,11 @@ router.delete('/api/channels/:channelId', authenticateBot, async (req, res) => {
     return res.status(403).json({ error: 'Missing channels:manage permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
   }
+  const { serverId } = channelAccess
 
   const servers = getServers()
   const server = servers.find(s => s.id === serverId)
@@ -1008,11 +1191,11 @@ router.patch('/api/channels/:channelId', authenticateBot, async (req, res) => {
     return res.status(403).json({ error: 'Missing channels:manage permission' })
   }
 
-  const channel = channelService.getChannel(req.params.channelId)
-  const serverId = channel?.serverId
-  if (serverId && !req.bot.servers.includes(serverId)) {
-    return res.status(403).json({ error: 'Bot not in this server' })
+  const channelAccess = resolveBotChannelAccess(req.bot, req.params.channelId)
+  if (channelAccess.error) {
+    return res.status(channelAccess.status).json({ error: channelAccess.error })
   }
+  const { serverId } = channelAccess
 
   const servers = getServers()
   const server = servers.find(s => s.id === serverId)
@@ -1121,6 +1304,12 @@ router.patch('/api/servers/:serverId/roles/:roleId', authenticateBot, async (req
 
 // Bot: get user by ID
 router.get('/api/users/:userId', authenticateBot, async (req, res) => {
+  if (!await botService.hasPermission(req.bot.id, 'members:read')) {
+    return res.status(403).json({ error: 'Missing members:read permission' })
+  }
+  if (!botSharesServerWithUser(req.bot, req.params.userId)) {
+    return res.status(403).json({ error: 'Bot does not share a server with this user' })
+  }
   const targetUser = userService.getUser(req.params.userId)
   if (!targetUser) {
     return res.status(404).json({ error: 'User not found' })
@@ -1129,7 +1318,6 @@ router.get('/api/users/:userId', authenticateBot, async (req, res) => {
   res.json({
     id: targetUser.id,
     username: targetUser.username,
-    email: targetUser.email,
     avatar: targetUser.avatar,
     status: targetUser.status || 'offline',
     customStatus: targetUser.customStatus || null,

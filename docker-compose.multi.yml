@@ -14,6 +14,10 @@ services:
       - SERVER_URL=${SERVER_URL}
       - JWT_SECRET=${JWT_SECRET}
       - STORAGE_TYPE=sqlite
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD_not_set}
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./data:/app/data
@@ -44,6 +48,10 @@ services:
       - SERVER_URL=${SERVER_URL}
       - JWT_SECRET=${JWT_SECRET}
       - STORAGE_TYPE=sqlite
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD_not_set}
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./data:/app/data
@@ -74,6 +82,10 @@ services:
       - SERVER_URL=${SERVER_URL}
       - JWT_SECRET=${JWT_SECRET}
       - STORAGE_TYPE=sqlite
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD_not_set}
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./data:/app/data
@@ -104,6 +116,10 @@ services:
       - SERVER_URL=${SERVER_URL}
       - JWT_SECRET=${JWT_SECRET}
       - STORAGE_TYPE=sqlite
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD_not_set}
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./data:/app/data
@@ -134,6 +150,10 @@ services:
       - SERVER_URL=${SERVER_URL}
       - JWT_SECRET=${JWT_SECRET}
       - STORAGE_TYPE=sqlite
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD_not_set}
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./data:/app/data
@@ -155,13 +175,30 @@ services:
     image: redis:7-alpine
     container_name: volt-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD_not_set}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        exec redis-server \
+          --appendonly yes \
+          --maxmemory 256mb \
+          --maxmemory-policy allkeys-lru \
+          --bind 0.0.0.0 \
+          --protected-mode yes \
+          --requirepass "$${REDIS_PASSWORD:?REDIS_PASSWORD_not_set}"
+    # Keep Redis internal to the compose network by default.
+    # Do not add `ports:` unless you explicitly need host access.
+    # If host access is required for local debugging, prefer:
+    # ports:
+    #   - "127.0.0.1:6379:6379"
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 3

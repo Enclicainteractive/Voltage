@@ -2,6 +2,7 @@ import express from 'express'
 import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { authenticateToken } from '../middleware/authMiddleware.js'
+import { adminService } from '../services/dataService.js'
 import { selfVoltService } from '../services/selfVoltService.js'
 import config from '../config/config.js'
 
@@ -22,11 +23,54 @@ const resolveUserAvatar = (userId, profile = null) => {
   return getAvatarUrl(userId)
 }
 
+const isPlatformAdmin = (userId) => {
+  try {
+    return Boolean(adminService?.isAdmin?.(userId))
+  } catch {
+    return false
+  }
+}
+
+const getUserId = (req) => req.user?.id || req.user?.userId || null
+const VOLT_ID_PATTERN = /^[A-Za-z0-9:_-]+$/
+const MAX_VOLT_ID_LENGTH = 128
+
+const normalizeVoltId = (value) => {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > MAX_VOLT_ID_LENGTH) return null
+  if (!VOLT_ID_PATTERN.test(trimmed)) return null
+  return trimmed
+}
+
+const canManageVolt = (volt, userId) => Boolean(
+  volt && userId && (volt.ownerId === userId || isPlatformAdmin(userId))
+)
+
+const toVoltSummary = (volt) => ({
+  id: volt.id,
+  name: volt.name,
+  host: volt.host,
+  url: volt.url,
+  status: volt.status,
+  lastPing: volt.lastPing,
+  serverCount: Array.isArray(volt.servers) ? volt.servers.length : 0,
+  features: volt.features,
+  federationEnabled: Boolean(volt.federationEnabled),
+  version: volt.version,
+  icon: volt.icon || '',
+  description: volt.description || ''
+})
+
 const router = express.Router()
 
 router.get('/', authenticateToken, (req, res) => {
-  const volts = selfVoltService.getAllVoltServers()
-  res.json(volts)
+  if (isPlatformAdmin(req.user.id)) {
+    const volts = selfVoltService.getAllVoltServers()
+    return res.json((Array.isArray(volts) ? volts : []).map(toVoltSummary))
+  }
+  const owned = selfVoltService.getVoltByOwner(req.user.id)
+  return res.json((Array.isArray(owned) ? owned : []).map(toVoltSummary))
 })
 
 router.get('/my', authenticateToken, (req, res) => {
@@ -40,17 +84,13 @@ router.get('/host/:host', authenticateToken, async (req, res) => {
   if (!volt) {
     return res.status(404).json({ error: 'Server not found' })
   }
+
+  if (!canManageVolt(volt, getUserId(req))) {
+    // Hide object existence for unauthorized users to reduce host-based enumeration.
+    return res.status(404).json({ error: 'Server not found' })
+  }
   
-  res.json({
-    id: volt.id,
-    name: volt.name,
-    host: volt.host,
-    url: volt.url,
-    status: volt.status,
-    lastPing: volt.lastPing,
-    serverCount: volt.servers?.length || 0,
-    features: volt.features
-  })
+  res.json(toVoltSummary(volt))
 })
 
 router.get('/:voltId', authenticateToken, (req, res) => {
@@ -60,6 +100,10 @@ router.get('/:voltId', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
+  if (!canManageVolt(volt, req.user.id)) {
+    return res.status(403).json({ error: 'Not authorized to view this server' })
+  }
+
   res.json(volt)
 })
 
@@ -113,7 +157,7 @@ router.put('/:voltId', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
-  if (volt.ownerId !== req.user.id) {
+  if (!canManageVolt(volt, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized to modify this server' })
   }
   
@@ -141,7 +185,7 @@ router.delete('/:voltId', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
-  if (volt.ownerId !== req.user.id) {
+  if (!canManageVolt(volt, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized to delete this server' })
   }
   
@@ -158,7 +202,7 @@ router.post('/:voltId/test', authenticateToken, async (req, res) => {
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
-  if (volt.ownerId !== req.user.id) {
+  if (!canManageVolt(volt, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
   
@@ -192,7 +236,7 @@ router.post('/:voltId/register-mainline', authenticateToken, async (req, res) =>
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
-  if (volt.ownerId !== req.user.id) {
+  if (!canManageVolt(volt, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
   
@@ -262,6 +306,10 @@ router.get('/:voltId/servers', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
+  if (!canManageVolt(volt, req.user.id)) {
+    return res.status(403).json({ error: 'Not authorized to view this server list' })
+  }
+
   res.json(volt.servers || [])
 })
 
@@ -273,7 +321,7 @@ router.post('/:voltId/servers', authenticateToken, async (req, res) => {
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
-  if (volt.ownerId !== req.user.id) {
+  if (!canManageVolt(volt, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
   
@@ -308,7 +356,7 @@ router.post('/:voltId/invite', authenticateToken, (req, res) => {
     return res.status(404).json({ error: 'Self-Volt server not found' })
   }
   
-  if (volt.ownerId !== req.user.id) {
+  if (!canManageVolt(volt, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
   
@@ -328,22 +376,46 @@ router.post('/:voltId/invite', authenticateToken, (req, res) => {
 
 router.post('/generate-key', authenticateToken, (req, res) => {
   const { voltId, permissions, expiresAt } = req.body
+  const userId = getUserId(req)
+  const safeVoltId = normalizeVoltId(voltId)
+
+  if (!safeVoltId) {
+    return res.status(400).json({ error: 'Valid voltId is required' })
+  }
+
+  const volt = selfVoltService.getVoltServer(safeVoltId)
+  if (!volt) {
+    return res.status(404).json({ error: 'Self-Volt server not found' })
+  }
+  if (!canManageVolt(volt, userId)) {
+    return res.status(403).json({ error: 'Not authorized to create keys for this server' })
+  }
+
+  if (permissions !== undefined && !Array.isArray(permissions)) {
+    return res.status(400).json({ error: 'permissions must be an array of strings' })
+  }
+  const normalizedPermissions = Array.isArray(permissions)
+    ? permissions.filter(permission => typeof permission === 'string' && permission.trim().length > 0)
+    : null
+  if (Array.isArray(permissions) && normalizedPermissions.length !== permissions.length) {
+    return res.status(400).json({ error: 'permissions must contain only non-empty strings' })
+  }
   
   const apiKey = crypto.randomBytes(32).toString('hex')
   const keyId = `sv_${Date.now()}`
   
-  selfVoltService.generateApiKey(req.user.id, {
+  selfVoltService.generateApiKey(userId, {
     keyId,
     apiKey,
-    voltId,
-    permissions: permissions || ['servers:read', 'users:read'],
+    voltId: safeVoltId,
+    permissions: normalizedPermissions || ['servers:read', 'users:read'],
     expiresAt
   })
   
   res.json({
     keyId,
     apiKey,
-    permissions: permissions || ['servers:read', 'users:read'],
+    permissions: normalizedPermissions || ['servers:read', 'users:read'],
     expiresAt,
     message: 'Store this API key securely - it will not be shown again'
   })
@@ -371,6 +443,10 @@ router.post('/validate-key', (req, res) => {
   if (!apiKey) {
     return res.status(400).json({ error: 'API key required' })
   }
+
+  if (requiredPermissions !== undefined && !Array.isArray(requiredPermissions)) {
+    return res.status(400).json({ error: 'requiredPermissions must be an array of permission strings' })
+  }
   
   const validated = selfVoltService.validateApiKey(apiKey)
   
@@ -378,7 +454,7 @@ router.post('/validate-key', (req, res) => {
     return res.status(401).json({ valid: false, error: 'Invalid or expired API key' })
   }
   
-  if (requiredPermissions?.length) {
+  if (Array.isArray(requiredPermissions) && requiredPermissions.length > 0) {
     const hasPermission = requiredPermissions.every(p => 
       validated.permissions?.includes(p)
     )
@@ -390,9 +466,9 @@ router.post('/validate-key', (req, res) => {
   
   res.json({ 
     valid: true, 
-    userId: validated.userId,
     voltId: validated.voltId,
-    permissions: validated.permissions
+    permissions: validated.permissions,
+    expiresAt: validated.expiresAt || null
   })
 })
 

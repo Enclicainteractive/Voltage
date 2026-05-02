@@ -174,6 +174,98 @@ const DISCORD_PERMISSION_MAP = {
   0x100000000000: 'view_server_insights',
 }
 
+const SERVER_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
+const DISCORD_TEMPLATE_CODE_RE = /^[A-Za-z0-9_-]{2,128}$/
+const DISCORD_TEMPLATE_HOSTS = new Set(['discord.new', 'discord.com', 'www.discord.com'])
+
+const getServerMembers = (server) => {
+  if (Array.isArray(server?.members)) return server.members
+  if (server?.members && typeof server.members === 'object') return Object.values(server.members)
+  return []
+}
+
+const getMemberRoleIds = (member) => {
+  if (!member) return []
+  if (Array.isArray(member.roles)) return member.roles
+  if (member.role) return [member.role]
+  return []
+}
+
+const canManageImportTargetServer = (server, userId) => {
+  if (!server || !userId) return false
+  if (server.ownerId === userId) return true
+
+  const member = getServerMembers(server).find(item => item?.id === userId)
+  if (!member) return false
+
+  const roleIds = getMemberRoleIds(member)
+  for (const roleId of roleIds) {
+    const role = server.roles?.find(item => item?.id === roleId)
+    if (role?.permissions?.includes('admin') || role?.permissions?.includes('manage_server')) {
+      return true
+    }
+  }
+
+  return false
+}
+
+const normalizeTargetServerId = (serverId) => {
+  if (serverId === null || serverId === undefined || serverId === '') return null
+  if (typeof serverId !== 'string') return null
+  const trimmed = serverId.trim()
+  return SERVER_ID_RE.test(trimmed) ? trimmed : null
+}
+
+const assertImportTargetAccess = (serverId, userId) => {
+  const normalizedServerId = normalizeTargetServerId(serverId)
+  if (!normalizedServerId) {
+    const err = new Error('Invalid server ID')
+    err.statusCode = 400
+    throw err
+  }
+
+  const existingServer = serverService.getServer(normalizedServerId)
+  if (!existingServer) {
+    const err = new Error('Target server not found')
+    err.statusCode = 404
+    throw err
+  }
+
+  if (!canManageImportTargetServer(existingServer, userId)) {
+    const err = new Error('Insufficient permissions to import into this server')
+    err.statusCode = 403
+    throw err
+  }
+
+  return normalizedServerId
+}
+
+const normalizeDiscordTemplateCode = (input) => {
+  if (typeof input !== 'string') return null
+  const raw = input.trim()
+  if (!raw) return null
+
+  let code = raw
+  try {
+    const parsed = new URL(raw)
+    const host = parsed.hostname.toLowerCase()
+    if (!DISCORD_TEMPLATE_HOSTS.has(host)) return null
+
+    if (host === 'discord.new') {
+      code = parsed.pathname.replace(/^\/+/, '')
+    } else {
+      const match = parsed.pathname.match(/^\/template\/([^/]+)$/)
+      if (!match) return null
+      code = match[1]
+    }
+  } catch {
+    code = raw
+  }
+
+  const trimmedCode = code.trim()
+  return DISCORD_TEMPLATE_CODE_RE.test(trimmedCode) ? trimmedCode : null
+}
+
 const discordPermissionsToVoltage = (discordPermInteger) => {
   const permissions = []
   const permNum = BigInt(discordPermInteger)
@@ -524,15 +616,13 @@ router.post('/discord/template', authenticateToken, async (req, res) => {
     if (!templateCode) {
       return res.status(400).json({ error: 'Template code is required' })
     }
-    
-    // Normalise all Discord template URL formats:
-    //   https://discord.new/<code>
-    //   https://discord.com/template/<code>
-    //   <code>  (bare code)
-    const templateCodeClean = templateCode
-      .replace(/^https?:\/\/discord\.new\//, '')
-      .replace(/^https?:\/\/discord\.com\/template\//, '')
-      .trim()
+
+    const templateCodeClean = normalizeDiscordTemplateCode(templateCode)
+    if (!templateCodeClean) {
+      return res.status(400).json({ error: 'Invalid Discord template code or URL' })
+    }
+
+    const targetServerId = serverId ? assertImportTargetAccess(serverId, req.user.id) : null
     
     console.log(`[Import] Fetching Discord template: ${templateCodeClean}`)
     
@@ -542,9 +632,9 @@ router.post('/discord/template', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Invalid template format' })
     }
     
-    const result = await createDiscordServer(templateData, req.user.id, serverId || null)
+    const result = await createDiscordServer(templateData, req.user.id, targetServerId)
     
-    console.log(`[Import] Successfully imported ${serverId ? 'to existing' : 'new'} server: ${result.server.name}`)
+    console.log(`[Import] Successfully imported ${targetServerId ? 'to existing' : 'new'} server: ${result.server.name}`)
     
     res.json({
       success: true,
@@ -556,7 +646,7 @@ router.post('/discord/template', authenticateToken, async (req, res) => {
     })
   } catch (error) {
     console.error('[Import] Error importing Discord template:', error)
-    res.status(500).json({ error: error.message || 'Failed to import template' })
+    res.status(error.statusCode || 500).json({ error: error.message || 'Failed to import template' })
   }
 })
 
@@ -567,8 +657,9 @@ router.post('/discord/import', authenticateToken, async (req, res) => {
     if (!templateData || !templateData.serialized_source_guild) {
       return res.status(400).json({ error: 'Invalid template data' })
     }
-    
-    const result = await createDiscordServer(templateData, req.user.id, serverId || null)
+
+    const targetServerId = serverId ? assertImportTargetAccess(serverId, req.user.id) : null
+    const result = await createDiscordServer(templateData, req.user.id, targetServerId)
     
     console.log(`[Import] Successfully imported server: ${result.server.name}`)
     
@@ -582,7 +673,7 @@ router.post('/discord/import', authenticateToken, async (req, res) => {
     })
   } catch (error) {
     console.error('[Import] Error importing Discord template:', error)
-    res.status(500).json({ error: error.message || 'Failed to import template' })
+    res.status(error.statusCode || 500).json({ error: error.message || 'Failed to import template' })
   }
 })
 

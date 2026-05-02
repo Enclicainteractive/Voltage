@@ -1,8 +1,12 @@
 import fs from 'fs'
 import path from 'path'
+import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const DEFAULT_JWT_SECRET = 'volt_super_secret_key_change_in_production'
+const DEFAULT_SCALING_NODE_SECRET = 'change_me_scaling_secret'
+const CONFIG_POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
 const DEFAULT_CONFIG = {
   server: {
@@ -23,7 +27,7 @@ const DEFAULT_CONFIG = {
   },
   
   storage: {
-    type: 'json',
+    type: 'sqlite',
     json: {
       dataDir: path.join(__dirname, '..', '..', 'data')
     },
@@ -84,10 +88,12 @@ const DEFAULT_CONFIG = {
       connectionString: null,
       authSource: 'admin'
     },
+    // Redis defaults are intentionally local-only. Keep this on loopback
+    // or a private network address, and never expose Redis directly to the public internet.
     redis: {
-      host: 'localhost',
+      host: '127.0.0.1',
       port: 6379,
-      password: '',
+      password: null,
       db: 0,
       keyPrefix: 'voltchat:'
     }
@@ -134,7 +140,7 @@ const DEFAULT_CONFIG = {
     enabled: true,
     provider: 'memory',
     redis: {
-      host: 'localhost',
+      host: '127.0.0.1',
       port: 6379,
       password: null,
       db: 0
@@ -145,7 +151,7 @@ const DEFAULT_CONFIG = {
     enabled: false,
     provider: 'memory',
     redis: {
-      host: 'localhost',
+      host: '127.0.0.1',
       port: 6379,
       password: null,
       db: 1
@@ -180,9 +186,10 @@ const DEFAULT_CONFIG = {
   },
   
   security: {
-    jwtSecret: process.env.JWT_SECRET || 'volt_super_secret_key_change_in_production',
+    jwtSecret: process.env.JWT_SECRET || null,
     jwtExpiry: '7d',
     bcryptRounds: 12,
+    trustProxy: process.env.TRUST_PROXY || process.env.VOLT_TRUST_PROXY || 'loopback, linklocal, uniquelocal',
     rateLimit: {
       windowMs: 60000,
       maxRequests: 100
@@ -300,8 +307,10 @@ class Config {
           console.log('[Config] Using default config')
         }
       }
+      this.enforceSecurityRequirements()
     } catch (err) {
       console.error('[Config] Error loading config:', err.message)
+      throw err
     }
     
     this.loaded = true
@@ -335,7 +344,18 @@ class Config {
     }
     
     if (process.env.JWT_SECRET) {
-      envConfig.security = { jwtSecret: process.env.JWT_SECRET }
+      envConfig.security = envConfig.security || {}
+      envConfig.security.jwtSecret = process.env.JWT_SECRET
+    }
+
+    if (process.env.TRUST_PROXY !== undefined || process.env.VOLT_TRUST_PROXY !== undefined) {
+      envConfig.security = envConfig.security || {}
+      envConfig.security.trustProxy = process.env.TRUST_PROXY ?? process.env.VOLT_TRUST_PROXY
+    }
+
+    if (process.env.SCALING_NODE_SECRET || process.env.VOLT_SCALING_NODE_SECRET) {
+      envConfig.scaling = envConfig.scaling || {}
+      envConfig.scaling.nodeSecret = process.env.SCALING_NODE_SECRET || process.env.VOLT_SCALING_NODE_SECRET
     }
     
     if (process.env.ENCLICA_CLIENT_ID) {
@@ -373,7 +393,8 @@ class Config {
 
   mergeDeep(target, source) {
     const result = { ...target }
-    for (const key in source) {
+    for (const key of Object.keys(source || {})) {
+      if (CONFIG_POLLUTION_KEYS.has(key)) continue
       if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
         result[key] = this.mergeDeep(target[key] || {}, source[key])
       } else {
@@ -383,6 +404,43 @@ class Config {
     return result
   }
 
+  enforceSecurityRequirements() {
+    this.config.security = this.config.security || {}
+    this.config.scaling = this.config.scaling || {}
+
+    const nodeEnv = String(process.env.NODE_ENV || '').toLowerCase()
+    const isProduction = nodeEnv === 'production'
+    const jwtSecret = typeof this.config.security.jwtSecret === 'string'
+      ? this.config.security.jwtSecret.trim()
+      : ''
+    const jwtUsesInsecureDefault = jwtSecret === DEFAULT_JWT_SECRET || jwtSecret === 'CHANGE_ME' || jwtSecret === 'CHANGE_ME_IN_PRODUCTION'
+
+    if (!jwtSecret) {
+      if (isProduction) {
+        throw new Error('JWT secret must be configured in production')
+      }
+      // Non-production only: avoid shipping a known static signing key.
+      this.config.security.jwtSecret = crypto.randomBytes(48).toString('hex')
+      console.warn('[Config] Generated ephemeral JWT secret for non-production runtime')
+    } else if (isProduction && (jwtUsesInsecureDefault || jwtSecret.length < 32)) {
+      throw new Error('JWT secret is insecure for production; set a unique secret of at least 32 characters')
+    }
+
+    if (this.config.security.trustProxy === undefined || this.config.security.trustProxy === null || this.config.security.trustProxy === '') {
+      this.config.security.trustProxy = 'loopback, linklocal, uniquelocal'
+    }
+
+    if (this.config.scaling.enabled) {
+      const nodeSecret = typeof this.config.scaling.nodeSecret === 'string'
+        ? this.config.scaling.nodeSecret.trim()
+        : ''
+      const nodeSecretIsPlaceholder = nodeSecret === DEFAULT_SCALING_NODE_SECRET || nodeSecret === 'CHANGE_ME'
+      if (!nodeSecret || nodeSecretIsPlaceholder || (isProduction && nodeSecret.length < 32)) {
+        throw new Error('Scaling nodeSecret is insecure; configure a unique secret before enabling scaling')
+      }
+    }
+  }
+
   reset() {
     this.config = { ...DEFAULT_CONFIG }
     console.log('[Config] Reset to defaults')
@@ -390,7 +448,8 @@ class Config {
 
   save() {
     try {
-      fs.writeFileSync(this.configFilePath, JSON.stringify(this.config, null, 2))
+      fs.writeFileSync(this.configFilePath, JSON.stringify(this.config, null, 2), { mode: 0o600 })
+      fs.chmodSync(this.configFilePath, 0o600)
       console.log('[Config] Saved config to file')
       return true
     } catch (err) {

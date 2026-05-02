@@ -272,6 +272,90 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 dotenv.config()
 config.load()
 
+const LOCAL_DEV_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000']
+const ACTIVE_UPLOAD_CONTENT_EXTENSIONS = new Set([
+  '.html',
+  '.htm',
+  '.svg',
+  '.xml',
+  '.xhtml',
+  '.js',
+  '.mjs'
+])
+
+const normalizeOrigin = (value) => {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null
+    }
+    return `${parsed.protocol}//${parsed.host}`
+  } catch {
+    return null
+  }
+}
+
+const resolveAllowedCorsOrigins = () => {
+  const allowedOrigins = new Set()
+  const addOrigin = (candidate) => {
+    const normalized = normalizeOrigin(candidate)
+    if (normalized) {
+      allowedOrigins.add(normalized)
+    }
+  }
+
+  const configuredOrigins =
+    process.env.CORS_ALLOWED_ORIGINS ||
+    process.env.VOLT_CORS_ALLOWED_ORIGINS ||
+    config.get('security.corsAllowedOrigins')
+
+  if (Array.isArray(configuredOrigins)) {
+    configuredOrigins.forEach(addOrigin)
+  } else if (typeof configuredOrigins === 'string') {
+    configuredOrigins.split(',').forEach(addOrigin)
+  }
+
+  addOrigin(config.getServerUrl())
+
+  if (process.env.NODE_ENV !== 'production') {
+    LOCAL_DEV_ORIGINS.forEach(addOrigin)
+  }
+
+  return Array.from(allowedOrigins)
+}
+
+const resolveTrustProxySetting = () => {
+  const rawTrustProxy = process.env.TRUST_PROXY ?? process.env.VOLT_TRUST_PROXY ?? config.get('security.trustProxy')
+
+  if (typeof rawTrustProxy === 'number' && Number.isInteger(rawTrustProxy) && rawTrustProxy >= 0) {
+    return rawTrustProxy
+  }
+
+  if (typeof rawTrustProxy !== 'string') {
+    return false
+  }
+
+  const normalized = rawTrustProxy.trim().toLowerCase()
+  if (!normalized || normalized === 'false' || normalized === '0' || normalized === 'off' || normalized === 'no') {
+    return false
+  }
+  if (normalized === 'true' || normalized === 'on' || normalized === 'yes') {
+    return 'loopback, linklocal, uniquelocal'
+  }
+  if (/^\d+$/.test(normalized)) {
+    return Number.parseInt(normalized, 10)
+  }
+
+  const trustedSubnets = rawTrustProxy
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  return trustedSubnets.length > 0 ? trustedSubnets : false
+}
+
 const numCPUs = os.cpus().length
 const CLUSTER_MODE = process.env.VOLT_CLUSTER_MODE !== 'false' && !process.env.VOLT_SERVICE
 const VOLT_WORKERS = parseInt(process.env.VOLT_WORKERS || '0', 10)
@@ -431,16 +515,29 @@ await scaleService.init()
 
 const app = express()
 const httpServer = createServer(app)
-app.set('trust proxy', 1)
+// HTTP timeouts to mitigate slowloris / connection-exhaustion DoS.
+// keepAliveTimeout MUST be > the load balancer's idle timeout; headersTimeout
+// MUST be > keepAliveTimeout (per Node docs).
+httpServer.keepAliveTimeout = 65000
+httpServer.headersTimeout = 66000
+httpServer.requestTimeout = 60000
+const trustProxySetting = resolveTrustProxySetting()
+app.set('trust proxy', trustProxySetting)
 
-const serverUrl = config.getServerUrl()
-const corsOrigin = process.env.NODE_ENV === 'production'
-? serverUrl
-: ['http://localhost:3000', 'http://127.0.0.1:3000']
+const allowedCorsOrigins = resolveAllowedCorsOrigins()
+const isCorsOriginAllowed = (origin) => {
+  const normalized = normalizeOrigin(origin)
+  return !!normalized && allowedCorsOrigins.includes(normalized)
+}
+const corsOriginResolver = (origin, callback) => {
+  // Same-origin or non-browser requests may not include Origin and should still work.
+  if (!origin) return callback(null, true)
+  return callback(null, isCorsOriginAllowed(origin))
+}
 
 const io = new Server(httpServer, {
   cors: {
-    origin: corsOrigin,
+    origin: corsOriginResolver,
     credentials: true
   },
   maxHttpBufferSize: 20 * 1024 * 1024, // 20MB — needed for drawing/activity payloads
@@ -570,7 +667,7 @@ app.use((req, res, next) => {
 
 // CORS configuration
 app.use(cors({
-  origin: corsOrigin,
+  origin: corsOriginResolver,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
@@ -583,8 +680,11 @@ app.use('/api/auth', authRateLimit)
 app.use('/api/auth/login', loginRateLimit)
 app.use('/api', apiRateLimit)
 
-app.use(express.json({ limit: '2gb' }))
-app.use(express.urlencoded({ extended: true, limit: '2gb' }))
+// Body-parser limits intentionally small. Genuine large uploads MUST go
+// through a dedicated multipart route (multer) with its own larger limit —
+// they should NOT be sent through express.json/urlencoded.
+app.use(express.json({ limit: '10mb' }))
+app.use(express.urlencoded({ extended: true, limit: '10mb' }))
 
 // Global validation middleware - apply to all routes
 app.use(validationRateLimit)
@@ -618,13 +718,39 @@ app.get('/.well-known/voltchat/mainnet', (req, res) => {
 })
 
 // Serve uploaded files
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+  dotfiles: 'deny',
+  index: false,
+  setHeaders: (res, filePath) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    const ext = path.extname(filePath).toLowerCase()
+    if (ACTIVE_UPLOAD_CONTENT_EXTENSIONS.has(ext)) {
+      // Force download for scriptable content types to reduce stored-XSS risk.
+      res.setHeader('Content-Disposition', 'attachment')
+      res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
+    }
+  }
+}))
 
-// Additional CORS headers for file serving
+// Additional CORS headers for file serving.
+// Previously this echoed `Access-Control-Allow-Origin: *` plus
+// `Cross-Origin-Resource-Policy: cross-origin`, which made every uploaded
+// file fully readable from any origin on the public web. We now restrict to
+// the configured CORS origin (or, if we can't resolve a single origin
+// reliably, fall back to 'same-origin' rather than wildcard) and drop the
+// permissive CORP header.
 app.use('/api/upload/file', (req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*')
+  let allowedOrigin = 'same-origin'
+  const requestOrigin = req.headers.origin
+  if (typeof requestOrigin === 'string' && isCorsOriginAllowed(requestOrigin)) {
+    allowedOrigin = normalizeOrigin(requestOrigin) || 'same-origin'
+  } else if (allowedCorsOrigins.length > 0) {
+    allowedOrigin = allowedCorsOrigins[0]
+  }
+
+  res.header('Access-Control-Allow-Origin', allowedOrigin)
+  res.header('Vary', 'Origin')
   res.header('Access-Control-Allow-Methods', 'GET')
-  res.header('Cross-Origin-Resource-Policy', 'cross-origin')
   next()
 })
 
@@ -667,6 +793,25 @@ app.use('/api/gifs', gifRoutes)
 app.use('/api/scale', scaleRoutes)
 app.use('/api', automodRoutes)
 app.use('/', healthRoutes) // Health checks accessible without /api prefix
+
+// SECURITY: Suppress route enumeration / API base discovery.
+// Pen-test confirmed `GET /api` (and `GET /`) leaked a route map in some
+// environments. We never want to expose a list of mounted routers — it just
+// helps attackers fingerprint the surface area. In production we return 404
+// for the bare API root; in non-production we return a tiny status payload
+// for developer convenience but still no route listing.
+const apiRootHandler = (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not Found' })
+  }
+  return res.status(200).json({
+    status: 'ok',
+    service: 'voltchat-api',
+    env: process.env.NODE_ENV || 'development'
+  })
+}
+app.get('/api', apiRootHandler)
+app.get('/api/', apiRootHandler)
 
 // 404 handler for unknown routes
 app.use(notFoundHandler)

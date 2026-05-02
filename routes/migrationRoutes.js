@@ -2,6 +2,7 @@ import express from 'express'
 import config from '../config/config.js'
 import dataService from '../services/dataService.js'
 import { distributeFromStorageKv } from '../services/storageService.js'
+import { requireSuperAdmin } from '../middleware/adminAuth.js'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -10,6 +11,33 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const router = express.Router()
 const APP_ROOT = path.join(__dirname, '..', '..')
 const DATA_DIR = path.join(__dirname, '..', '..', 'data')
+
+// Migration endpoints expose storage config and run destructive ops.
+// Gate every route behind super-admin auth.
+router.use(requireSuperAdmin)
+
+const SENSITIVE_CONFIG_KEYS = new Set([
+  'password', 'pass', 'pwd', 'secret',
+  'connectionString', 'connectionstring', 'uri', 'url',
+  'token', 'apiKey', 'apikey', 'authToken', 'authtoken',
+  'user', 'username', 'host', 'hostname', 'port'
+])
+
+const redactStorageConfig = (value) => {
+  if (Array.isArray(value)) return value.map(redactStorageConfig)
+  if (!value || typeof value !== 'object') return value
+  const out = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (SENSITIVE_CONFIG_KEYS.has(key.toLowerCase())) {
+      out[key] = child === undefined || child === null || child === '' ? child : '[REDACTED]'
+    } else if (child && typeof child === 'object') {
+      out[key] = redactStorageConfig(child)
+    } else {
+      out[key] = child
+    }
+  }
+  return out
+}
 
 const JSON_FILE_TO_TABLE = {
   'users.json': 'users',
@@ -121,28 +149,25 @@ const loadOptionalModule = async (moduleName) => {
 }
 
 const STORAGE_TYPES = {
-  json: { name: 'JSON Files', requires: [] },
   sqlite: { name: 'SQLite', requires: ['better-sqlite3'] },
   mysql: { name: 'MySQL', requires: ['mysql2'] },
   mariadb: { name: 'MariaDB', requires: ['mariadb'] },
   postgres: { name: 'PostgreSQL', requires: ['pg'] },
   cockroachdb: { name: 'CockroachDB', requires: ['pg'] },
-  mssql: { name: 'SQL Server', requires: ['mssql'] },
-  mongodb: { name: 'MongoDB', requires: ['mongodb'] },
-  redis: { name: 'Redis', requires: ['redis'] }
+  mssql: { name: 'SQL Server', requires: ['mssql'] }
 }
 
 router.get('/storage-info', (req, res) => {
   try {
     const storageInfo = dataService.getStorageInfo()
     const currentConfig = config.config.storage
-    
+
     res.json({
       success: true,
       current: {
         type: storageInfo.type,
         provider: storageInfo.provider,
-        config: currentConfig
+        config: redactStorageConfig(currentConfig)
       },
       available: STORAGE_TYPES
     })
@@ -461,52 +486,12 @@ router.post('/test-connection', async (req, res) => {
         }
         break
         
-      case 'mongodb':
-        try {
-          const { MongoClient } = await loadOptionalModule('mongodb')
-          const uri = testConfig.connectionString || 
-            `mongodb://${testConfig.host || 'localhost'}:${testConfig.port || 27017}/${testConfig.database || 'voltchat'}`
-          const client = new MongoClient(uri)
-          await client.connect()
-          await client.close()
-          results.success = true
-          results.tested = true
-        } catch (err) {
-          results.error = isDriverMissing(err) ? driverMissingMsg('mongodb') : err.message
-          results.driverMissing = isDriverMissing(err)
-        }
-        break
-        
-      case 'redis':
-        try {
-          const redis = await loadOptionalModule('redis')
-          const client = redis.createClient({
-            host: testConfig.host || 'localhost',
-            port: testConfig.port || 6379,
-            password: testConfig.password || undefined
-          })
-          await client.connect()
-          await client.quit()
-          results.success = true
-          results.tested = true
-        } catch (err) {
-          results.error = isDriverMissing(err) ? driverMissingMsg('redis') : err.message
-          results.driverMissing = isDriverMissing(err)
-        }
-        break
-        
       case 'sqlite':
         results.success = true
         results.tested = true
         results.message = 'SQLite connection test passed (file-based)'
         break
-        
-      case 'json':
-        results.success = true
-        results.tested = true
-        results.message = 'JSON storage always available'
-        break
-        
+
       default:
         results.error = 'Unknown storage type'
     }
@@ -525,14 +510,9 @@ router.get('/check-dependencies', async (req, res) => {
     'mysql2': 'mysql',
     'mariadb': 'mariadb',
     'pg': 'postgres',
-    'mssql': 'mssql',
-    'mongodb': 'mongodb',
-    'redis': 'redis'
+    'mssql': 'mssql'
   }
-  
-  // JSON is always available (no driver needed)
-  dependencies['json'] = { available: true, package: null, note: 'Built-in, no driver required' }
-  
+
   try {
     for (const [dep, storageType] of Object.entries(requiredDeps)) {
       try {

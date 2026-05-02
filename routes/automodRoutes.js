@@ -7,13 +7,24 @@ import { io } from '../server.js'
 
 const router = express.Router()
 
-// Helper to check if user can manage automod
+// Membership gate — used as the first auth check on every :serverId route so
+// that non-members never see (or write to) automod config. Inlined here to
+// avoid cross-route imports; mirrors the pattern in serverRoutes.js.
+const isServerMember = (server, userId) => {
+  if (!server || !userId) return false
+  if (server.ownerId === userId) return true
+  return Array.isArray(server.members) && server.members.some(m => m.id === userId)
+}
+
+// Helper to check if user can manage automod (write side).
+// NOTE: callers must still gate read access with isServerMember() — being
+// a member is required even just to view automod config.
 const canManageAutomod = (server, userId) => {
   if (server.ownerId === userId) return true
-  
+
   const member = server.members?.find(m => m.id === userId)
   if (!member) return false
-  
+
   const roles = member.roles || []
   for (const roleId of roles) {
     const role = server.roles?.find(r => r.id === roleId)
@@ -21,7 +32,7 @@ const canManageAutomod = (server, userId) => {
       return true
     }
   }
-  
+
   return false
 }
 
@@ -36,7 +47,14 @@ const canManageAutomod = (server, userId) => {
 router.get('/servers/:serverId/automod', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -52,7 +70,14 @@ router.get('/servers/:serverId/automod', authenticateToken, async (req, res) => 
 router.put('/servers/:serverId/automod', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -124,7 +149,14 @@ router.post('/servers/:serverId/automod/toggle', authenticateToken, async (req, 
   
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -154,7 +186,14 @@ router.post('/servers/:serverId/automod/toggle', authenticateToken, async (req, 
 router.put('/servers/:serverId/automod/word-filter', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -187,7 +226,14 @@ router.post('/servers/:serverId/automod/word-filter/words', authenticateToken, a
   
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -219,7 +265,14 @@ router.post('/servers/:serverId/automod/word-filter/words', authenticateToken, a
 router.delete('/servers/:serverId/automod/word-filter/words/:word', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -252,7 +305,14 @@ router.delete('/servers/:serverId/automod/word-filter/words/:word', authenticate
 router.put('/servers/:serverId/automod/spam-protection', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -283,7 +343,14 @@ router.put('/servers/:serverId/automod/spam-protection', authenticateToken, asyn
 router.put('/servers/:serverId/automod/link-block', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -316,7 +383,14 @@ router.post('/servers/:serverId/automod/link-block/allowlist', authenticateToken
   
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -347,7 +421,14 @@ router.post('/servers/:serverId/automod/link-block/allowlist', authenticateToken
 router.delete('/servers/:serverId/automod/link-block/allowlist/:domain', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -380,7 +461,14 @@ router.delete('/servers/:serverId/automod/link-block/allowlist/:domain', authent
 router.put('/servers/:serverId/automod/mention-spam', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -411,7 +499,14 @@ router.put('/servers/:serverId/automod/mention-spam', authenticateToken, async (
 router.put('/servers/:serverId/automod/caps-filter', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -442,7 +537,14 @@ router.put('/servers/:serverId/automod/caps-filter', authenticateToken, async (r
 router.put('/servers/:serverId/automod/invite-block', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -486,7 +588,14 @@ router.post('/servers/:serverId/automod/custom-rules', authenticateToken, async 
   
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -527,7 +636,14 @@ router.post('/servers/:serverId/automod/custom-rules', authenticateToken, async 
 router.put('/servers/:serverId/automod/custom-rules/:ruleId', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -574,7 +690,14 @@ router.put('/servers/:serverId/automod/custom-rules/:ruleId', authenticateToken,
 router.delete('/servers/:serverId/automod/custom-rules/:ruleId', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -613,7 +736,14 @@ router.post('/servers/:serverId/automod/exemptions', authenticateToken, async (r
   
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -654,7 +784,14 @@ router.delete('/servers/:serverId/automod/exemptions', authenticateToken, async 
   
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -691,7 +828,14 @@ router.delete('/servers/:serverId/automod/exemptions', authenticateToken, async 
 router.get('/servers/:serverId/automod/warnings/:userId', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -707,7 +851,14 @@ router.get('/servers/:serverId/automod/warnings/:userId', authenticateToken, asy
 router.delete('/servers/:serverId/automod/warnings/:userId', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -734,7 +885,14 @@ router.delete('/servers/:serverId/automod/warnings/:userId', authenticateToken, 
 router.put('/servers/:serverId/automod/warn-settings', authenticateToken, async (req, res) => {
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }
@@ -767,7 +925,14 @@ router.put('/servers/:serverId/automod/log-channel', authenticateToken, async (r
   
   const server = await serverService.getServer(req.params.serverId)
   if (!server) return res.status(404).json({ error: 'Server not found' })
-  
+
+  // Membership gate FIRST: even reading automod config must be limited to
+  // members of the server (prevents IDOR enumeration of automod settings via
+  // server UUID guessing).
+  if (!isServerMember(server, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
+  }
+
   if (!canManageAutomod(server, req.user.id)) {
     return res.status(403).json({ error: 'Not authorized' })
   }

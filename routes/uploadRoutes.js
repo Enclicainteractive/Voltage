@@ -2,16 +2,186 @@ import express from 'express'
 import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
-import { fileURLToPath } from 'url'
 import { v4 as uuidv4 } from 'uuid'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { fileService } from '../services/dataService.js'
 import { cdnService } from '../services/cdnService.js'
 import config from '../config/config.js'
-import { existsLocally, findFileOnPeer, proxyFileFromPeer } from '../services/scaleService.js'
+import { findFileOnPeer, proxyFileFromPeer } from '../services/scaleService.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const UPLOADS_DIR = cdnService.getUploadDir()
+const UPLOADS_ROOT = path.resolve(UPLOADS_DIR)
+const SAFE_FILENAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/
+
+const BLOCKED_UPLOAD_EXTS = new Set([
+  '.html',
+  '.htm',
+  '.svg',
+  '.svgz',
+  '.xhtml',
+  '.xml',
+  '.php',
+  '.php3',
+  '.php4',
+  '.php5',
+  '.php7',
+  '.phtml',
+  '.phar',
+  '.asp',
+  '.aspx',
+  '.asa',
+  '.cer',
+  '.jsp',
+  '.jspx',
+  '.cgi',
+  '.fcgi'
+])
+
+const BLOCKED_UPLOAD_MIMES = new Set([
+  'text/html',
+  'image/svg+xml',
+  'application/xhtml+xml',
+  'text/xml',
+  'application/xml',
+  'application/x-httpd-php',
+  'application/x-php',
+  'text/php'
+])
+
+const ALLOWED_UPLOAD_MIMES = new Set([
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp',
+  'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
+  'audio/mp3', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/aac', 'audio/flac', 'audio/x-m4a',
+  'application/pdf', 'application/zip', 'application/x-zip-compressed',
+  'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'text/plain', 'text/css', 'text/javascript', 'application/json',
+  'application/javascript', 'text/markdown', 'text/x-markdown',
+  'text/csv', 'text/tab-separated-values'
+])
+
+const ALLOWED_UPLOAD_EXTS = new Set([
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.ico',
+  '.mp4', '.webm', '.ogg', '.mov', '.avi', '.mkv',
+  '.mp3', '.wav', '.m4a', '.flac', '.aac', '.wma',
+  '.pdf', '.zip', '.doc', '.docx', '.xls', '.xlsx',
+  '.js', '.jsx', '.ts', '.tsx', '.css', '.scss', '.sass', '.less',
+  '.json', '.yaml', '.yml', '.sql', '.sh', '.bash', '.zsh', '.ps1', '.bat',
+  '.c', '.cpp', '.h', '.hpp', '.cs', '.java', '.py', '.rb', '.go', '.rs', '.swift',
+  '.kt', '.kts', '.pl', '.r', '.m', '.mm', '.scala', '.groovy', '.lua',
+  '.vim', '.dockerfile', '.makefile', '.cmake', '.gradle', '.txt', '.md', '.log',
+  '.csv', '.tsv', '.ini', '.conf', '.cfg', '.env', '.gitignore'
+])
+
+const INLINE_SAFE_EXTS = new Set([
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp',
+  '.mp4', '.webm', '.ogg', '.mov', '.avi', '.mkv',
+  '.mp3', '.wav', '.m4a', '.flac', '.aac',
+  '.pdf'
+])
+
+const CONTENT_TYPE_BY_EXT = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.ico': 'image/x-icon',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.ogg': 'video/ogg',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
+  '.mkv': 'video/x-matroska',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.m4a': 'audio/mp4',
+  '.flac': 'audio/flac',
+  '.aac': 'audio/aac',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.css': 'text/css',
+  '.js': 'application/javascript',
+  '.json': 'application/json',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.tsv': 'text/tab-separated-values'
+}
+
+const normalizeMime = (mimeType) => String(mimeType || '').split(';')[0].trim().toLowerCase()
+const isAdminFlag = (value) => value === true || value === 1 || value === '1' || value === 'true'
+
+const sanitizeFilename = (value) => {
+  const filename = path.basename(String(value || '').trim())
+  if (!filename || filename === '.' || filename === '..') return null
+  if (!SAFE_FILENAME_PATTERN.test(filename)) return null
+  return filename
+}
+
+const isPathWithinUploads = (candidatePath) => {
+  const resolved = path.resolve(candidatePath)
+  return resolved.startsWith(`${UPLOADS_ROOT}${path.sep}`)
+}
+
+const resolveUploadPath = (value) => {
+  const safeFilename = sanitizeFilename(value)
+  if (!safeFilename) return null
+
+  const resolvedPath = path.resolve(UPLOADS_ROOT, safeFilename)
+  if (!isPathWithinUploads(resolvedPath)) return null
+
+  return { safeFilename, resolvedPath }
+}
+
+const resolveLocalFilePath = (fileData) => {
+  const storedPath = typeof fileData?.path === 'string' ? fileData.path.trim() : ''
+  if (storedPath) {
+    const resolvedStoredPath = path.resolve(storedPath)
+    if (isPathWithinUploads(resolvedStoredPath)) {
+      return resolvedStoredPath
+    }
+  }
+
+  const safeFilename = sanitizeFilename(fileData?.filename)
+  if (!safeFilename) return null
+
+  const resolvedFromFilename = path.resolve(UPLOADS_ROOT, safeFilename)
+  return isPathWithinUploads(resolvedFromFilename) ? resolvedFromFilename : null
+}
+
+const buildSafePeerRedirectUrl = (peerBaseUrl, routePath, safeFilename) => {
+  if (!safeFilename) return null
+
+  try {
+    const peerUrl = new URL(String(peerBaseUrl || '').trim())
+    if (!['http:', 'https:'].includes(peerUrl.protocol)) return null
+    if (peerUrl.username || peerUrl.password) return null
+
+    const normalizedPath = peerUrl.pathname.endsWith('/') && peerUrl.pathname !== '/'
+      ? peerUrl.pathname.slice(0, -1)
+      : peerUrl.pathname
+
+    return `${peerUrl.origin}${normalizedPath}${routePath}/${encodeURIComponent(safeFilename)}`
+  } catch {
+    return null
+  }
+}
+
+const applySafeFileHeaders = (res, filename, sizeInBytes) => {
+  const ext = path.extname(filename).toLowerCase()
+  const contentType = CONTENT_TYPE_BY_EXT[ext] || 'application/octet-stream'
+  const dispositionType = INLINE_SAFE_EXTS.has(ext) ? 'inline' : 'attachment'
+  const safeDownloadName = filename.replace(/"/g, '')
+
+  res.setHeader('Content-Type', contentType)
+  res.setHeader('Content-Length', sizeInBytes)
+  res.setHeader('Cache-Control', 'public, max-age=31536000')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
+  res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
+  res.setHeader('Content-Disposition', `${dispositionType}; filename="${safeDownloadName}"`)
+}
 
 // Create uploads directory if it doesn't exist
 if (!fs.existsSync(UPLOADS_DIR)) {
@@ -34,40 +204,19 @@ const storage = multer.diskStorage({
 
 // File filter for allowed MIME types
 const fileFilter = (req, file, cb) => {
-  const allowedMimes = [
-    // Images
-    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml', 'image/bmp',
-    // Videos
-    'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
-    // Audio
-    'audio/mp3', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/aac', 'audio/flac', 'audio/x-m4a',
-    // Documents
-    'application/pdf', 'application/zip', 'application/x-zip-compressed',
-    'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    // Text & Code
-    'text/plain', 'text/html', 'text/css', 'text/javascript', 'application/json',
-    'application/javascript', 'text/markdown', 'text/x-markdown'
-  ]
-  
-  // Also allow files based on common extensions
-  const allowedExts = [
-    '.js', '.jsx', '.ts', '.tsx', '.html', '.htm', '.css', '.scss', '.sass', '.less',
-    '.json', '.xml', '.yaml', '.yml', '.sql', '.sh', '.bash', '.zsh', '.ps1', '.bat',
-    '.c', '.cpp', '.h', '.hpp', '.cs', '.java', '.py', '.rb', '.go', '.rs', '.swift',
-    '.kt', '.kts', '.php', '.pl', '.r', '.m', '.mm', '.scala', '.groovy', '.lua',
-    '.vim', '.dockerfile', '.makefile', '.cmake', '.gradle', '.txt', '.md', '.log',
-    '.csv', '.tsv', '.ini', '.conf', '.cfg', '.env', '.gitignore'
-  ]
-  
-  const ext = path.extname(file.originalname).toLowerCase()
-  
-  if (allowedMimes.includes(file.mimetype) || allowedExts.includes(ext)) {
-    cb(null, true)
-  } else {
-    console.warn(`[Upload] Rejected file type: ${file.mimetype} (${file.originalname})`)
-    cb(null, true) // Allow anyway for now, but log it
+  const ext = path.extname(file.originalname || '').toLowerCase()
+  const mimeType = normalizeMime(file.mimetype)
+
+  if (BLOCKED_UPLOAD_EXTS.has(ext) || BLOCKED_UPLOAD_MIMES.has(mimeType)) {
+    return cb(new Error(`Blocked upload type: ${file.mimetype || ext || 'unknown'}`), false)
   }
+
+  if (!ALLOWED_UPLOAD_EXTS.has(ext) && !ALLOWED_UPLOAD_MIMES.has(mimeType)) {
+    console.warn(`[Upload] Rejected file type: ${file.mimetype} (${file.originalname})`)
+    return cb(new Error(`Unsupported file type: ${file.mimetype || ext || 'unknown'}`), false)
+  }
+
+  return cb(null, true)
 }
 
 const upload = multer({
@@ -88,7 +237,7 @@ const uploadFields = upload.fields([
 const getFileType = (mimetype, filename) => {
   const ext = path.extname(filename).toLowerCase()
   
-  if (mimetype.startsWith('image/') || ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico'].includes(ext)) {
+  if (mimetype.startsWith('image/') || ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.ico'].includes(ext)) {
     return 'image'
   }
   if (mimetype.startsWith('video/') || ['.mp4', '.webm', '.ogg', '.mov', '.avi', '.mkv'].includes(ext)) {
@@ -100,10 +249,10 @@ const getFileType = (mimetype, filename) => {
   
   // Code files
   const codeExts = [
-    '.js', '.jsx', '.ts', '.tsx', '.html', '.htm', '.css', '.scss', '.sass', '.less',
-    '.json', '.xml', '.yaml', '.yml', '.sql', '.sh', '.bash', '.zsh', '.ps1', '.bat',
+    '.js', '.jsx', '.ts', '.tsx', '.css', '.scss', '.sass', '.less',
+    '.json', '.yaml', '.yml', '.sql', '.sh', '.bash', '.zsh', '.ps1', '.bat',
     '.c', '.cpp', '.h', '.hpp', '.cs', '.java', '.py', '.rb', '.go', '.rs', '.swift',
-    '.kt', '.kts', '.php', '.pl', '.r', '.m', '.mm', '.scala', '.groovy', '.lua'
+    '.kt', '.kts', '.pl', '.r', '.m', '.mm', '.scala', '.groovy', '.lua'
   ]
   if (codeExts.includes(ext)) return 'code'
   
@@ -140,8 +289,6 @@ const handleUpload = async (req, res) => {
 
     const attachments = await Promise.all(uploadedFiles.map(async (file) => {
       const fileId = uuidv4()
-      const ext = path.extname(file.originalname)
-      const storedFilename = `${fileId}${ext}`
       const fileType = getFileType(file.mimetype, file.originalname)
       
       const result = await cdnService.upload(file, {
@@ -190,6 +337,10 @@ router.get('/metadata/:fileId', authenticateToken, (req, res) => {
     if (!fileData) {
       return res.status(404).json({ error: 'File not found' })
     }
+
+    if (fileData.uploadedBy !== req.user.id && !isAdminFlag(req.user.isAdmin)) {
+      return res.status(404).json({ error: 'File not found' })
+    }
     
     res.json(fileData)
   } catch (err) {
@@ -201,70 +352,49 @@ router.get('/metadata/:fileId', authenticateToken, (req, res) => {
 // Serve file by ID
 router.get('/file/:filename', async (req, res) => {
   try {
-    const filePath = path.join(UPLOADS_DIR, req.params.filename)
+    const resolved = resolveUploadPath(req.params.filename)
+    if (!resolved) {
+      return res.status(400).json({ error: 'Invalid filename' })
+    }
+    const { safeFilename, resolvedPath: filePath } = resolved
     
     if (!fs.existsSync(filePath)) {
       // ── Scale fallback: ask peer nodes if they have it ────────────────────
       if (config.isScalingEnabled()) {
         const scaleCfg = config.getScalingConfig()
-        const peerNode = await findFileOnPeer(req.params.filename)
+        const peerNode = await findFileOnPeer(safeFilename)
 
         if (peerNode) {
           const mode = scaleCfg.fileResolutionMode || 'proxy'
 
           if (mode === 'redirect') {
-            // 302 redirect straight to the peer (faster, exposes peer URL)
-            const peerUrl = `${peerNode.url}/api/upload/file/${encodeURIComponent(req.params.filename)}`
-            console.log(`[Scale] Redirecting ${req.params.filename} to node ${peerNode.id}`)
+            // Redirect only to validated peer URLs; otherwise fall back to proxy mode.
+            const peerUrl = buildSafePeerRedirectUrl(peerNode.url, '/api/upload/file', safeFilename)
+            if (!peerUrl) {
+              console.warn(`[Scale] Invalid peer redirect URL for node ${peerNode.id}; falling back to proxy`)
+              return await proxyFileFromPeer(peerNode, safeFilename, res)
+            }
+            console.log(`[Scale] Redirecting ${safeFilename} to node ${peerNode.id}`)
             return res.redirect(302, peerUrl)
           } else {
             // Default: proxy the file through this node (hides peer topology)
-            console.log(`[Scale] Proxying ${req.params.filename} from node ${peerNode.id}`)
-            return await proxyFileFromPeer(peerNode, req.params.filename, res)
+            console.log(`[Scale] Proxying ${safeFilename} from node ${peerNode.id}`)
+            return await proxyFileFromPeer(peerNode, safeFilename, res)
           }
         }
       }
       // ─────────────────────────────────────────────────────────────────────
 
-      console.error(`[API] File not found: ${req.params.filename}`)
+      console.error(`[API] File not found: ${safeFilename}`)
       return res.status(404).json({ error: 'File not found' })
     }
     
-    // Get file stats
     const stat = fs.statSync(filePath)
-    const ext = path.extname(req.params.filename).toLowerCase()
-    
-    // Set appropriate content type based on extension
-    const contentTypes = {
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.png': 'image/png',
-      '.gif': 'image/gif',
-      '.webp': 'image/webp',
-      '.svg': 'image/svg+xml',
-      '.bmp': 'image/bmp',
-      '.mp4': 'video/mp4',
-      '.webm': 'video/webm',
-      '.ogg': 'video/ogg',
-      '.mov': 'video/quicktime',
-      '.mp3': 'audio/mpeg',
-      '.wav': 'audio/wav',
-      '.m4a': 'audio/mp4',
-      '.flac': 'audio/flac',
-      '.aac': 'audio/aac',
-      '.pdf': 'application/pdf',
-      '.txt': 'text/plain',
-      '.html': 'text/html',
-      '.css': 'text/css',
-      '.js': 'application/javascript',
-      '.json': 'application/json',
-      '.md': 'text/markdown'
+    if (!stat.isFile()) {
+      return res.status(404).json({ error: 'File not found' })
     }
-    
-    const contentType = contentTypes[ext] || 'application/octet-stream'
-    res.setHeader('Content-Type', contentType)
-    res.setHeader('Content-Length', stat.size)
-    res.setHeader('Cache-Control', 'public, max-age=31536000')
+
+    applySafeFileHeaders(res, safeFilename, stat.size)
     
     res.sendFile(filePath, (err) => {
       if (err) {
@@ -283,25 +413,40 @@ router.get('/file/:filename', async (req, res) => {
 // Legacy endpoint for backward compatibility
 router.get('/:filename', async (req, res) => {
   try {
-    const filePath = path.join(UPLOADS_DIR, req.params.filename)
+    const resolved = resolveUploadPath(req.params.filename)
+    if (!resolved) {
+      return res.status(400).json({ error: 'Invalid filename' })
+    }
+    const { safeFilename, resolvedPath: filePath } = resolved
     
     if (!fs.existsSync(filePath)) {
       // Scale fallback for legacy path too
       if (config.isScalingEnabled()) {
         const scaleCfg = config.getScalingConfig()
-        const peerNode = await findFileOnPeer(req.params.filename)
+        const peerNode = await findFileOnPeer(safeFilename)
         if (peerNode) {
           const mode = scaleCfg.fileResolutionMode || 'proxy'
           if (mode === 'redirect') {
-            return res.redirect(302, `${peerNode.url}/api/upload/${encodeURIComponent(req.params.filename)}`)
+            const peerUrl = buildSafePeerRedirectUrl(peerNode.url, '/api/upload', safeFilename)
+            if (!peerUrl) {
+              console.warn(`[Scale] Invalid peer redirect URL for node ${peerNode.id}; falling back to proxy`)
+              return await proxyFileFromPeer(peerNode, safeFilename, res)
+            }
+            return res.redirect(302, peerUrl)
           } else {
-            return await proxyFileFromPeer(peerNode, req.params.filename, res)
+            return await proxyFileFromPeer(peerNode, safeFilename, res)
           }
         }
       }
       return res.status(404).json({ error: 'File not found' })
     }
-    
+
+    const stat = fs.statSync(filePath)
+    if (!stat.isFile()) {
+      return res.status(404).json({ error: 'File not found' })
+    }
+
+    applySafeFileHeaders(res, safeFilename, stat.size)
     res.sendFile(filePath)
   } catch (err) {
     console.error('[API] File serve error:', err)
@@ -324,13 +469,13 @@ router.delete('/:fileId', authenticateToken, async (req, res) => {
     
     if (fileData.provider !== 'local' && fileData.filename) {
       await cdnService.delete(fileData.filename)
-    } else if (fileData.path) {
-      if (fs.existsSync(fileData.path)) {
-        fs.unlinkSync(fileData.path)
-      }
     } else {
-      const localPath = path.join(UPLOADS_DIR, fileData.filename)
-      if (fs.existsSync(localPath)) {
+      const localPath = resolveLocalFilePath(fileData)
+      if (!localPath) {
+        return res.status(400).json({ error: 'Invalid local file path' })
+      }
+
+      if (fs.existsSync(localPath) && fs.statSync(localPath).isFile()) {
         fs.unlinkSync(localPath)
       }
     }
@@ -363,4 +508,3 @@ router.get('/cdn/status', authenticateToken, (req, res) => {
 })
 
 export default router
-const isAdminFlag = (value) => value === true || value === 1 || value === '1' || value === 'true'

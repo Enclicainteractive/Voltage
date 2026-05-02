@@ -4,12 +4,13 @@ import { v4 as uuidv4 } from 'uuid'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { FILES, userService, messageService, channelService, serverService, reactionService, supportsDirectQuery, directQuery } from '../services/dataService.js'
+import { FILES, userService, messageService, channelService, serverService, reactionService, dmService, fileService, supportsDirectQuery, directQuery } from '../services/dataService.js'
 import { io } from '../server.js'
 import config from '../config/config.js'
 import { normalizeAgeVerification } from '../utils/ageVerificationPolicy.js'
 import { sendPushNotification } from './pushRoutes.js'
 import rateLimiter from '../services/rateLimiter.js'
+import { messageLimiter } from '../middleware/rateLimitMiddleware.js'
 import { validationSchemas, validateRequest, sanitizeInput, validationRateLimit } from '../middleware/builtinValidationMiddleware.js'
 
 const router = express.Router()
@@ -27,6 +28,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PINNED_FILE = FILES.pinnedMessages
 const MESSAGE_FLUSH_INTERVAL_MS = Math.max(10, Number(process.env.VOLT_MESSAGE_FLUSH_INTERVAL_MS || 40))
 const MESSAGE_FLUSH_MAX_PENDING = Math.max(1, Number(process.env.VOLT_MESSAGE_FLUSH_MAX_PENDING || 100))
+const MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,100}$/
+const ATTACHMENT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
+const ATTACHMENT_PROVIDER_RE = /^[A-Za-z0-9._-]{1,64}$/
+const ATTACHMENT_MIMETYPE_RE = /^[A-Za-z0-9][A-Za-z0-9.+-]*\/[A-Za-z0-9][A-Za-z0-9.+-]*$/
+const SAFE_TEXT_SINGLE_LINE_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\r\n]+/g
+const SAFE_TEXT_MULTI_LINE_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]+/g
+const SAFE_ATTACHMENT_TYPES = new Set(['image', 'video', 'audio', 'text', 'file', 'document'])
+const MAX_ATTACHMENT_COUNT = 10
 let messageStoreCache = null
 export let pendingMessageWrites = 0
 let messageFlushTimer = null
@@ -143,6 +152,192 @@ const hasPermission = (server, userId, permission) => {
   return false
 }
 
+const normalizeIdentifier = (value, regex) => {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return regex.test(trimmed) ? trimmed : null
+}
+
+const normalizeText = (value, maxLength = 255, { multiLine = false } = {}) => {
+  if (typeof value !== 'string') return null
+  const normalized = value
+    .replace(multiLine ? SAFE_TEXT_MULTI_LINE_RE : SAFE_TEXT_SINGLE_LINE_RE, ' ')
+    .trim()
+  if (!normalized) return null
+  return normalized.slice(0, maxLength)
+}
+
+const sanitizeMessageContent = (value, maxLength = 4000) => {
+  if (typeof value !== 'string') return ''
+  return value
+    .replace(SAFE_TEXT_MULTI_LINE_RE, '')
+    .replace(/<script[^>]*>.*?<\/script>/gis, '')
+    .replace(/<iframe[^>]*>.*?<\/iframe>/gis, '')
+    .replace(/<object[^>]*>.*?<\/object>/gis, '')
+    .replace(/<embed[^>]*>/gi, '')
+    .replace(/on\w+\s*=\s*["'][^"']*["']/gi, '')
+    .replace(/javascript:/gi, '')
+    .replace(/data:\s*text\/html/gi, '')
+    .trim()
+    .slice(0, maxLength)
+}
+
+const sanitizeAttachmentUrl = (value) => {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > 2048 || /[\r\n]/.test(trimmed)) return null
+  if (trimmed.startsWith('/')) {
+    if (!/^\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*$/.test(trimmed)) return null
+    return trimmed
+  }
+  try {
+    const parsed = new URL(trimmed)
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null
+    return parsed.toString()
+  } catch {
+    return null
+  }
+}
+
+const normalizeSizeBytes = (value) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  if (parsed < 0 || parsed > 1024 * 1024 * 1024 * 2) return null
+  return Math.floor(parsed)
+}
+
+const normalizeRoleIds = (member) => {
+  if (!member) return []
+  const roleIds = Array.isArray(member.roles)
+    ? member.roles
+    : (member.role ? [member.role] : [])
+  const out = roleIds
+    .map(id => typeof id === 'string' ? id.trim() : '')
+    .filter(Boolean)
+  if (!out.includes('member')) out.push('member')
+  return Array.from(new Set(out))
+}
+
+const getChannelPermissionOverwrites = (channel) => {
+  try {
+    return sanitizePermissionOverwriteArray(channel?.permissions, { strict: false })
+  } catch {
+    return []
+  }
+}
+
+const hasChannelPermission = (channel, server, userId, permission) => {
+  if (!channel || !server || !permission) return false
+  if (server.ownerId === userId) return true
+
+  const member = server.members?.find(m => m && m.id === userId)
+  if (!member) return false
+
+  const roleIds = normalizeRoleIds(member)
+  const roles = roleIds
+    .map(roleId => server.roles?.find(r => r.id === roleId))
+    .filter(Boolean)
+
+  if (roles.some(role => role?.permissions?.includes('admin'))) return true
+
+  let allowed = (
+    (roles.length === 0 && (permission === 'view_channels' || permission === 'send_messages')) ||
+    roles.some(role => role?.permissions?.includes(permission))
+  )
+
+  const overwrites = getChannelPermissionOverwrites(channel)
+
+  const everyoneOverride = overwrites.find(item => item?.id === '@everyone' || item?.type === 'everyone')
+  if (everyoneOverride) {
+    if (everyoneOverride.deny?.includes(permission)) allowed = false
+    if (everyoneOverride.allow?.includes(permission)) allowed = true
+  }
+
+  const roleOverwrites = overwrites.filter(item => item?.type === 'role' && roleIds.includes(item.id))
+  if (roleOverwrites.some(item => item?.deny?.includes(permission))) allowed = false
+  if (roleOverwrites.some(item => item?.allow?.includes(permission))) allowed = true
+
+  const memberOverride = overwrites.find(item => item?.id === userId || (item?.type === 'member' && item?.id === userId))
+  if (memberOverride) {
+    if (memberOverride.deny?.includes(permission)) allowed = false
+    if (memberOverride.allow?.includes(permission)) allowed = true
+  }
+
+  return allowed
+}
+
+const extractDmParticipantIds = (channel = {}) => {
+  const participants = new Set()
+  const pushId = (value) => {
+    if (typeof value !== 'string') return
+    const trimmed = value.trim()
+    if (!trimmed) return
+    participants.add(trimmed)
+  }
+
+  if (Array.isArray(channel.participants)) {
+    for (const id of channel.participants) pushId(id)
+  }
+  if (Array.isArray(channel.participantIds)) {
+    for (const id of channel.participantIds) pushId(id)
+  }
+  if (Array.isArray(channel.members)) {
+    for (const member of channel.members) {
+      if (typeof member === 'string') pushId(member)
+      else if (member && typeof member === 'object') pushId(member.id || member.userId)
+    }
+  }
+  if (typeof channel.participantKey === 'string' && channel.participantKey.includes(':')) {
+    for (const id of channel.participantKey.split(':')) pushId(id)
+  }
+  pushId(channel.ownerId)
+  pushId(channel.recipientId)
+  pushId(channel.createdBy)
+  pushId(channel.userId)
+  return participants
+}
+
+const isUserInDmChannel = (channel, channelId, userId) => {
+  const participants = extractDmParticipantIds(channel)
+  if (participants.size > 0) return participants.has(userId)
+
+  if (typeof channelId === 'string' && channelId.startsWith('dm_')) {
+    const conversation = dmService.getConversationForUser(userId, channelId)
+    if (!conversation) return false
+    const conversationParticipants = extractDmParticipantIds(conversation)
+    if (conversationParticipants.size === 0) return false
+    return conversationParticipants.has(userId)
+  }
+
+  return false
+}
+
+const sanitizeMessageMetadata = (value, { depth = 0 } = {}) => {
+  if (depth > 4) return null
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string') return normalizeText(value, 500, { multiLine: true })
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'boolean') return value
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 32)
+      .map(entry => sanitizeMessageMetadata(entry, { depth: depth + 1 }))
+      .filter(entry => entry !== null)
+  }
+  if (typeof value === 'object') {
+    const out = {}
+    for (const [key, entry] of Object.entries(value)) {
+      if (RESERVED_OVERRIDE_KEYS.has(key)) continue
+      const safeKey = normalizeText(key, 64)
+      if (!safeKey) continue
+      const safeValue = sanitizeMessageMetadata(entry, { depth: depth + 1 })
+      if (safeValue !== null) out[safeKey] = safeValue
+    }
+    return Object.keys(out).length > 0 ? out : null
+  }
+  return null
+}
+
 export const findChannelById = (channelId) => {
   const channels = loadChannels()
   
@@ -204,8 +399,10 @@ export const canViewChannel = (channelId, userId) => {
   const channel = findChannelById(channelId)
   if (!channel) return false
   
-  // For DM channels, check if user is part of the conversation
-  if (channel.type === 'dm' || channelId.startsWith('dm_')) return true
+  // For DM channels, enforce conversation membership to prevent BOLA.
+  if (channel.type === 'dm' || channelId.startsWith('dm_')) {
+    return isUserInDmChannel(channel, channelId, userId)
+  }
   
   // For server channels, check server membership
   const serverInfo = getChannelServer(channelId)
@@ -244,25 +441,7 @@ export const canViewChannel = (channelId, userId) => {
     return false
   }
   
-  // Check role permissions for view_channels
-  // Get member's role IDs (can be array or single string)
-  const roleIds = Array.isArray(member.roles) ? member.roles : (member.role ? [member.role] : [])
-  
-  // If member has no roles, allow by default (default member role)
-  if (roleIds.length === 0) return true
-  
-  // Check each role for view_channels permission
-  for (const roleId of roleIds) {
-    const role = server.roles?.find(r => r.id === roleId)
-    if (role?.permissions?.includes('view_channels') || role?.permissions?.includes('admin')) return true
-  }
-  
-  // Check default @member role
-  const defaultMemberRole = server.roles?.find(r => r.id === 'member')
-  if (defaultMemberRole?.permissions?.includes('view_channels')) return true
-  
-  // No role has view_channels permission - deny
-  return false
+  return hasChannelPermission(channel, server, userId, 'view_channels')
 }
 
 const isUserAgeVerified = (userId) => {
@@ -274,16 +453,72 @@ const isUserAgeVerified = (userId) => {
   }
 }
 
-const getChannelDiagnostics = async (channelId, userId) => {
-  return {
-    channelId,
-    userId,
-    timestamp: new Date().toISOString()
-  }
+const clampInteger = (value, defaultValue, { min = 1, max = 100 } = {}) => {
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isFinite(parsed)) return defaultValue
+  return Math.min(max, Math.max(min, parsed))
 }
 
-const buildFixSuggestions = (diagnostics) => {
-  return ['Ensure you are a member of the server containing this channel']
+const sanitizeAttachment = (attachment) => {
+  if (!attachment || typeof attachment !== 'object') return null
+  const safe = {}
+  const id = normalizeIdentifier(attachment.id, ATTACHMENT_ID_RE)
+  if (id) safe.id = id
+
+  const name = normalizeText(attachment.name, 255)
+  if (name) safe.name = name
+
+  const type = typeof attachment.type === 'string' ? attachment.type.trim().toLowerCase() : ''
+  if (SAFE_ATTACHMENT_TYPES.has(type)) safe.type = type
+
+  const mimetype = typeof attachment.mimetype === 'string' ? attachment.mimetype.trim().toLowerCase() : ''
+  if (ATTACHMENT_MIMETYPE_RE.test(mimetype)) safe.mimetype = mimetype
+
+  const sizeBytes = normalizeSizeBytes(attachment.sizeBytes ?? attachment.size)
+  if (sizeBytes !== null) safe.sizeBytes = sizeBytes
+
+  const size = normalizeText(attachment.size, 32)
+  if (size) safe.size = size
+
+  const url = sanitizeAttachmentUrl(attachment.url)
+  if (url) safe.url = url
+
+  const filename = typeof attachment.filename === 'string' ? attachment.filename.trim() : ''
+  if (filename && SAFE_ATTACHMENT_FILENAME_RE.test(filename) && filename === path.basename(filename)) {
+    safe.filename = filename
+  }
+
+  const provider = typeof attachment.provider === 'string' ? attachment.provider.trim().toLowerCase() : ''
+  if (provider && ATTACHMENT_PROVIDER_RE.test(provider)) safe.provider = provider
+
+  if (typeof attachment.cdn === 'boolean') safe.cdn = attachment.cdn
+
+  const uploadedAt = typeof attachment.uploadedAt === 'string' ? attachment.uploadedAt.trim() : ''
+  if (uploadedAt && !Number.isNaN(Date.parse(uploadedAt))) safe.uploadedAt = uploadedAt
+
+  if (!safe.id && !safe.url && !safe.filename) return null
+  return safe
+}
+
+const sanitizeAttachments = (attachments) => {
+  if (!Array.isArray(attachments)) return []
+  return attachments.map(sanitizeAttachment).filter(Boolean)
+}
+
+const sanitizeReplyPreview = (replyTo) => {
+  if (!replyTo) return null
+  if (typeof replyTo === 'string') {
+    return normalizeIdentifier(replyTo, MESSAGE_ID_RE)
+  }
+  if (typeof replyTo !== 'object') return null
+  return {
+    id: normalizeIdentifier(replyTo.id, MESSAGE_ID_RE),
+    userId: normalizeText(replyTo.userId, 64),
+    username: normalizeText(replyTo.username, 128),
+    content: replyTo.deleted ? '' : sanitizeMessageContent(replyTo.content, 4000),
+    timestamp: typeof replyTo.timestamp === 'string' ? replyTo.timestamp : null,
+    deleted: Boolean(replyTo.deleted)
+  }
 }
 
 const hydrateMessageShape = (message) => {
@@ -294,11 +529,11 @@ const hydrateMessageShape = (message) => {
     userId: message.userId,
     username: message.username,
     avatar: message.avatar,
-    content: message.content,
+    content: sanitizeMessageContent(message.content, 4000),
     embeds: message.embeds || [],
-    attachments: message.attachments || [],
+    attachments: sanitizeAttachments(message.attachments),
     ui: message.ui || null,
-    replyTo: message.replyTo,
+    replyTo: sanitizeReplyPreview(message.replyTo),
     timestamp: message.timestamp,
     edited: message.edited,
     editedAt: message.editedAt,
@@ -352,7 +587,11 @@ const loadPinnedMessages = (channelId = null) => {
       if (channelId) {
         // Return flat array for a specific channel
         const rows = directQuery('SELECT * FROM pinned_messages WHERE channelId = ?', [channelId])
-        return rows || []
+        if (!rows) {
+          console.warn(`[ChannelRoutes] No pinned messages found for channel ${channelId}`)
+          return []
+        }
+        return rows
       }
       // Return keyed object { channelId: [rows] } for bulk operations
       const rows = directQuery('SELECT * FROM pinned_messages') || []
@@ -363,12 +602,17 @@ const loadPinnedMessages = (channelId = null) => {
       }
       return grouped
     } catch (err) {
-      console.error('[ChannelRoutes] Error loading pinned from DB:', err.message)
+      console.error('[ChannelRoutes] Error loading pinned from DB:', err.message, { channelId, stack: err.stack })
     }
   }
-  const all = loadData(PINNED_FILE, {})
-  if (channelId) return all[channelId] || []
-  return all
+  try {
+    const all = loadData(PINNED_FILE, {})
+    if (channelId) return all[channelId] || []
+    return all
+  } catch (err) {
+    console.error('[ChannelRoutes] Error loading pinned from file:', err.message, { channelId })
+    return channelId ? [] : {}
+  }
 }
 
 const savePinnedMessages = async (pinned) => {
@@ -464,6 +708,319 @@ export const editMessage = async (channelId, messageId, userId, newContent, opti
 }
 
 const UPLOADS_DIR = path.join(__dirname, '..', 'uploads')
+const UPLOADS_ROOT = path.resolve(UPLOADS_DIR)
+const UPLOADS_ROOT_PREFIX = `${UPLOADS_ROOT}${path.sep}`
+const SAFE_ATTACHMENT_FILENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/
+
+const resolveSafeAttachmentPath = (attachment) => {
+  const filename = typeof attachment?.filename === 'string' ? attachment.filename.trim() : ''
+  if (!filename) return null
+  if (!SAFE_ATTACHMENT_FILENAME_RE.test(filename)) return null
+  if (filename !== path.basename(filename)) return null
+  if (path.isAbsolute(filename)) return null
+
+  const resolved = path.resolve(UPLOADS_DIR, filename)
+  if (!resolved.startsWith(UPLOADS_ROOT_PREFIX)) return null
+
+  // If caller persisted a full path, require it to agree with our computed safe path.
+  if (typeof attachment?.path === 'string' && attachment.path.trim()) {
+    const persistedPath = path.resolve(attachment.path)
+    if (!persistedPath.startsWith(UPLOADS_ROOT_PREFIX)) return null
+    if (path.basename(persistedPath) !== filename) return null
+  }
+
+  return resolved
+}
+
+const deleteAttachmentFromDisk = async (attachment) => {
+  const attachmentId = normalizeIdentifier(attachment?.id, ATTACHMENT_ID_RE)
+  if (!attachmentId) {
+    return
+  }
+
+  let trustedFileRecord = null
+  try {
+    trustedFileRecord = await fileService.getFile(attachmentId)
+  } catch (err) {
+    console.warn(`[Security] Attachment metadata lookup failed for ${attachmentId}:`, err.message)
+    return
+  }
+
+  if (!trustedFileRecord || typeof trustedFileRecord !== 'object') {
+    return
+  }
+
+  // Never trust message-embedded filename/path over file metadata.
+  const safePath = resolveSafeAttachmentPath({
+    filename: trustedFileRecord.filename,
+    path: trustedFileRecord.path || null
+  })
+  if (!safePath) {
+    const unsafeName = typeof attachment?.filename === 'string' ? attachment.filename : '<missing>'
+    console.warn(`[Security] Skipping unsafe attachment path during delete: ${unsafeName}`)
+    return
+  }
+  if (!fs.existsSync(safePath)) return
+  try {
+    fs.unlinkSync(safePath)
+    console.log(`[File] Deleted attachment: ${path.basename(safePath)}`)
+  } catch (err) {
+    console.error(`[File] Failed to delete attachment: ${path.basename(safePath)}`, err)
+  }
+}
+
+const getServerAuthContext = (channelId, userId) => {
+  const serverInfo = getChannelServer(channelId)
+  const servers = loadServers()
+  const server = servers.find(s => s.id === serverInfo?.serverId) || null
+  const isAdmin = server ? hasPermission(server, userId, 'admin') : false
+  const canManageMessages = server ? hasPermission(server, userId, 'manage_messages') : false
+  return { server, isAdmin, canManageMessages }
+}
+
+const canPinOrUnpinMessage = (channelId, userId, message) => {
+  const { isAdmin, canManageMessages } = getServerAuthContext(channelId, userId)
+  const isAuthor = message?.userId === userId
+  return isAdmin || canManageMessages || isAuthor
+}
+
+const getChannelReadAccessResult = (channelId, userId) => {
+  const channel = findChannelById(channelId)
+  if (!channel) {
+    return { allowed: false, status: 404, error: 'Channel not found' }
+  }
+  if (channel?.nsfw && !isUserAgeVerified(userId)) {
+    return { allowed: false, status: 451, error: 'Age verification required for this channel', code: 'AGE_VERIFICATION_REQUIRED' }
+  }
+  if (!canViewChannel(channelId, userId)) {
+    return { allowed: false, status: 403, error: 'Cannot view channel' }
+  }
+  return { allowed: true, channel }
+}
+
+const canSendMessageToChannel = (channelId, userId, channel = null) => {
+  const resolvedChannel = channel || findChannelById(channelId)
+  if (!resolvedChannel) return false
+
+  if (resolvedChannel.type === 'dm' || channelId.startsWith('dm_')) {
+    return isUserInDmChannel(resolvedChannel, channelId, userId)
+  }
+
+  const serverInfo = getChannelServer(channelId)
+  if (!serverInfo?.serverId) return false
+
+  let server = serverService.getServer(serverInfo.serverId)
+  if (!server) {
+    try {
+      const servers = loadData(FILES.servers, {})
+      server = servers[serverInfo.serverId]
+    } catch (err) {
+      console.warn(`[Channel] Failed to reload server ${serverInfo.serverId}:`, err.message)
+      return false
+    }
+  }
+  if (!server) return false
+
+  return hasChannelPermission(resolvedChannel, server, userId, 'send_messages')
+}
+
+const sanitizeInboundAttachments = async (attachments, { userId, serverId = null } = {}) => {
+  if (!Array.isArray(attachments)) return []
+
+  const safeAttachments = []
+  const seenAttachmentIds = new Set()
+
+  for (const rawAttachment of attachments.slice(0, MAX_ATTACHMENT_COUNT)) {
+    if (!rawAttachment || typeof rawAttachment !== 'object') continue
+
+    const claimedId = normalizeIdentifier(rawAttachment.id, ATTACHMENT_ID_RE)
+    let trustedSource = rawAttachment
+    let metadataVerified = false
+
+    if (claimedId) {
+      try {
+        const stored = await fileService.getFile(claimedId)
+        if (stored && typeof stored === 'object') {
+          const uploadedBy = typeof stored.uploadedBy === 'string' ? stored.uploadedBy.trim() : null
+          const storedServerId = typeof stored.serverId === 'string' ? stored.serverId.trim() : null
+
+          if (uploadedBy && uploadedBy !== userId) {
+            console.warn(`[Security] Rejected attachment ${claimedId}: uploadedBy mismatch`)
+            continue
+          }
+          if (serverId && storedServerId && storedServerId !== serverId) {
+            console.warn(`[Security] Rejected attachment ${claimedId}: serverId mismatch`)
+            continue
+          }
+          trustedSource = { ...stored, id: claimedId }
+          metadataVerified = true
+        }
+      } catch (err) {
+        console.warn(`[Security] Attachment metadata lookup failed for ${claimedId}:`, err.message)
+      }
+    }
+
+    const safeAttachment = sanitizeAttachment(trustedSource)
+    if (!safeAttachment) continue
+
+    if (safeAttachment.id) {
+      if (seenAttachmentIds.has(safeAttachment.id)) continue
+      seenAttachmentIds.add(safeAttachment.id)
+    }
+
+    // Unverified client payloads should never carry server-local delete primitives.
+    if (!metadataVerified) {
+      delete safeAttachment.filename
+      delete safeAttachment.provider
+    }
+
+    safeAttachments.push(safeAttachment)
+  }
+
+  return safeAttachments
+}
+
+const safePinnedMessageProjection = (message) => {
+  if (!message) return null
+  const base = hydrateMessageShape(message)
+  if (!base) return null
+  return {
+    ...base,
+    pinnedAt: message?.pinnedAt || null,
+    pinnedBy: message?.pinnedBy || null
+  }
+}
+
+const VALID_CHANNEL_PERMISSIONS = new Set([
+  'admin',
+  'manage_server',
+  'manage_roles',
+  'manage_channels',
+  'manage_messages',
+  'manage_emojis',
+  'manage_events',
+  'manage_webhooks',
+  'kick_members',
+  'ban_members',
+  'mute_members',
+  'deafen_members',
+  'move_members',
+  'priority_speaker',
+  'view_channels',
+  'send_messages',
+  'send_embeds',
+  'attach_files',
+  'add_reactions',
+  'mention_everyone',
+  'manage_threads',
+  'manage_invites',
+  'create_invites',
+  'connect',
+  'speak',
+  'video',
+  'share_screen',
+  'use_voice_activity'
+])
+const CHANNEL_PERMISSION_ALIASES = new Map([
+  ['view_channel', 'view_channels']
+])
+const VALID_OVERWRITE_TYPES = new Set(['role', 'member', 'everyone'])
+const MAX_PERMISSION_OVERWRITES = 200
+const MAX_PERMISSION_ENTRIES_PER_OVERWRITE = 64
+const OVERWRITE_ID_RE = /^[@A-Za-z0-9._:-]{1,128}$/
+const RESERVED_OVERRIDE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+const toCanonicalPermission = (permission) => {
+  if (typeof permission !== 'string') return null
+  const raw = permission.trim().toLowerCase()
+  if (!raw) return null
+  return CHANNEL_PERMISSION_ALIASES.get(raw) || raw
+}
+
+const toBoolLike = (value) => {
+  if (value === true || value === 'true') return true
+  if (value === false || value === 'false') return false
+  return null
+}
+
+const sanitizePermissionVector = (permissions, fieldName) => {
+  if (permissions === undefined || permissions === null) return []
+  if (!Array.isArray(permissions)) {
+    throw new Error(`"${fieldName}" must be an array`)
+  }
+  const out = []
+  const seen = new Set()
+  for (const entry of permissions) {
+    const canonical = toCanonicalPermission(entry)
+    if (!canonical) continue
+    if (!VALID_CHANNEL_PERMISSIONS.has(canonical)) {
+      throw new Error(`Invalid permission value: ${entry}`)
+    }
+    if (!seen.has(canonical)) {
+      seen.add(canonical)
+      out.push(canonical)
+    }
+  }
+  if (out.length > MAX_PERMISSION_ENTRIES_PER_OVERWRITE) {
+    throw new Error('Too many permission entries in overwrite')
+  }
+  return out
+}
+
+const sanitizePermissionOverwrite = (rawOverwrite, explicitId = null) => {
+  if (!rawOverwrite || typeof rawOverwrite !== 'object' || Array.isArray(rawOverwrite)) {
+    throw new Error('Overwrite must be an object')
+  }
+  const id = String(explicitId ?? rawOverwrite.id ?? '').trim()
+  if (!id || RESERVED_OVERRIDE_KEYS.has(id) || !OVERWRITE_ID_RE.test(id)) {
+    throw new Error('Invalid overwrite target id')
+  }
+
+  const requestedType = typeof rawOverwrite.type === 'string' ? rawOverwrite.type.trim().toLowerCase() : ''
+  let type = requestedType || (id === '@everyone' ? 'everyone' : 'role')
+  if (!VALID_OVERWRITE_TYPES.has(type)) {
+    throw new Error(`Invalid overwrite type for target ${id}`)
+  }
+  if (id === '@everyone') type = 'everyone'
+  if (type === 'everyone' && id !== '@everyone') {
+    throw new Error('Only @everyone can use overwrite type "everyone"')
+  }
+
+  let allow = sanitizePermissionVector(rawOverwrite.allow, 'allow')
+  let deny = sanitizePermissionVector(rawOverwrite.deny, 'deny')
+
+  // Support legacy frontend booleans for @everyone.
+  if (id === '@everyone') {
+    const view = toBoolLike(rawOverwrite.view)
+    const sendMessages = toBoolLike(rawOverwrite.sendMessages)
+    if (view === true && !allow.includes('view_channels')) allow = [...allow, 'view_channels']
+    if (view === false && !deny.includes('view_channels')) deny = [...deny, 'view_channels']
+    if (sendMessages === true && !allow.includes('send_messages')) allow = [...allow, 'send_messages']
+    if (sendMessages === false && !deny.includes('send_messages')) deny = [...deny, 'send_messages']
+  }
+
+  // Deny wins if a payload sets the same permission in both arrays.
+  allow = allow.filter(permission => !deny.includes(permission))
+
+  return { id, type, allow, deny }
+}
+
+const sanitizePermissionOverwriteArray = (permissions, { strict = true } = {}) => {
+  if (!Array.isArray(permissions)) return []
+  if (permissions.length > MAX_PERMISSION_OVERWRITES) {
+    throw new Error(`Too many permission overwrites (max ${MAX_PERMISSION_OVERWRITES})`)
+  }
+  const map = new Map()
+  for (const item of permissions) {
+    try {
+      const sanitized = sanitizePermissionOverwrite(item)
+      map.set(sanitized.id, sanitized)
+    } catch (err) {
+      if (strict) throw err
+    }
+  }
+  return Array.from(map.values())
+}
 
 export const deleteMessage = async (channelId, messageId, userId) => {
   const allMessages = loadMessages()
@@ -485,20 +1042,10 @@ export const deleteMessage = async (channelId, messageId, userId) => {
   const message = messages[messageIndex]
   
   // Delete attached files
-  if (message.attachments && message.attachments.length > 0) {
-    message.attachments.forEach(attachment => {
-      if (attachment.filename) {
-        const filePath = path.join(UPLOADS_DIR, attachment.filename)
-        if (fs.existsSync(filePath)) {
-          try {
-            fs.unlinkSync(filePath)
-            console.log(`[File] Deleted attachment: ${attachment.filename}`)
-          } catch (err) {
-            console.error(`[File] Failed to delete attachment: ${attachment.filename}`, err)
-          }
-        }
-      }
-    })
+  if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+    for (const attachment of message.attachments) {
+      await deleteAttachmentFromDisk(attachment)
+    }
   }
   
   messages[messageIndex] = {
@@ -554,15 +1101,10 @@ export const bulkDeleteMessages = async (channelId, messageIds, userId) => {
     }
     const message = messages[idx]
     // Delete attached files
-    if (message.attachments && message.attachments.length > 0) {
-      message.attachments.forEach(attachment => {
-        if (attachment.filename) {
-          const filePath = path.join(UPLOADS_DIR, attachment.filename)
-          if (fs.existsSync(filePath)) {
-            try { fs.unlinkSync(filePath) } catch { /* ignore */ }
-          }
-        }
-      })
+    if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+      for (const attachment of message.attachments) {
+        await deleteAttachmentFromDisk(attachment)
+      }
     }
     messages[idx] = {
       ...message,
@@ -591,6 +1133,10 @@ router.post('/:channelId/messages/bulk-delete', authenticateToken, async (req, r
   const { channelId } = req.params
   const { messageIds } = req.body
 
+  if (!canViewChannel(channelId, req.user.id)) {
+    return res.status(403).json({ error: 'Cannot view channel' })
+  }
+
   if (!Array.isArray(messageIds) || messageIds.length === 0) {
     return res.status(400).json({ error: 'messageIds array is required' })
   }
@@ -617,54 +1163,30 @@ router.post('/:channelId/messages/bulk-delete', authenticateToken, async (req, r
 })
 
 router.get('/:channelId/messages', authenticateToken, async (req, res) => {
-    const { limit = 50, before, after } = req.query
-    const channelInfo = findChannelById(req.params.channelId)
-    if (!channelInfo) {
-        const diagnostics = await getChannelDiagnostics(req.params.channelId, req.user.id)
-        const fixes = buildFixSuggestions(diagnostics)
-        console.warn('[API] Message fetch failed: channel not found', diagnostics)
-        return res.status(404).json({
-          error: 'Channel not found',
-          code: 'CHANNEL_NOT_FOUND',
-          diagnostics,
-          fixes
-        })
+    const { before, after } = req.query
+    const limit = clampInteger(req.query.limit, 50, { min: 1, max: 100 })
+    const access = getChannelReadAccessResult(req.params.channelId, req.user.id)
+    if (!access.allowed) {
+      const payload = { error: access.error }
+      if (access.code) payload.code = access.code
+      return res.status(access.status).json(payload)
     }
-    if (channelInfo?.nsfw && !isUserAgeVerified(req.user.id)) {
-        const diagnostics = await getChannelDiagnostics(req.params.channelId, req.user.id)
-        const fixes = buildFixSuggestions(diagnostics)
-        console.warn('[API] Message fetch blocked by age verification', diagnostics)
-        return res.status(451).json({
-          error: 'Age verification required for this channel',
-          code: 'AGE_VERIFICATION_REQUIRED',
-          diagnostics,
-          fixes
-        })
-    }
-    const canView = await canViewChannel(req.params.channelId, req.user.id)
-    if (!canView) {
-        const diagnostics = await getChannelDiagnostics(req.params.channelId, req.user.id)
-        const fixes = buildFixSuggestions(diagnostics)
-        console.warn('[API] Message fetch denied', diagnostics)
-        return res.status(403).json({
-          error: 'Cannot view channel',
-          code: 'CHANNEL_ACCESS_DENIED',
-          diagnostics,
-          fixes
-        })
-    }
-    let messages = await messageService.getChannelMessages(req.params.channelId, parseInt(limit, 10) || 50, before || null)
+
+    let messages = await messageService.getChannelMessages(req.params.channelId, limit, before || null)
+    messages = Array.isArray(messages)
+      ? messages.filter(message => message?.channelId === req.params.channelId)
+      : []
   
   let filtered = messages
   
   if (before) {
     filtered = messages.filter(m => new Date(m.timestamp) < new Date(before))
-    filtered = filtered.slice(-parseInt(limit))
+    filtered = filtered.slice(-limit)
   } else if (after) {
     filtered = messages.filter(m => new Date(m.timestamp) > new Date(after))
-    filtered = filtered.slice(0, parseInt(limit))
+    filtered = filtered.slice(0, limit)
   } else {
-    filtered = messages.slice(-parseInt(limit))
+    filtered = messages.slice(-limit)
   }
   
   // Load all reactions once and attach to messages (async, queries SQLite/DB directly)
@@ -699,18 +1221,8 @@ router.get('/:channelId/messages', authenticateToken, async (req, res) => {
     }
   })
 
-  console.log(`[API] Get messages for channel ${req.params.channelId} - returned ${hydrated.length} messages`)
-  if (hydrated.length === 0) {
-    const diagnostics = await getChannelDiagnostics(req.params.channelId, req.user.id)
-    const fixes = buildFixSuggestions(diagnostics)
-    console.warn('[API] Message fetch returned empty result', {
-      ...diagnostics,
-      query: { limit: parseInt(limit, 10) || 50, before: before || null, after: after || null },
-      fixes
-    })
-    res.setHeader('X-Volt-Diagnostics', 'empty-channel')
-  }
-  res.json(hydrated)
+	  console.log(`[API] Get messages for channel ${req.params.channelId} - returned ${hydrated.length} messages`)
+	  res.json(hydrated)
 })
 
 router.post('/:channelId/messages', 
@@ -724,6 +1236,17 @@ router.post('/:channelId/messages',
   async (req, res) => {
   const { content, attachments, replyTo, metadata } = req.body
   const channelId = req.params.channelId
+
+  const access = getChannelReadAccessResult(channelId, req.user.id)
+  if (!access.allowed) {
+    const payload = { error: access.error }
+    if (access.code) payload.code = access.code
+    return res.status(access.status).json(payload)
+  }
+
+  if (!canSendMessageToChannel(channelId, req.user.id, access.channel)) {
+    return res.status(403).json({ error: 'Not authorized to send messages in this channel' })
+  }
 
   const rateLimit = await rateLimiter.checkMessageRateLimit(req.user.id)
   if (!rateLimit.allowed) {
@@ -755,7 +1278,7 @@ router.post('/:channelId/messages',
     }
   }
 
-  const channelInfo = findChannelById(channelId)
+  const channelInfo = access.channel
   if (channelInfo?.nsfw && !isUserAgeVerified(req.user.id)) {
     return res.status(451).json({ error: 'Age verification required for this channel', code: 'AGE_VERIFICATION_REQUIRED' })
   }
@@ -791,6 +1314,14 @@ router.post('/:channelId/messages',
   const serverNick = serverId ? (senderProfile?.serverNicks?.[serverId] || null) : null
   // Resolve display name: server nick > display name > username
   const messageUsername = serverNick || req.user.displayName || req.user.username || req.user.email
+  const safeContent = sanitizeMessageContent(content, 4000)
+  const safeReplyTo = normalizeIdentifier(replyTo, MESSAGE_ID_RE)
+  const safeAttachments = await sanitizeInboundAttachments(attachments, { userId: req.user.id, serverId })
+  const safeMetadata = sanitizeMessageMetadata(metadata)
+
+  if (!safeContent && safeAttachments.length === 0) {
+    return res.status(400).json({ error: 'Message content or attachments required' })
+  }
 
   const message = {
     id: uuidv4(),
@@ -799,10 +1330,10 @@ router.post('/:channelId/messages',
     username: messageUsername,
     avatar: req.user.avatar || getAvatarUrl(req.user.id),
     guildTag: senderProfile?.guildTag || null,
-    content,
-    attachments: attachments || [],
-    replyTo: typeof replyTo === 'string' ? replyTo : null,
-    storage: metadata ? { metadata } : {},
+    content: safeContent,
+    attachments: safeAttachments,
+    replyTo: safeReplyTo,
+    storage: safeMetadata ? { metadata: safeMetadata } : {},
     timestamp: new Date().toISOString()
   }
   
@@ -960,38 +1491,69 @@ router.put('/:channelId/move', authenticateToken, async (req, res) => {
 })
 
 router.get('/:channelId/messages/search', authenticateToken, (req, res) => {
-  const { q, limit = 25 } = req.query
-  if (!q || q.trim().length === 0) {
+  const access = getChannelReadAccessResult(req.params.channelId, req.user.id)
+  if (!access.allowed) {
+    const payload = { error: access.error }
+    if (access.code) payload.code = access.code
+    return res.status(access.status).json(payload)
+  }
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : ''
+  if (!q) {
     return res.json([])
   }
+  const limit = clampInteger(req.query.limit, 25, { min: 1, max: 100 })
   
   const allMessages = loadMessages()
   const messages = allMessages[req.params.channelId] || []
-  const query = q.toLowerCase()
+  const query = q.toLowerCase().slice(0, 200)
   
   const results = messages
     .filter(m => {
-      const contentMatch = m.content && m.content.toLowerCase().includes(query)
-      const attachmentMatch = m.attachments && m.attachments.some(a => 
-        a.name && a.name.toLowerCase().includes(query)
+      const contentMatch = typeof m?.content === 'string' && m.content.toLowerCase().includes(query)
+      const attachmentMatch = Array.isArray(m?.attachments) && m.attachments.some(a =>
+        typeof a?.name === 'string' && a.name.toLowerCase().includes(query)
       )
       return contentMatch || attachmentMatch
     })
-    .slice(-parseInt(limit))
+    .slice(-limit)
     .reverse()
+    .map(hydrateMessageShape)
   
   console.log(`[API] Search messages in channel ${req.params.channelId} for "${q}" - found ${results.length} results`)
   res.json(results)
 })
 
-router.get('/:channelId/pins', authenticateToken, (req, res) => {
-  // Pass channelId so the DB path returns a flat array directly
-  const channelPins = loadPinnedMessages(req.params.channelId)
-  res.json(channelPins)
+router.get('/:channelId/pins', authenticateToken, messageLimiter, (req, res) => {
+  try {
+    const access = getChannelReadAccessResult(req.params.channelId, req.user.id)
+    if (!access.allowed) {
+      const payload = { error: access.error }
+      if (access.code) payload.code = access.code
+      return res.status(access.status).json(payload)
+    }
+    // Pass channelId so the DB path returns a flat array directly
+    const channelPins = loadPinnedMessages(req.params.channelId)
+    const pins = (channelPins || []).map(safePinnedMessageProjection).filter(Boolean)
+    res.json(pins)
+  } catch (err) {
+    console.error('[ChannelRoutes] Error in GET /pins:', err.message)
+    res.status(500).json({ error: 'Failed to load pinned messages' })
+  }
 })
 
-router.put('/:channelId/pins/:messageId', authenticateToken, async (req, res) => {
+router.put('/:channelId/pins/:messageId', authenticateToken, messageLimiter, async (req, res) => {
   const { channelId, messageId } = req.params
+  const safeMessageId = normalizeIdentifier(messageId, MESSAGE_ID_RE)
+  if (!safeMessageId) {
+    return res.status(400).json({ error: 'Invalid message ID' })
+  }
+
+  const access = getChannelReadAccessResult(channelId, req.user.id)
+  if (!access.allowed) {
+    const payload = { error: access.error }
+    if (access.code) payload.code = access.code
+    return res.status(access.status).json(payload)
+  }
 
   // Try to find the message in the in-memory store first, then fall back to DB
   let message = null
@@ -1011,6 +1573,15 @@ router.put('/:channelId/pins/:messageId', authenticateToken, async (req, res) =>
 
   if (!message) {
     return res.status(404).json({ error: 'Message not found' })
+  }
+  if (message.channelId && message.channelId !== channelId) {
+    return res.status(404).json({ error: 'Message not found' })
+  }
+  if (message.deleted) {
+    return res.status(400).json({ error: 'Cannot pin deleted message' })
+  }
+  if (!canPinOrUnpinMessage(channelId, req.user.id, message)) {
+    return res.status(403).json({ error: 'Not authorized to pin this message' })
   }
 
   // Load existing pins for this channel (flat array)
@@ -1033,8 +1604,19 @@ router.put('/:channelId/pins/:messageId', authenticateToken, async (req, res) =>
   res.json({ success: true })
 })
 
-router.delete('/:channelId/pins/:messageId', authenticateToken, async (req, res) => {
+router.delete('/:channelId/pins/:messageId', authenticateToken, messageLimiter, async (req, res) => {
   const { channelId, messageId } = req.params
+  const safeMessageId = normalizeIdentifier(messageId, MESSAGE_ID_RE)
+  if (!safeMessageId) {
+    return res.status(400).json({ error: 'Invalid message ID' })
+  }
+
+  const access = getChannelReadAccessResult(channelId, req.user.id)
+  if (!access.allowed) {
+    const payload = { error: access.error }
+    if (access.code) payload.code = access.code
+    return res.status(access.status).json(payload)
+  }
 
   // Load existing pins for this channel (flat array)
   const channelPins = loadPinnedMessages(channelId)
@@ -1045,6 +1627,9 @@ router.delete('/:channelId/pins/:messageId', authenticateToken, async (req, res)
   const index = channelPins.findIndex(p => p.id === messageId)
   if (index === -1) {
     return res.status(404).json({ error: 'Pinned message not found' })
+  }
+  if (!canPinOrUnpinMessage(channelId, req.user.id, channelPins[index])) {
+    return res.status(403).json({ error: 'Not authorized to unpin this message' })
   }
 
   channelPins.splice(index, 1)
@@ -1064,17 +1649,18 @@ router.get('/:channelId/permissions', authenticateToken, (req, res) => {
   const channel = channelService.getChannel(channelId)
   if (!channel) return res.status(404).json({ error: 'Channel not found' })
 
-  // Only server members can view permissions
-  const serverInfo = getChannelServer(channelId)
-  if (serverInfo) {
-    const server = serverService.getServer(serverInfo.serverId)
-    if (server && server.ownerId !== req.user.id) {
-      const member = server.members?.find(m => m && m.id === req.user.id)
-      if (!member) return res.status(403).json({ error: 'Not a member of this server' })
-    }
+  // Only members who can view the channel can view its permissions
+  if (!canViewChannel(channelId, req.user.id)) {
+    return res.status(403).json({ error: 'Not a member of this server' })
   }
 
-  res.json(channel.permissions || [])
+  let safePermissions = []
+  try {
+    safePermissions = sanitizePermissionOverwriteArray(channel.permissions, { strict: false })
+  } catch {
+    safePermissions = []
+  }
+  res.json(safePermissions)
 })
 
 router.put('/:channelId/permissions', authenticateToken, async (req, res) => {
@@ -1095,64 +1681,45 @@ router.put('/:channelId/permissions', authenticateToken, async (req, res) => {
   //   { overrides: { id: { allow, deny } } }    — keyed object (frontend format)
   //   { id, type, allow, deny }                 — single overwrite upsert
   let newPermissions
-  if (Array.isArray(req.body.permissions)) {
-    // Full replacement via array
-    newPermissions = req.body.permissions
-  } else if (req.body.overrides && typeof req.body.overrides === 'object') {
-    // Frontend sends { overrides: { roleId: { allow: [], deny: [] }, '@everyone': { view, sendMessages } } }
-    // Convert to canonical array format
-    const existing = Array.isArray(channel.permissions) ? [...channel.permissions] : []
-    for (const [id, overrideData] of Object.entries(req.body.overrides)) {
-      // Normalise allow/deny — frontend may send string booleans for @everyone
-      let allow = Array.isArray(overrideData.allow) ? overrideData.allow : []
-      let deny = Array.isArray(overrideData.deny) ? overrideData.deny : []
-
-      // Handle @everyone shorthand: { view: "false", sendMessages: "false" }
-      if (id === '@everyone') {
-        if (overrideData.view === 'false' || overrideData.view === false) {
-          if (!deny.includes('view_channel')) deny = [...deny, 'view_channel']
-        } else if (overrideData.view === 'true' || overrideData.view === true) {
-          if (!allow.includes('view_channel')) allow = [...allow, 'view_channel']
+  try {
+    if (Array.isArray(req.body.permissions)) {
+      // Full replacement via array
+      newPermissions = sanitizePermissionOverwriteArray(req.body.permissions)
+    } else if (req.body.overrides && typeof req.body.overrides === 'object' && !Array.isArray(req.body.overrides)) {
+      // Frontend sends { overrides: { roleId: { allow: [], deny: [] }, '@everyone': { view, sendMessages } } }
+      // Convert to canonical array format and merge with existing.
+      const existing = sanitizePermissionOverwriteArray(channel.permissions, { strict: false })
+      const merged = new Map(existing.map(item => [item.id, item]))
+      const entries = Object.entries(req.body.overrides)
+      if (entries.length > MAX_PERMISSION_OVERWRITES) {
+        throw new Error(`Too many permission overwrites (max ${MAX_PERMISSION_OVERWRITES})`)
+      }
+      for (const [id, overrideData] of entries) {
+        if (RESERVED_OVERRIDE_KEYS.has(id)) {
+          throw new Error('Invalid overwrite target id')
         }
-        if (overrideData.sendMessages === 'false' || overrideData.sendMessages === false) {
-          if (!deny.includes('send_messages')) deny = [...deny, 'send_messages']
-        } else if (overrideData.sendMessages === 'true' || overrideData.sendMessages === true) {
-          if (!allow.includes('send_messages')) allow = [...allow, 'send_messages']
-        }
+        const overwrite = sanitizePermissionOverwrite(overrideData, id)
+        merged.set(overwrite.id, overwrite)
       }
-
-      const overwrite = {
-        id,
-        type: overrideData.type || (id === '@everyone' ? 'everyone' : 'role'),
-        allow,
-        deny
+      if (merged.size > MAX_PERMISSION_OVERWRITES) {
+        throw new Error(`Too many permission overwrites (max ${MAX_PERMISSION_OVERWRITES})`)
       }
-      const idx = existing.findIndex(p => p.id === id)
-      if (idx >= 0) {
-        existing[idx] = overwrite
-      } else {
-        existing.push(overwrite)
+      newPermissions = Array.from(merged.values())
+    } else if (req.body.id) {
+      // Single overwrite upsert
+      const existing = sanitizePermissionOverwriteArray(channel.permissions, { strict: false })
+      const merged = new Map(existing.map(item => [item.id, item]))
+      const overwrite = sanitizePermissionOverwrite(req.body)
+      merged.set(overwrite.id, overwrite)
+      if (merged.size > MAX_PERMISSION_OVERWRITES) {
+        throw new Error(`Too many permission overwrites (max ${MAX_PERMISSION_OVERWRITES})`)
       }
-    }
-    newPermissions = existing
-  } else if (req.body.id) {
-    // Single overwrite upsert
-    const existing = Array.isArray(channel.permissions) ? [...channel.permissions] : []
-    const idx = existing.findIndex(p => p.id === req.body.id)
-    const overwrite = {
-      id: req.body.id,
-      type: req.body.type || 'role',
-      allow: Array.isArray(req.body.allow) ? req.body.allow : [],
-      deny: Array.isArray(req.body.deny) ? req.body.deny : []
-    }
-    if (idx >= 0) {
-      existing[idx] = overwrite
+      newPermissions = Array.from(merged.values())
     } else {
-      existing.push(overwrite)
+      return res.status(400).json({ error: 'Provide either permissions array, overrides object, or a single overwrite {id, type, allow, deny}' })
     }
-    newPermissions = existing
-  } else {
-    return res.status(400).json({ error: 'Provide either permissions array, overrides object, or a single overwrite {id, type, allow, deny}' })
+  } catch (err) {
+    return res.status(400).json({ error: err?.message || 'Invalid permissions payload' })
   }
 
   const updated = await channelService.updateChannel(channelId, {
@@ -1163,7 +1730,7 @@ router.put('/:channelId/permissions', authenticateToken, async (req, res) => {
 
   io.to(`server:${serverId}`).emit('channel:updated', updated)
   console.log(`[API] Updated permissions for channel ${channelId}`)
-  res.json(updated.permissions || [])
+  res.json(sanitizePermissionOverwriteArray(updated.permissions, { strict: false }))
 })
 
 // DELETE a single permission overwrite
@@ -1180,7 +1747,7 @@ router.delete('/:channelId/permissions/:targetId', authenticateToken, async (req
     return res.status(403).json({ error: 'Not authorized to manage channel permissions' })
   }
 
-  const existing = Array.isArray(channel.permissions) ? channel.permissions : []
+  const existing = sanitizePermissionOverwriteArray(channel.permissions, { strict: false })
   const filtered = existing.filter(p => p.id !== targetId)
 
   const updated = await channelService.updateChannel(channelId, {

@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid'
 import { addMessage, editMessage, deleteMessage, bulkDeleteMessages, findChannelById } from '../routes/channelRoutes.js'
-import { FILES, dmMessageService, dmService, userService, reactionService, channelService, callLogService, blockService, serverService } from './dataService.js'
+import { FILES, dmMessageService, dmService, userService, reactionService, channelService, callLogService, blockService, serverService, friendService } from './dataService.js'
 import { e2eService, userKeyService } from './e2eService.js'
 import { e2eTrueService } from './e2eTrueService.js'
 import { botService } from './botService.js'
@@ -50,6 +50,12 @@ const HEARTBEAT_TIMEOUT_MS = 20000
 const HEARTBEAT_CHECK_INTERVAL_MS = 5000
 const TRANSIENT_SOCKET_DISCONNECT_GRACE_MS = 15000
 let heartbeatMonitorStarted = false
+const MAX_SOCKET_ID_REF_LENGTH = 256
+const MAX_E2E_TRUE_KEY_FIELD_BYTES = 64 * 1024
+const MAX_E2E_TRUE_BLOB_BYTES = 256 * 1024
+const MAX_E2E_TRUE_BUNDLE_BYTES = 512 * 1024
+const MAX_E2E_TRUE_PREKEY_COUNT = 256
+const MAX_E2E_TRUE_REASON_BYTES = 2048
 
 const normalizeHost = (value) => federationService.normalizeHost?.(value) || String(value || '').toLowerCase()
 const extractRemoteOriginId = (userId) => String(userId || '').split('@')[0]
@@ -610,6 +616,282 @@ const isChannelAgeRestricted = (channelId) => {
   return !!channel?.nsfw
 }
 
+const getServerById = (serverId) => {
+  if (!serverId) return null
+
+  const directServer = serverService?.getServer?.(serverId)
+  if (directServer) return directServer
+
+  const serversData = serverService?.getAllServers?.()
+  if (!serversData) return null
+
+  if (Array.isArray(serversData)) {
+    return serversData.find((server) => server?.id === serverId) || null
+  }
+
+  if (typeof serversData === 'object') {
+    return serversData[serverId] || Object.values(serversData).find((server) => server?.id === serverId) || null
+  }
+
+  return null
+}
+
+const isServerMember = (server, memberId) => {
+  if (!server || !memberId) return false
+  if (server.ownerId === memberId) return true
+  return Array.isArray(server.members) && server.members.some((member) => member?.id === memberId)
+}
+
+const resolveChannelContext = (channelId) => {
+  if (!channelId) return { channel: null, serverId: null, server: null }
+
+  let channel = channelService.getChannel(channelId) || findChannelById(channelId)
+  let serverId = channel?.serverId || null
+
+  if (!serverId) {
+    const allChannels = channelService?.getAllChannels?.()
+    if (Array.isArray(allChannels)) {
+      const found = allChannels.find((entry) => entry?.id === channelId)
+      if (found) {
+        channel = channel || found
+        serverId = found.serverId || null
+      }
+    } else if (allChannels && typeof allChannels === 'object') {
+      for (const [key, value] of Object.entries(allChannels)) {
+        if (Array.isArray(value)) {
+          const found = value.find((entry) => entry?.id === channelId)
+          if (found) {
+            channel = channel || found
+            serverId = found.serverId || key
+            break
+          }
+        } else if (value?.id === channelId) {
+          channel = channel || value
+          serverId = value.serverId || key
+          break
+        }
+      }
+    }
+  }
+
+  const server = serverId ? getServerById(serverId) : null
+  return { channel, serverId, server }
+}
+
+const getServerAccessForUser = (userId, serverId) => {
+  const server = getServerById(serverId)
+  if (!serverId) {
+    return { allowed: false, reason: 'MISSING_SERVER_ID', server: null, serverId: null }
+  }
+  if (!server) {
+    return { allowed: false, reason: 'SERVER_NOT_FOUND', server: null, serverId }
+  }
+  if (!isServerMember(server, userId)) {
+    return { allowed: false, reason: 'NOT_SERVER_MEMBER', server, serverId }
+  }
+  return { allowed: true, reason: null, server, serverId }
+}
+
+const getChannelAccessForUser = (userId, channelId) => {
+  const { channel, serverId, server } = resolveChannelContext(channelId)
+  if (!channel) {
+    return { allowed: false, reason: 'CHANNEL_NOT_FOUND', channel: null, serverId: null, server: null }
+  }
+  if (!serverId) {
+    return { allowed: false, reason: 'MISSING_CHANNEL_SERVER', channel, serverId: null, server: null }
+  }
+  if (!server) {
+    return { allowed: false, reason: 'SERVER_NOT_FOUND', channel, serverId, server: null }
+  }
+  if (!isServerMember(server, userId)) {
+    return { allowed: false, reason: 'NOT_SERVER_MEMBER', channel, serverId, server }
+  }
+  return { allowed: true, reason: null, channel, serverId, server }
+}
+
+const logSocketAuthWarning = (eventName, userId, details = {}) => {
+  console.warn(`[Socket][Auth] Blocked ${eventName} for user ${userId}`, details)
+}
+
+const ensureServerAccess = ({ socket, userId, serverId, eventName, errorEvent = 'server:error', errorCode = 'UNAUTHORIZED_SERVER' }) => {
+  const access = getServerAccessForUser(userId, serverId)
+  if (access.allowed) return access
+
+  logSocketAuthWarning(eventName, userId, { serverId, reason: access.reason, socketId: socket.id })
+  socket.emit(errorEvent, {
+    serverId,
+    code: errorCode,
+    error: 'Not authorized for this server'
+  })
+  return null
+}
+
+const ensureChannelAccess = ({ socket, userId, channelId, eventName, errorEvent = 'channel:error', errorCode = 'UNAUTHORIZED_CHANNEL' }) => {
+  const access = getChannelAccessForUser(userId, channelId)
+  if (access.allowed) return access
+
+  logSocketAuthWarning(eventName, userId, { channelId, serverId: access.serverId || null, reason: access.reason, socketId: socket.id })
+  socket.emit(errorEvent, {
+    channelId,
+    code: errorCode,
+    error: 'Not authorized for this channel'
+  })
+  return null
+}
+
+const ensureBotChannelAccess = ({ socket, botId, botServers, channelId, eventName }) => {
+  const access = resolveChannelContext(channelId)
+  const allowedServers = Array.isArray(botServers) ? botServers : []
+  const inServer = access.serverId ? allowedServers.includes(access.serverId) : false
+  const allowed = !!(access.channel && access.serverId && access.server && inServer)
+  if (allowed) return access
+
+  let reason = 'UNKNOWN'
+  if (!access.channel) reason = 'CHANNEL_NOT_FOUND'
+  else if (!access.serverId) reason = 'MISSING_CHANNEL_SERVER'
+  else if (!access.server) reason = 'SERVER_NOT_FOUND'
+  else if (!inServer) reason = 'NOT_SERVER_MEMBER'
+
+  console.warn(`[Socket][Auth] Blocked ${eventName} for bot ${botId}`, {
+    channelId,
+    serverId: access.serverId || null,
+    reason,
+    socketId: socket.id
+  })
+  socket.emit('bot:error', { error: 'Bot not in this server' })
+  return null
+}
+
+const utf8Size = (value) => {
+  if (value === undefined || value === null) return 0
+  if (typeof value === 'string') return Buffer.byteLength(value, 'utf8')
+  try {
+    return Buffer.byteLength(JSON.stringify(value), 'utf8')
+  } catch {
+    return Number.POSITIVE_INFINITY
+  }
+}
+
+const isValidIdReference = (value, maxLength = MAX_SOCKET_ID_REF_LENGTH) => (
+  typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength
+)
+
+const isValidNumericEpoch = (value) => (
+  Number.isInteger(value) && value > 0 && value <= Number.MAX_SAFE_INTEGER
+)
+
+const getConversationParticipants = (conversation) => {
+  if (!conversation) return []
+
+  const participantIds = Array.isArray(conversation.participants)
+    ? conversation.participants.filter(Boolean)
+    : []
+
+  if (participantIds.length > 0) {
+    return Array.from(new Set(participantIds))
+  }
+
+  const fallback = [conversation.ownerId, conversation.recipientId].filter(Boolean)
+  if (typeof conversation.participantKey === 'string' && conversation.participantKey.includes(':')) {
+    fallback.push(...conversation.participantKey.split(':').filter(Boolean))
+  }
+  return Array.from(new Set(fallback))
+}
+
+const usersShareDmConversation = (sourceUserId, targetUserId, requiredConversationId = null) => {
+  const conversations = dmService.getConversations(sourceUserId) || []
+  for (const conversation of conversations) {
+    if (!conversation?.id) continue
+    if (requiredConversationId && conversation.id !== requiredConversationId) continue
+    const participants = getConversationParticipants(conversation)
+    if (participants.includes(sourceUserId) && participants.includes(targetUserId)) {
+      return { shared: true, contextType: 'dm', contextId: conversation.id }
+    }
+  }
+  return { shared: false }
+}
+
+const usersShareServerContext = (sourceUserId, targetUserId, requiredServerId = null) => {
+  if (requiredServerId) {
+    const sourceAccess = getServerAccessForUser(sourceUserId, requiredServerId)
+    const targetAccess = getServerAccessForUser(targetUserId, requiredServerId)
+    if (sourceAccess.allowed && targetAccess.allowed) {
+      return { shared: true, contextType: 'server', contextId: requiredServerId }
+    }
+    return { shared: false }
+  }
+
+  const serversData = serverService?.getAllServers?.()
+  const servers = Array.isArray(serversData) ? serversData : Object.values(serversData || {})
+  for (const server of servers) {
+    if (!server?.id) continue
+    if (isServerMember(server, sourceUserId) && isServerMember(server, targetUserId)) {
+      return { shared: true, contextType: 'server', contextId: server.id }
+    }
+  }
+  return { shared: false }
+}
+
+const usersShareGroupContext = (sourceUserId, targetUserId, groupId) => {
+  if (!isValidIdReference(groupId)) return { shared: false }
+
+  const groupMembers = e2eTrueService.getGroupMembers(groupId)
+  if (Array.isArray(groupMembers) && groupMembers.includes(sourceUserId) && groupMembers.includes(targetUserId)) {
+    return { shared: true, contextType: 'group', contextId: groupId }
+  }
+
+  return usersShareDmConversation(sourceUserId, targetUserId, groupId)
+}
+
+const resolveSharedKeyExchangeContext = ({ sourceUserId, targetUserId, groupId = null }) => {
+  if (!sourceUserId || !targetUserId) {
+    return { shared: false, reason: 'MISSING_USER_REFERENCE' }
+  }
+  if (sourceUserId === targetUserId) {
+    return { shared: true, contextType: 'self', contextId: sourceUserId }
+  }
+
+  if (groupId) {
+    const groupContext = usersShareGroupContext(sourceUserId, targetUserId, groupId)
+    if (groupContext.shared) return groupContext
+
+    const groupServerContext = usersShareServerContext(sourceUserId, targetUserId, groupId)
+    if (groupServerContext.shared) return groupServerContext
+  }
+
+  if (friendService?.areFriends?.(sourceUserId, targetUserId) || friendService?.areFriends?.(targetUserId, sourceUserId)) {
+    return { shared: true, contextType: 'friend', contextId: null }
+  }
+
+  const dmContext = usersShareDmConversation(sourceUserId, targetUserId)
+  if (dmContext.shared) return dmContext
+
+  const serverContext = usersShareServerContext(sourceUserId, targetUserId)
+  if (serverContext.shared) return serverContext
+
+  return { shared: false, reason: 'NO_SHARED_CONTEXT' }
+}
+
+const emitE2ETrueError = (socket, code, error, details = {}) => {
+  socket.emit('e2e-true:error', {
+    code,
+    error,
+    ...details
+  })
+}
+
+const hasRegisteredDevice = (userId, deviceId) => {
+  if (!isValidIdReference(userId) || !isValidIdReference(deviceId)) return false
+  const devices = e2eTrueService.getUserDevices(userId)
+  return Array.isArray(devices) && devices.some((device) => device?.deviceId === deviceId)
+}
+
+const isVoiceParticipant = (channelId, userId) => {
+  if (!channelId || !userId) return false
+  const participants = voiceChannelUsers.get(channelId) || []
+  return participants.some((entry) => (entry?.id || entry?.userId) === userId)
+}
+
 // Parse mentions from message content
 // Supports: @everyone, @here, @username, @username:host (federated)
 const parseMentions = (content) => {
@@ -891,14 +1173,13 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:get-participants', (data) => {
         const { channelId } = data || {}
-        if (!channelId) return
-        
-        const channel = channelService.getChannel(channelId)
-        const serverId = channel?.serverId
-        if (serverId && !botServers.includes(serverId)) {
-          socket.emit('bot:error', { error: 'Bot not in this server' })
-          return
-        }
+        if (!ensureBotChannelAccess({
+          socket,
+          botId: botUserId,
+          botServers,
+          channelId,
+          eventName: 'voice:get-participants'
+        })) return
         
         const participants = voiceChannelUsers.get(channelId) || []
         socket.emit('voice:participants', { channelId, participants })
@@ -906,14 +1187,13 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:join', (data) => {
         const { channelId, peerId } = data || {}
-        if (!channelId) return
-
-        const channel = channelService.getChannel(channelId)
-        const serverId = channel?.serverId
-        if (serverId && !botServers.includes(serverId)) {
-          socket.emit('bot:error', { error: 'Bot not in this server' })
-          return
-        }
+        if (!ensureBotChannelAccess({
+          socket,
+          botId: botUserId,
+          botServers,
+          channelId,
+          eventName: 'voice:join'
+        })) return
 
         console.log(`[Voice] Bot ${botUserId} joining channel ${channelId}`)
 
@@ -1014,12 +1294,17 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:offer', (data) => {
         const { to, offer, channelId } = data || {}
-        if (channelId) {
-          const channel = channelService.getChannel(channelId)
-          const serverId = channel?.serverId
-          if (serverId && !botServers.includes(serverId)) {
-            return
-          }
+        if (!ensureBotChannelAccess({
+          socket,
+          botId: botUserId,
+          botServers,
+          channelId,
+          eventName: 'voice:offer'
+        })) return
+
+        if (!isVoiceParticipant(channelId, botUserId) || !isVoiceParticipant(channelId, to)) {
+          console.warn('[Socket][Auth] Blocked voice:offer for bot peer mismatch', { botId: botUserId, channelId, targetUserId: to, socketId: socket.id })
+          return
         }
         const targetSocket = userSockets.get(to) || botSockets.get(to)
         if (targetSocket) {
@@ -1029,12 +1314,17 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:answer', (data) => {
         const { to, answer, channelId } = data || {}
-        if (channelId) {
-          const channel = channelService.getChannel(channelId)
-          const serverId = channel?.serverId
-          if (serverId && !botServers.includes(serverId)) {
-            return
-          }
+        if (!ensureBotChannelAccess({
+          socket,
+          botId: botUserId,
+          botServers,
+          channelId,
+          eventName: 'voice:answer'
+        })) return
+
+        if (!isVoiceParticipant(channelId, botUserId) || !isVoiceParticipant(channelId, to)) {
+          console.warn('[Socket][Auth] Blocked voice:answer for bot peer mismatch', { botId: botUserId, channelId, targetUserId: to, socketId: socket.id })
+          return
         }
         const targetSocket = userSockets.get(to) || botSockets.get(to)
         if (targetSocket) {
@@ -1044,12 +1334,17 @@ export const setupSocketHandlers = (io) => {
 
       socket.on('voice:ice-candidate', (data) => {
         const { to, candidate, channelId } = data || {}
-        if (channelId) {
-          const channel = channelService.getChannel(channelId)
-          const serverId = channel?.serverId
-          if (serverId && !botServers.includes(serverId)) {
-            return
-          }
+        if (!ensureBotChannelAccess({
+          socket,
+          botId: botUserId,
+          botServers,
+          channelId,
+          eventName: 'voice:ice-candidate'
+        })) return
+
+        if (!isVoiceParticipant(channelId, botUserId) || !isVoiceParticipant(channelId, to)) {
+          console.warn('[Socket][Auth] Blocked voice:ice-candidate for bot peer mismatch', { botId: botUserId, channelId, targetUserId: to, socketId: socket.id })
+          return
         }
         const targetSocket = userSockets.get(to) || botSockets.get(to)
         if (targetSocket) {
@@ -1223,6 +1518,13 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('server:join', (serverId) => {
       try {
+        if (!ensureServerAccess({
+          socket,
+          userId,
+          serverId,
+          eventName: 'server:join'
+        })) return
+
         socket.join(`server:${serverId}`)
         socket.currentServer = serverId
       } catch (err) {
@@ -1232,11 +1534,20 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('channel:join', (channelId) => {
       try {
+        const access = ensureChannelAccess({
+          socket,
+          userId,
+          channelId,
+          eventName: 'channel:join'
+        })
+        if (!access) return
+
         if (socket.currentChannel) {
           socket.leave(`channel:${socket.currentChannel}`)
         }
         socket.join(`channel:${channelId}`)
         socket.currentChannel = channelId
+        socket.currentServer = access.serverId
       } catch (err) {
         console.error('[Socket] Error in channel:join:', err.message)
       }
@@ -1494,35 +1805,51 @@ export const setupSocketHandlers = (io) => {
 
     socket.on('message:send', async (data, ack) => {
       try {
+        const channelId = data?.channelId
+        if (!channelId) {
+          if (typeof ack === 'function') ack({ success: false, error: 'Missing channel', code: 'INVALID_CHANNEL' })
+          socket.emit('message:error', { channelId: null, code: 'INVALID_CHANNEL', error: 'Missing channel' })
+          return
+        }
+
+        const access = ensureChannelAccess({
+          socket,
+          userId,
+          channelId,
+          eventName: 'message:send',
+          errorEvent: 'message:error'
+        })
+        if (!access) {
+          if (typeof ack === 'function') ack({ success: false, error: 'Not authorized for this channel', code: 'UNAUTHORIZED_CHANNEL' })
+          return
+        }
+
+        const { channel, serverId: channelServerId, server: channelServer } = access
+        socket.currentServer = channelServerId
+
         // Check if user is timed out in this server
-        const channel = findChannelById(data.channelId)
-        if (channel?.serverId) {
-          const servers = serverService ? serverService.getAllServers() : null
-          const serverList = servers ? (Array.isArray(servers) ? servers : Object.values(servers)) : []
-          const srv = serverList.find(s => s.id === channel.serverId)
-          if (srv) {
-            const member = srv.members?.find(m => m && m.id === userId)
-            if (member?.timeoutUntil && new Date(member.timeoutUntil) > new Date()) {
-              const remaining = Math.ceil((new Date(member.timeoutUntil) - Date.now()) / 1000)
-              if (typeof ack === 'function') ack({ success: false, error: `You are timed out for ${remaining} more seconds`, code: 'TIMED_OUT' })
-              socket.emit('message:error', { channelId: data.channelId, code: 'TIMED_OUT', error: `You are timed out. ${remaining}s remaining.` })
-              return
-            }
+        if (channelServer) {
+          const member = channelServer.members?.find((entry) => entry && entry.id === userId)
+          if (member?.timeoutUntil && new Date(member.timeoutUntil) > new Date()) {
+            const remaining = Math.ceil((new Date(member.timeoutUntil) - Date.now()) / 1000)
+            if (typeof ack === 'function') ack({ success: false, error: `You are timed out for ${remaining} more seconds`, code: 'TIMED_OUT' })
+            socket.emit('message:error', { channelId, code: 'TIMED_OUT', error: `You are timed out. ${remaining}s remaining.` })
+            return
           }
         }
 
         const profile = userService.getUser(userId)
         const adultAccess = normalizeAgeVerification(profile?.ageVerification, profile || {}).adultAccess
-        if (isChannelAgeRestricted(data.channelId) && !adultAccess) {
+        if (isChannelAgeRestricted(channelId) && !adultAccess) {
           if (typeof ack === 'function') ack({ success: false, error: 'Age verification required', code: 'AGE_VERIFICATION_REQUIRED' })
-          socket.emit('message:error', { channelId: data.channelId, code: 'AGE_VERIFICATION_REQUIRED', error: 'Age verification required for this channel' })
+          socket.emit('message:error', { channelId, code: 'AGE_VERIFICATION_REQUIRED', error: 'Age verification required for this channel' })
           return
         }
 
         const slowMode = channel?.slowMode || 0
         
         if (slowMode > 0) {
-          const key = `${userId}:${data.channelId}`
+          const key = `${userId}:${channelId}`
           const lastMessageTime = messageTimestamps.get(key) || 0
           const now = Date.now()
           const timeSinceLastMessage = now - lastMessageTime
@@ -1531,7 +1858,7 @@ export const setupSocketHandlers = (io) => {
             const remainingTime = Math.ceil((slowMode * 1000 - timeSinceLastMessage) / 1000)
             if (typeof ack === 'function') ack({ success: false, error: `Slowmode active. Wait ${remainingTime}s`, code: 'SLOWMODE' })
             socket.emit('message:error', { 
-              channelId: data.channelId, 
+              channelId, 
               code: 'SLOWMODE', 
               error: `Slowmode is active. You can send another message in ${remainingTime} seconds.` 
             })
@@ -1552,7 +1879,7 @@ export const setupSocketHandlers = (io) => {
         const messageId = uuidv4()
         const message = {
           id: messageId,
-          channelId: data.channelId,
+          channelId,
           userId: userId,
           username: socket.user.username || socket.user.email,
           avatar: socket.user.avatar,
@@ -1568,7 +1895,6 @@ export const setupSocketHandlers = (io) => {
           clientNonce: data.clientNonce || null
         }
 
-        const channelServerId = channel?.serverId
         if (channelServerId) {
           message.content = convertEmojiFormat(data.content, channelServerId)
         }
@@ -1578,13 +1904,13 @@ export const setupSocketHandlers = (io) => {
         if (typeof ack === 'function') ack({ success: true, messageId })
 
         // Use batching service for efficient message processing
-        const queued = messageBatchService.queueMessage(data.channelId, message, false)
+        const queued = messageBatchService.queueMessage(channelId, message, false)
         if (!queued) {
           console.warn('[Socket] Message was not queued (likely duplicate):', messageId)
         }
-        io.to(`channel:${data.channelId}`).emit('message:new', message)
+        io.to(`channel:${channelId}`).emit('message:new', message)
 
-        sendMentionNotifications(io, socket, data.channelId, message, mentions)
+        sendMentionNotifications(io, socket, channelId, message, mentions)
 
         if (channelServerId) {
           for (const [botId, botSocketId] of botSockets.entries()) {
@@ -1601,7 +1927,7 @@ export const setupSocketHandlers = (io) => {
               botService.deliverWebhookEvent(botId, 'MESSAGE_CREATE', {
                 message,
                 serverId: channelServerId,
-                channelId: data.channelId
+                channelId
               })
             }
           }
@@ -1617,28 +1943,53 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('message:typing', (data) => {
-      socket.to(`channel:${data.channelId}`).emit('user:typing', {
+      const channelId = data?.channelId
+      if (!ensureChannelAccess({
+        socket,
+        userId,
+        channelId,
+        eventName: 'message:typing',
+        errorEvent: 'message:error'
+      })) return
+
+      socket.to(`channel:${channelId}`).emit('user:typing', {
         userId,
         username: socket.user.username || socket.user.email,
-        channelId: data.channelId
+        channelId
       })
     })
 
       socket.on('voice:get-participants', (data) => {
-        const { channelId } = data
+        const channelId = data?.channelId
+        const access = ensureChannelAccess({
+          socket,
+          userId,
+          channelId,
+          eventName: 'voice:get-participants',
+          errorEvent: 'voice:error'
+        })
+        if (!access) return
+
+        socket.currentServer = access.serverId
         const participants = voiceChannelUsers.get(channelId) || []
         socket.emit('voice:participants', { channelId, participants, iceServers: getIceServers() })
       })
 
     // Handle UI component interactions (buttons, inputs, selects, canvas)
     socket.on('ui:buttonClick', async (data) => {
-        const { messageId, channelId, componentId, componentType, action, label, value } = data
-        // Relay to all bots in the channel's server
-        const channel = channelService.getChannel(channelId)
+        const { messageId, channelId, componentId, componentType, action, label, value } = data || {}
+        const access = ensureChannelAccess({
+          socket,
+          userId,
+          channelId,
+          eventName: 'ui:buttonClick',
+          errorEvent: 'ui:error'
+        })
+        if (!access) return
 
-        console.log(channelId);
-        const serverId = channel?.serverId
-        if (!serverId) return
+        // Relay to all bots in the channel's server
+        const serverId = access.serverId
+        socket.currentServer = serverId
 
         for (const [botId, botSocketId] of botSockets.entries()) {
           const botSocket = io.sockets.sockets.get(botSocketId)
@@ -1660,11 +2011,18 @@ export const setupSocketHandlers = (io) => {
       })
 
       socket.on('ui:inputSubmit', async (data) => {
-        const { messageId, channelId, componentId, componentType, action, value } = data
-        const channel = channelService.getChannel(channelId)
-        console.log('[BotUI] inputSubmit channelId:', channelId, 'channel:', channel)
-        const serverId = channel?.serverId
-        if (!serverId) return
+        const { messageId, channelId, componentId, componentType, action, value } = data || {}
+        const access = ensureChannelAccess({
+          socket,
+          userId,
+          channelId,
+          eventName: 'ui:inputSubmit',
+          errorEvent: 'ui:error'
+        })
+        if (!access) return
+
+        const serverId = access.serverId
+        socket.currentServer = serverId
 
         for (const [botId, botSocketId] of botSockets.entries()) {
           const botSocket = io.sockets.sockets.get(botSocketId)
@@ -1685,11 +2043,18 @@ export const setupSocketHandlers = (io) => {
       })
 
       socket.on('ui:selectChange', async (data) => {
-        const { messageId, channelId, componentId, componentType, action, value } = data
-        const channel = channelService.getChannel(channelId)
-        console.log('[BotUI] selectChange channelId:', channelId, 'channel:', channel)
-        const serverId = channel?.serverId
-        if (!serverId) return
+        const { messageId, channelId, componentId, componentType, action, value } = data || {}
+        const access = ensureChannelAccess({
+          socket,
+          userId,
+          channelId,
+          eventName: 'ui:selectChange',
+          errorEvent: 'ui:error'
+        })
+        if (!access) return
+
+        const serverId = access.serverId
+        socket.currentServer = serverId
 
         for (const [botId, botSocketId] of botSockets.entries()) {
           const botSocket = io.sockets.sockets.get(botSocketId)
@@ -1710,11 +2075,18 @@ export const setupSocketHandlers = (io) => {
       })
 
       socket.on('ui:canvasClick', async (data) => {
-        const { messageId, channelId, componentId, componentType, action, x, y } = data
-        const channel = channelService.getChannel(channelId)
-        console.log('[BotUI] canvasClick channelId:', channelId, 'channel:', channel, 'x:', x, 'y:', y)
-        const serverId = channel?.serverId
-        if (!serverId) return
+        const { messageId, channelId, componentId, componentType, action, x, y } = data || {}
+        const access = ensureChannelAccess({
+          socket,
+          userId,
+          channelId,
+          eventName: 'ui:canvasClick',
+          errorEvent: 'ui:error'
+        })
+        if (!access) return
+
+        const serverId = access.serverId
+        socket.currentServer = serverId
 
         for (const [botId, botSocketId] of botSockets.entries()) {
           const botSocket = io.sockets.sockets.get(botSocketId)
@@ -1736,24 +2108,27 @@ export const setupSocketHandlers = (io) => {
       })
 
     socket.on('voice:join', (data) => {
-      const { channelId, peerId } = data
+      const { channelId, peerId } = data || {}
       cancelPendingVoiceDisconnect(userId)
 
+      const access = ensureChannelAccess({
+        socket,
+        userId,
+        channelId,
+        eventName: 'voice:join',
+        errorEvent: 'voice:error'
+      })
+      if (!access) return
+
+      socket.currentServer = access.serverId
+
       // Check if user is timed out in this server
-      const voiceChannel = channelService.getChannel(channelId)
-      if (voiceChannel?.serverId) {
-        const serversData = serverService ? serverService.getAllServers() : null
-        const serverList = serversData ? (Array.isArray(serversData) ? serversData : Object.values(serversData)) : []
-        const voiceSrv = serverList.find(s => s.id === voiceChannel.serverId)
-        if (voiceSrv) {
-          const voiceMember = voiceSrv.members?.find(m => m && m.id === userId)
-          if (voiceMember?.timeoutUntil && new Date(voiceMember.timeoutUntil) > new Date()) {
-            const remaining = Math.ceil((new Date(voiceMember.timeoutUntil) - Date.now()) / 1000)
-            socket.emit('voice:error', { channelId, code: 'TIMED_OUT', error: `You are timed out. ${remaining}s remaining.` })
-            return
-          }
+      const voiceMember = access.server?.members?.find((member) => member && member.id === userId)
+      if (voiceMember?.timeoutUntil && new Date(voiceMember.timeoutUntil) > new Date()) {
+        const remaining = Math.ceil((new Date(voiceMember.timeoutUntil) - Date.now()) / 1000)
+        socket.emit('voice:error', { channelId, code: 'TIMED_OUT', error: `You are timed out. ${remaining}s remaining.` })
+        return
         }
-      }
       
       console.log(`[Voice] User ${userId} joining channel ${channelId}`)
       
@@ -1851,8 +2226,27 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('voice:offer', (data) => {
-      const { to, offer, channelId } = data
+      const { to, offer, channelId } = data || {}
       console.log(`[Voice] Received voice:offer from ${userId} to ${to}`)
+
+      if (!ensureChannelAccess({
+        socket,
+        userId,
+        channelId,
+        eventName: 'voice:offer',
+        errorEvent: 'voice:error'
+      })) return
+
+      if (!isVoiceParticipant(channelId, userId) || !isVoiceParticipant(channelId, to)) {
+        logSocketAuthWarning('voice:offer', userId, {
+          channelId,
+          targetUserId: to,
+          reason: 'VOICE_PARTICIPANT_MISMATCH',
+          socketId: socket.id
+        })
+        return
+      }
+
       const targetSocket = userSockets.get(to) || botSockets.get(to)
       if (targetSocket) {
         io.to(targetSocket).emit('voice:offer', {
@@ -1867,8 +2261,27 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('voice:answer', (data) => {
-      const { to, answer, channelId } = data
+      const { to, answer, channelId } = data || {}
       console.log(`[Voice] Received voice:answer from ${userId} to ${to}`)
+
+      if (!ensureChannelAccess({
+        socket,
+        userId,
+        channelId,
+        eventName: 'voice:answer',
+        errorEvent: 'voice:error'
+      })) return
+
+      if (!isVoiceParticipant(channelId, userId) || !isVoiceParticipant(channelId, to)) {
+        logSocketAuthWarning('voice:answer', userId, {
+          channelId,
+          targetUserId: to,
+          reason: 'VOICE_PARTICIPANT_MISMATCH',
+          socketId: socket.id
+        })
+        return
+      }
+
       const targetSocket = userSockets.get(to) || botSockets.get(to)
       if (targetSocket) {
         io.to(targetSocket).emit('voice:answer', {
@@ -1880,8 +2293,27 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('voice:ice-candidate', (data) => {
-      const { to, candidate, channelId } = data
+      const { to, candidate, channelId } = data || {}
       console.log(`[Voice] Received voice:ice-candidate from ${userId} to ${to}`)
+
+      if (!ensureChannelAccess({
+        socket,
+        userId,
+        channelId,
+        eventName: 'voice:ice-candidate',
+        errorEvent: 'voice:error'
+      })) return
+
+      if (!isVoiceParticipant(channelId, userId) || !isVoiceParticipant(channelId, to)) {
+        logSocketAuthWarning('voice:ice-candidate', userId, {
+          channelId,
+          targetUserId: to,
+          reason: 'VOICE_PARTICIPANT_MISMATCH',
+          socketId: socket.id
+        })
+        return
+      }
+
       const targetSocket = userSockets.get(to) || botSockets.get(to)
       if (targetSocket) {
         io.to(targetSocket).emit('voice:ice-candidate', {
@@ -2824,48 +3256,159 @@ export const setupSocketHandlers = (io) => {
     })
 
     // Server update handlers - emit to all users in the server
-    socket.on('server:update', (data) => {
-      const { serverId, server } = data
+    socket.on('server:update', (data = {}) => {
+      const { serverId, server } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'server:update'
+      })) return
       io.to(`server:${serverId}`).emit('server:updated', server)
     })
 
-    socket.on('channel:create', (data) => {
-      const { serverId, channel } = data
+    socket.on('channel:create', (data = {}) => {
+      const { serverId, channel } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'channel:create'
+      })) return
+      if (channel?.serverId && channel.serverId !== serverId) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'Channel payload server mismatch' })
+        return
+      }
       io.to(`server:${serverId}`).emit('channel:created', channel)
     })
 
-    socket.on('channel:update', (data) => {
-      const { serverId, channel } = data
+    socket.on('channel:update', (data = {}) => {
+      const { serverId, channel } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'channel:update'
+      })) return
+      if (!channel?.id) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'channel.id is required' })
+        return
+      }
+      if (channel?.serverId && channel.serverId !== serverId) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'Channel payload server mismatch' })
+        return
+      }
+      const access = ensureChannelAccess({
+        socket,
+        userId,
+        channelId: channel.id,
+        eventName: 'channel:update',
+        errorEvent: 'server:error',
+        errorCode: 'UNAUTHORIZED_SERVER'
+      })
+      if (!access || access.serverId !== serverId) return
       io.to(`server:${serverId}`).emit('channel:updated', channel)
     })
 
-    socket.on('channel:delete', (data) => {
-      const { serverId, channelId } = data
+    socket.on('channel:delete', (data = {}) => {
+      const { serverId, channelId } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'channel:delete'
+      })) return
+      if (!channelId) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'channelId is required' })
+        return
+      }
+      const access = ensureChannelAccess({
+        socket,
+        userId,
+        channelId,
+        eventName: 'channel:delete',
+        errorEvent: 'server:error',
+        errorCode: 'UNAUTHORIZED_SERVER'
+      })
+      if (!access || access.serverId !== serverId) return
       io.to(`server:${serverId}`).emit('channel:deleted', { channelId })
     })
 
-    socket.on('channel:order', (data) => {
-      const { serverId, channels } = data
+    socket.on('channel:order', (data = {}) => {
+      const { serverId, channels } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'channel:order'
+      })) return
+      if (channels && (!Array.isArray(channels) || channels.length > 500)) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'Invalid channel order payload' })
+        return
+      }
       io.to(`server:${serverId}`).emit('channel:order-updated', channels)
     })
 
-    socket.on('role:create', (data) => {
-      const { serverId, role } = data
+    socket.on('role:create', (data = {}) => {
+      const { serverId, role } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'role:create'
+      })) return
+      if (role?.serverId && role.serverId !== serverId) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'Role payload server mismatch' })
+        return
+      }
       io.to(`server:${serverId}`).emit('role:created', role)
     })
 
-    socket.on('role:update', (data) => {
-      const { serverId, role } = data
+    socket.on('role:update', (data = {}) => {
+      const { serverId, role } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'role:update'
+      })) return
+      if (!role?.id) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'role.id is required' })
+        return
+      }
+      if (role?.serverId && role.serverId !== serverId) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'Role payload server mismatch' })
+        return
+      }
       io.to(`server:${serverId}`).emit('role:updated', role)
     })
 
-    socket.on('role:delete', (data) => {
-      const { serverId, roleId } = data
+    socket.on('role:delete', (data = {}) => {
+      const { serverId, roleId } = data || {}
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'role:delete'
+      })) return
+      if (!roleId) {
+        socket.emit('server:error', { serverId, code: 'INVALID_PAYLOAD', error: 'roleId is required' })
+        return
+      }
       io.to(`server:${serverId}`).emit('role:deleted', { roleId })
     })
 
     // E2E Encryption handlers
     socket.on('e2e:get-server-status', (serverId) => {
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'e2e:get-server-status',
+        errorEvent: 'e2e:error',
+        errorCode: 'UNAUTHORIZED_E2E_SERVER'
+      })) return
+
       const keys = e2eService.getServerKeys(serverId)
       socket.emit('e2e:server-status', {
         serverId,
@@ -2875,6 +3418,15 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('e2e:join-server', async (serverId) => {
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'e2e:join-server',
+        errorEvent: 'e2e:error',
+        errorCode: 'UNAUTHORIZED_E2E_SERVER'
+      })) return
+
       if (!e2eService.isEncryptionEnabled(serverId)) {
         socket.emit('e2e:not-enabled', { serverId })
         return
@@ -2894,7 +3446,7 @@ export const setupSocketHandlers = (io) => {
 
       try {
         const encryptedKey = crypto.encryptKeyForUser(symmetricKey, userKeys.publicKey)
-        e2eService.setMemberEncryptedKey(serverId, userId, encryptedKey)
+        await e2eService.setMemberEncryptedKey(serverId, userId, encryptedKey)
 
         socket.emit('e2e:joined', {
           serverId,
@@ -2913,6 +3465,15 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('e2e:request-member-keys', (serverId) => {
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'e2e:request-member-keys',
+        errorEvent: 'e2e:error',
+        errorCode: 'UNAUTHORIZED_E2E_SERVER'
+      })) return
+
       if (!e2eService.isEncryptionEnabled(serverId)) {
         return
       }
@@ -2934,6 +3495,15 @@ export const setupSocketHandlers = (io) => {
     })
 
     socket.on('e2e:get-my-encrypted-key', (serverId) => {
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'e2e:get-my-encrypted-key',
+        errorEvent: 'e2e:error',
+        errorCode: 'UNAUTHORIZED_E2E_SERVER'
+      })) return
+
       if (!e2eService.isEncryptionEnabled(serverId)) {
         return
       }
@@ -2953,64 +3523,262 @@ export const setupSocketHandlers = (io) => {
 
     // === True E2EE handlers ===
 
-    socket.on('e2e-true:register-device', (data) => {
-      const { deviceId, identityPublicKey, signedPreKey, signedPreKeySignature, oneTimePreKeys } = data
-      if (!deviceId || !identityPublicKey || !signedPreKey) return
+    socket.on('e2e-true:register-device', async (data = {}) => {
+      const {
+        deviceId,
+        identityPublicKey,
+        signedPreKey,
+        signedPreKeySignature,
+        oneTimePreKeys
+      } = data || {}
 
-      e2eTrueService.uploadDeviceKeyBundle(userId, deviceId, {
-        identityPublicKey, signedPreKey, signedPreKeySignature,
-        oneTimePreKeys: oneTimePreKeys || []
+      if (!isValidIdReference(deviceId)) {
+        emitE2ETrueError(socket, 'INVALID_DEVICE_ID', 'Invalid deviceId reference')
+        return
+      }
+      if (typeof identityPublicKey !== 'string' || utf8Size(identityPublicKey) > MAX_E2E_TRUE_KEY_FIELD_BYTES) {
+        emitE2ETrueError(socket, 'INVALID_IDENTITY_KEY', 'Invalid identity public key payload')
+        return
+      }
+      if (typeof signedPreKey !== 'string' || utf8Size(signedPreKey) > MAX_E2E_TRUE_KEY_FIELD_BYTES) {
+        emitE2ETrueError(socket, 'INVALID_SIGNED_PREKEY', 'Invalid signed pre-key payload')
+        return
+      }
+      if (signedPreKeySignature !== undefined && signedPreKeySignature !== null && (typeof signedPreKeySignature !== 'string' || utf8Size(signedPreKeySignature) > MAX_E2E_TRUE_KEY_FIELD_BYTES)) {
+        emitE2ETrueError(socket, 'INVALID_SIGNED_PREKEY_SIGNATURE', 'Invalid signed pre-key signature payload')
+        return
+      }
+
+      const safeOneTimePreKeys = Array.isArray(oneTimePreKeys) ? oneTimePreKeys : []
+      if (safeOneTimePreKeys.length > MAX_E2E_TRUE_PREKEY_COUNT) {
+        emitE2ETrueError(socket, 'TOO_MANY_ONE_TIME_KEYS', 'Too many one-time pre-keys')
+        return
+      }
+      if (safeOneTimePreKeys.some((preKey) => utf8Size(preKey) > MAX_E2E_TRUE_KEY_FIELD_BYTES)) {
+        emitE2ETrueError(socket, 'INVALID_ONE_TIME_KEY', 'One-time pre-key payload too large')
+        return
+      }
+
+      if (utf8Size({
+        identityPublicKey,
+        signedPreKey,
+        signedPreKeySignature: signedPreKeySignature || null,
+        oneTimePreKeys: safeOneTimePreKeys
+      }) > MAX_E2E_TRUE_BUNDLE_BYTES) {
+        emitE2ETrueError(socket, 'DEVICE_BUNDLE_TOO_LARGE', 'Device key bundle exceeds maximum size')
+        return
+      }
+
+      await e2eTrueService.uploadDeviceKeyBundle(userId, deviceId, {
+        identityPublicKey,
+        signedPreKey,
+        signedPreKeySignature,
+        oneTimePreKeys: safeOneTimePreKeys
       })
 
       socket.deviceId = deviceId
       socket.emit('e2e-true:device-registered', { deviceId })
     })
 
-    socket.on('e2e-true:request-device-keys', (data) => {
-      const { targetUserId, targetDeviceId } = data
-      const bundle = e2eTrueService.getDeviceKeyBundle(targetUserId, targetDeviceId)
+    socket.on('e2e-true:request-device-keys', async (data = {}) => {
+      const { targetUserId, targetDeviceId, groupId } = data || {}
+
+      if (!isValidIdReference(targetUserId)) {
+        emitE2ETrueError(socket, 'INVALID_TARGET_USER', 'Invalid target user reference')
+        return
+      }
+      if (!isValidIdReference(targetDeviceId)) {
+        emitE2ETrueError(socket, 'INVALID_TARGET_DEVICE', 'Invalid target device reference')
+        return
+      }
+      if (!userService.getUser(targetUserId)) {
+        emitE2ETrueError(socket, 'TARGET_USER_NOT_FOUND', 'Target user not found', { targetUserId })
+        return
+      }
+
+      await e2eTrueService.ensureLoaded()
+
+      const sharedContext = resolveSharedKeyExchangeContext({
+        sourceUserId: userId,
+        targetUserId,
+        groupId: isValidIdReference(groupId) ? groupId : null
+      })
+      if (!sharedContext.shared) {
+        logSocketAuthWarning('e2e-true:request-device-keys', userId, {
+          targetUserId,
+          targetDeviceId,
+          reason: sharedContext.reason || 'NO_SHARED_CONTEXT'
+        })
+        emitE2ETrueError(socket, 'UNAUTHORIZED_KEY_EXCHANGE', 'No shared context for key exchange', {
+          targetUserId,
+          targetDeviceId
+        })
+        return
+      }
+
+      if (!hasRegisteredDevice(targetUserId, targetDeviceId)) {
+        socket.emit('e2e-true:device-keys', { targetUserId, targetDeviceId, bundle: null })
+        return
+      }
+
+      const bundle = await e2eTrueService.getDeviceKeyBundle(targetUserId, targetDeviceId)
       socket.emit('e2e-true:device-keys', { targetUserId, targetDeviceId, bundle })
     })
 
-    socket.on('e2e-true:distribute-sender-key', (data) => {
-      const { groupId, epoch, toUserId, toDeviceId, encryptedKeyBlob } = data
-      if (!groupId || !epoch || !toUserId || !toDeviceId || !encryptedKeyBlob) return
+    socket.on('e2e-true:distribute-sender-key', async (data = {}) => {
+      const { groupId, epoch, toUserId, toDeviceId, encryptedKeyBlob } = data || {}
+      const normalizedEpoch = typeof epoch === 'string' ? Number(epoch) : epoch
 
-      e2eTrueService.storeEncryptedSenderKey(
-        groupId, epoch, userId, socket.deviceId || 'default',
-        toUserId, toDeviceId, encryptedKeyBlob
+      if (!isValidIdReference(groupId)) {
+        emitE2ETrueError(socket, 'INVALID_GROUP_ID', 'Invalid groupId reference')
+        return
+      }
+      if (!isValidNumericEpoch(normalizedEpoch)) {
+        emitE2ETrueError(socket, 'INVALID_EPOCH', 'Invalid sender-key epoch value')
+        return
+      }
+      if (!isValidIdReference(toUserId)) {
+        emitE2ETrueError(socket, 'INVALID_TARGET_USER', 'Invalid target user reference')
+        return
+      }
+      if (!isValidIdReference(toDeviceId)) {
+        emitE2ETrueError(socket, 'INVALID_TARGET_DEVICE', 'Invalid target device reference')
+        return
+      }
+      if (!userService.getUser(toUserId)) {
+        emitE2ETrueError(socket, 'TARGET_USER_NOT_FOUND', 'Target user not found', { toUserId })
+        return
+      }
+      if (utf8Size(encryptedKeyBlob) <= 0 || utf8Size(encryptedKeyBlob) > MAX_E2E_TRUE_BLOB_BYTES) {
+        emitE2ETrueError(socket, 'INVALID_KEY_BLOB', 'Encrypted sender-key payload is invalid or too large')
+        return
+      }
+
+      await e2eTrueService.ensureLoaded()
+
+      const sharedContext = resolveSharedKeyExchangeContext({
+        sourceUserId: userId,
+        targetUserId: toUserId,
+        groupId
+      })
+      if (!sharedContext.shared) {
+        logSocketAuthWarning('e2e-true:distribute-sender-key', userId, {
+          toUserId,
+          toDeviceId,
+          groupId,
+          reason: sharedContext.reason || 'NO_SHARED_CONTEXT'
+        })
+        emitE2ETrueError(socket, 'UNAUTHORIZED_KEY_EXCHANGE', 'No shared context for sender-key distribution', {
+          toUserId,
+          toDeviceId,
+          groupId
+        })
+        return
+      }
+
+      if (!hasRegisteredDevice(toUserId, toDeviceId)) {
+        emitE2ETrueError(socket, 'TARGET_DEVICE_NOT_FOUND', 'Target device not found', {
+          toUserId,
+          toDeviceId
+        })
+        return
+      }
+
+      const fromDeviceId = isValidIdReference(socket.deviceId) ? socket.deviceId : 'default'
+      await e2eTrueService.storeEncryptedSenderKey(
+        groupId,
+        normalizedEpoch,
+        userId,
+        fromDeviceId,
+        toUserId,
+        toDeviceId,
+        encryptedKeyBlob
       )
 
-      e2eTrueService.queueKeyUpdate(toUserId, toDeviceId, {
-        groupId, epoch, encryptedKeyBlob,
-        fromUserId: userId, fromDeviceId: socket.deviceId || 'default'
+      await e2eTrueService.queueKeyUpdate(toUserId, toDeviceId, {
+        groupId,
+        epoch: normalizedEpoch,
+        encryptedKeyBlob,
+        fromUserId: userId,
+        fromDeviceId
       })
 
       emitToUser(io, toUserId, 'e2e-true:sender-key-available', {
-        groupId, epoch, fromUserId: userId
+        groupId,
+        epoch: normalizedEpoch,
+        fromUserId: userId
       })
     })
 
-    socket.on('e2e-true:fetch-queued-updates', (data) => {
-      const deviceId = data?.deviceId || socket.deviceId || 'default'
-      const keyUpdates = e2eTrueService.dequeueKeyUpdates(userId, deviceId)
-      const messages = e2eTrueService.dequeueEncryptedMessages(userId, deviceId)
+    socket.on('e2e-true:fetch-queued-updates', async (data = {}) => {
+      const requestedDeviceId = data?.deviceId
+      if (requestedDeviceId !== undefined && requestedDeviceId !== null && !isValidIdReference(requestedDeviceId)) {
+        emitE2ETrueError(socket, 'INVALID_DEVICE_ID', 'Invalid device reference')
+        return
+      }
+
+      await e2eTrueService.ensureLoaded()
+
+      const deviceId = requestedDeviceId || socket.deviceId || 'default'
+      if (deviceId !== 'default' && !hasRegisteredDevice(userId, deviceId)) {
+        emitE2ETrueError(socket, 'UNKNOWN_DEVICE', 'Device is not registered for this user', { deviceId })
+        return
+      }
+
+      const keyUpdates = await e2eTrueService.dequeueKeyUpdates(userId, deviceId)
+      const messages = await e2eTrueService.dequeueEncryptedMessages(userId, deviceId)
       socket.emit('e2e-true:queued-updates', { keyUpdates, messages })
     })
 
-    socket.on('e2e-true:advance-epoch', (data) => {
-      const { groupId, reason } = data
-      if (!groupId) return
-      const epoch = e2eTrueService.advanceEpoch(groupId, reason || 'manual', userId)
-      if (epoch) {
+    socket.on('e2e-true:advance-epoch', async (data = {}) => {
+      const { groupId, reason } = data || {}
+      if (!isValidIdReference(groupId)) {
+        emitE2ETrueError(socket, 'INVALID_GROUP_ID', 'Invalid groupId reference')
+        return
+      }
+      if (reason !== undefined && reason !== null && utf8Size(reason) > MAX_E2E_TRUE_REASON_BYTES) {
+        emitE2ETrueError(socket, 'REASON_TOO_LARGE', 'Epoch reason exceeds maximum size')
+        return
+      }
+
+      await e2eTrueService.ensureLoaded()
+
+      const groupMembers = e2eTrueService.getGroupMembers(groupId)
+      const isGroupMember = Array.isArray(groupMembers) && groupMembers.includes(userId)
+      const serverAccess = getServerAccessForUser(userId, groupId)
+      if (!isGroupMember && !serverAccess.allowed) {
+        logSocketAuthWarning('e2e-true:advance-epoch', userId, {
+          groupId,
+          reason: 'NOT_IN_GROUP_OR_SERVER'
+        })
+        emitE2ETrueError(socket, 'UNAUTHORIZED_GROUP', 'Not authorized to rotate keys for this group', {
+          groupId
+        })
+        return
+      }
+
+      const epochInfo = await e2eTrueService.advanceEpoch(groupId, reason || 'manual', userId)
+      if (epochInfo) {
         io.to(`server:${groupId}`).emit('e2e-true:epoch-advanced', {
-          groupId, epoch: epoch.epoch, reason, triggeredBy: userId
+          groupId,
+          epoch: epochInfo.epoch,
+          reason,
+          triggeredBy: userId
         })
       }
     })
 
-    socket.on('e2e:leave-server', (serverId) => {
-      e2eService.removeMemberKey(serverId, userId)
+    socket.on('e2e:leave-server', async (serverId) => {
+      if (!ensureServerAccess({
+        socket,
+        userId,
+        serverId,
+        eventName: 'e2e:leave-server',
+        errorEvent: 'e2e:error',
+        errorCode: 'UNAUTHORIZED_E2E_SERVER'
+      })) return
+
+      await e2eService.removeMemberKey(serverId, userId)
       io.to(`server:${serverId}`).emit('e2e:member-left', {
         serverId,
         userId

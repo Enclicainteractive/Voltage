@@ -28,6 +28,12 @@ const validateContextAccess = async ({ userId, contextType, contextId }) => {
   return { ok: false, error: 'Unsupported context_type' }
 }
 
+const sanitizeAppResponse = (app) => {
+  if (!app || typeof app !== 'object') return app
+  const { clientSecret, ...safeApp } = app
+  return safeApp
+}
+
 router.get('/catalog', authenticateToken, async (_req, res) => {
   try {
     const catalog = await activityService.listCatalog()
@@ -112,7 +118,7 @@ router.get('/public', async (_req, res) => {
 router.get('/apps/my', authenticateToken, async (req, res) => {
   try {
     const apps = await activityService.listMyApps(req.user.id)
-    res.json({ items: apps })
+    res.json({ items: Array.isArray(apps) ? apps.map(sanitizeAppResponse) : [] })
   } catch (err) {
     console.error('[Activities] Failed to load apps:', err)
     buildError(res, 500, 'Failed to load apps')
@@ -336,7 +342,7 @@ router.get('/apps/:appId', authenticateToken, async (req, res) => {
     const app = await activityService.getAppById(req.params.appId)
     if (!app) return buildError(res, 404, 'App not found')
     if (app.ownerId !== req.user.id) return buildError(res, 403, 'Not authorized')
-    res.json(app)
+    res.json(sanitizeAppResponse(app))
   } catch (err) {
     console.error('[Activities] Failed to get app:', err)
     buildError(res, 500, 'Failed to get app')
@@ -347,7 +353,7 @@ router.put('/apps/:appId', authenticateToken, async (req, res) => {
   try {
     const app = await activityService.updateApp(req.user.id, req.params.appId, req.body || {})
     if (!app) return buildError(res, 404, 'App not found or not authorized')
-    res.json(app)
+    res.json(sanitizeAppResponse(app))
   } catch (err) {
     console.error('[Activities] Failed to update app:', err)
     buildError(res, 400, err.message || 'Failed to update app')

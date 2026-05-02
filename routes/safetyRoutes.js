@@ -1,11 +1,25 @@
 import express from 'express'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { adminService, channelService, globalBanService, messageService, moderationReportService, serverBanService, serverService, userService } from '../services/dataService.js'
+import config from '../config/config.js'
 
 const router = express.Router()
 
-const requireModerator = async (req, res, next) => {
-  if (!(await adminService.isModerator(req.user.id))) {
+const getUserId = (req) => req.user?.id || req.user?.userId || null
+
+const isConfiguredAdmin = (userId) => {
+  if (!userId) return false
+  const adminUsers = config.config.security?.adminUsers || []
+  return adminUsers.includes(userId)
+}
+
+const isModeratorRequest = (req) => {
+  const userId = getUserId(req)
+  return !!(isConfiguredAdmin(userId) || (userId && adminService.isModerator(userId)))
+}
+
+const requireModerator = (req, res, next) => {
+  if (!isModeratorRequest(req)) {
     return res.status(403).json({ error: 'Moderator access required' })
   }
   next()
@@ -36,6 +50,28 @@ const hasThreatSignal = (flags) => {
 const sanitizeReason = (value) => {
   if (typeof value !== 'string') return ''
   return value.trim().slice(0, MAX_REASON_LENGTH)
+}
+
+const normalizeId = (value) => {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+const resolveReportBoundTarget = ({ req, overrideValue, reportValue, label }) => {
+  const overrideId = normalizeId(overrideValue)
+  const reportId = normalizeId(reportValue)
+  const configuredAdmin = isConfiguredAdmin(getUserId(req))
+
+  if (overrideId && overrideId !== reportId && !configuredAdmin) {
+    return { status: 403, error: `Only configured admins can override ${label}` }
+  }
+
+  const target = overrideId || reportId
+  if (!target) {
+    return { status: 400, error: `No ${label} available for this report` }
+  }
+  return { target }
 }
 
 const toReportMetaView = (report) => ({
@@ -112,6 +148,7 @@ router.post('/reports', authenticateToken, async (req, res) => {
   const accusedUserId = report.accusedUserId || null
   const targetUserId = report.targetUserId || null
   let autoAction = null
+  const reporterCanTakeModerationActions = isModeratorRequest(req)
 
   if (accusedUserId && targetUserId) {
     const target = await userService.getUser(targetUserId)
@@ -119,7 +156,7 @@ router.post('/reports', authenticateToken, async (req, res) => {
     const targetUnder16 = Number.isFinite(targetAge) && targetAge < 16
 
     const severeMinorRisk = targetUnder16 && (flags.groomingRisk || flags.sexualizedMinorRisk || flags.coercionThreats)
-    if (severeMinorRisk) {
+    if (severeMinorRisk && reporterCanTakeModerationActions) {
       await globalBanService.banUser(accusedUserId, {
         reason: 'Safety auto-action: threat/minor-risk content targeting verified under-16 user',
         bannedBy: 'system:safety',
@@ -316,10 +353,16 @@ router.post('/reports/:reportId/ban-user', authenticateToken, requireModerator, 
   const report = await moderationReportService.getById(req.params.reportId)
   if (!report) return res.status(404).json({ error: 'Report not found' })
 
-  const targetUserId = req.body?.userId || report.accusedUserId
-  if (!targetUserId) {
-    return res.status(400).json({ error: 'No target user to ban' })
+  const targetUserResolution = resolveReportBoundTarget({
+    req,
+    overrideValue: req.body?.userId,
+    reportValue: report.accusedUserId,
+    label: 'target user'
+  })
+  if (targetUserResolution.error) {
+    return res.status(targetUserResolution.status).json({ error: targetUserResolution.error })
   }
+  const targetUserId = targetUserResolution.target
 
   await globalBanService.banUser(targetUserId, {
     reason: req.body?.reason || `Manual safety action from report ${report.id}`,
@@ -345,10 +388,16 @@ router.post('/reports/:reportId/delete-message', authenticateToken, requireModer
   const report = await moderationReportService.getById(req.params.reportId)
   if (!report) return res.status(404).json({ error: 'Report not found' })
 
-  const messageId = (typeof req.body?.messageId === 'string' && req.body.messageId) || report.clientMeta?.messageId || null
-  if (!messageId) {
-    return res.status(400).json({ error: 'No messageId available for this report' })
+  const messageResolution = resolveReportBoundTarget({
+    req,
+    overrideValue: req.body?.messageId,
+    reportValue: report.clientMeta?.messageId,
+    label: 'messageId'
+  })
+  if (messageResolution.error) {
+    return res.status(messageResolution.status).json({ error: messageResolution.error })
   }
+  const messageId = messageResolution.target
 
   const message = await messageService.getMessage(messageId)
   if (!message) {
@@ -382,10 +431,16 @@ router.post('/reports/:reportId/ban-server', authenticateToken, requireModerator
   const report = await moderationReportService.getById(req.params.reportId)
   if (!report) return res.status(404).json({ error: 'Report not found' })
 
-  const serverId = (typeof req.body?.serverId === 'string' && req.body.serverId) || report.clientMeta?.serverId || null
-  if (!serverId) {
-    return res.status(400).json({ error: 'No serverId available for this report' })
+  const serverResolution = resolveReportBoundTarget({
+    req,
+    overrideValue: req.body?.serverId,
+    reportValue: report.clientMeta?.serverId,
+    label: 'serverId'
+  })
+  if (serverResolution.error) {
+    return res.status(serverResolution.status).json({ error: serverResolution.error })
   }
+  const serverId = serverResolution.target
 
   const server = await serverService.getServer(serverId)
   if (!server) {

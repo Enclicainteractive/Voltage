@@ -1,0 +1,254 @@
+{
+  "server": {
+    "name": "Volt",
+    "version": "1.0.0",
+    "mode": "mainline",
+    "host": "localhost",
+    "port": 5000,
+    "url": "https://volt.voltagechat.app",
+    "imageServerUrl": "https://api.enclicainteractive.com",
+    "description": "Volt - Decentralized Chat Platform"
+  },
+  "branding": {
+    "logo": null,
+    "primaryColor": "#ffb900",
+    "accentColor": "#ffce4d"
+  },
+  "storage": {
+    "type": "mariadb",
+    "json": {
+      "dataDir": "/app/data"
+    },
+    "sqlite": {
+      "dbPath": "./data/voltage.db"
+    },
+    "mysql": {
+      "host": "localhost",
+      "port": 3306,
+      "database": "voltchat",
+      "user": "root",
+      "password": "",
+      "connectionLimit": 10,
+      "charset": "utf8mb4"
+    },
+    "mariadb": {
+      "host": "199.192.21.113",
+      "port": 5502,
+      "database": "voltchat",
+      "user": "voltchat",
+      "password": "F2cR8YphJ7RiBG24",
+      "connectionLimit": 10,
+      "charset": "utf8mb4"
+    },
+    "postgres": {
+      "host": "localhost",
+      "port": 5432,
+      "database": "voltchat",
+      "user": "postgres",
+      "password": "",
+      "ssl": false,
+      "connectionString": null
+    },
+    "cockroachdb": {
+      "host": "localhost",
+      "port": 26257,
+      "database": "voltchat",
+      "user": "root",
+      "password": "",
+      "ssl": true,
+      "connectionString": null
+    },
+    "mssql": {
+      "host": "localhost",
+      "port": 1433,
+      "database": "voltchat",
+      "user": "sa",
+      "password": "",
+      "encrypt": false,
+      "trustServerCertificate": true
+    },
+    "mongodb": {
+      "host": "localhost",
+      "port": 27017,
+      "database": "voltchat",
+      "user": "",
+      "password": "",
+      "connectionString": null,
+      "authSource": "admin"
+    },
+    "redis": {
+      "host": "localhost",
+      "port": 6379,
+      "password": "",
+      "db": 0,
+      "keyPrefix": "voltchat:"
+    }
+  },
+  "cdn": {
+    "enabled": true,
+    "provider": "local",
+    "local": {
+      "uploadDir": "./uploads",
+      "baseUrl": null
+    },
+    "nfs": {
+      "uploadDir": null,
+      "baseUrl": null
+    },
+    "s3": {
+      "bucket": "my-volt-media",
+      "region": "us-east-1",
+      "accessKeyId": "",
+      "secretAccessKey": "",
+      "endpoint": null,
+      "publicUrl": "https://cdn.mydomain.com"
+    },
+    "cloudflare": {
+      "accountId": null,
+      "bucket": null,
+      "accessKeyId": null,
+      "secretAccessKey": null,
+      "publicUrl": null
+    }
+  },
+  "cache": {
+    "enabled": true,
+    "provider": "redis",
+    "redis": {
+      "host": "199.192.21.113",
+      "port": 6379,
+      "password": "n84UK8DqFbds",
+      "db": 1
+    }
+  },
+  "queue": {
+    "enabled": true,
+    "provider": "redis",
+    "redis": {
+      "host": "199.192.21.113",
+      "port": 6379,
+      "password": "n84UK8DqFbds",
+      "db": 1
+    }
+  },
+  "auth": {
+    "type": "all",
+    "local": {
+      "enabled": true,
+      "allowRegistration": true,
+      "requireEmailVerification": false,
+      "minPasswordLength": 8,
+      "maxPasswordLength": 128,
+      "passwordRequirements": {
+        "requireUppercase": false,
+        "requireNumbers": true,
+        "requireSymbols": false
+      }
+    },
+    "oauth": {
+      "enabled": true,
+      "provider": "enclica",
+      "enclica": {
+        "clientId": "(set)",
+        "authUrl": "https://api.enclicainteractive.com/oauth/authorize",
+        "tokenUrl": "https://api.enclicainteractive.com/api/oauth/token",
+        "userInfoUrl": "https://api.enclicainteractive.com/api/user/me",
+        "revokeUrl": "https://api.enclicainteractive.com/api/oauth/revoke"
+      }
+    },
+    "email": {
+      "enabled": true,
+      "provider": "smtp",
+      "smtp": {
+        "host": "mail.enclicainteractive.com",
+        "port": 587,
+        "secure": true,
+        "user": "volt@enclicainteractive.com",
+        "pass": "(set)",
+        "from": "noreply@voltagechat.app",
+        "fromName": "VoltChat"
+      },
+      "sendgrid": {
+        "apiKey": null,
+        "from": "noreply@voltagechat.app",
+        "fromName": "VoltChat"
+      },
+      "mailgun": {
+        "apiKey": null,
+        "domain": "",
+        "from": "noreply@voltagechat.app",
+        "fromName": "VoltChat"
+      }
+    },
+    "passwordReset": {
+      "enabled": true,
+      "tokenExpiry": 3600,
+      "maxAttempts": 3,
+      "lockoutDuration": 900
+    }
+  },
+  "security": {
+    "jwtSecret": "2k70EwuB5SIv1c/zwaiYiqbcosbQ/kA8ivI1ucbMjrM=",
+    "jwtExpiry": "17d",
+    "bcryptRounds": 12,
+    "rateLimit": {
+      "windowMs": 60000,
+      "maxRequests": 100
+    },
+    "adminUsers": []
+  },
+  "federation": {
+    "enabled": true,
+    "serverName": "volt.voltagechat.app",
+    "allowedServers": [],
+    "maxHops": 10
+  },
+  "features": {
+    "discovery": true,
+    "selfVolt": true,
+    "ageVerification": false,
+    "voiceChannels": true,
+    "videoChannels": true,
+    "e2eEncryption": true,
+    "e2eTrueEncryption": true,
+    "communities": true,
+    "threads": true,
+    "bots": true,
+    "federation": true
+  },
+  "limits": {
+    "maxUploadSize": 1048576000,
+    "maxServersPerUser": 10000,
+    "maxChannelsPerServer": 500,
+    "maxMembersPerServer": 100000,
+    "maxMessageLength": 3829,
+    "maxDmParticipants": 10
+  },
+  "logging": {
+    "level": "info",
+    "format": "json",
+    "outputs": [
+      "console"
+    ]
+  },
+  "monitoring": {
+    "enabled": false,
+    "prometheus": false,
+    "healthCheckPath": "/health"
+  },
+  "scaling": {
+    "enabled": true,
+    "nodeSecret": "~#tDKs6k:pe!'j8",
+    "nodeUrl": "http://199.192.21.113:5001",
+    "nodeId": "node-1",
+    "nodes": [
+      {
+        "id": "",
+        "url": ""
+      }
+    ],
+    "heartbeatInterval": 30000,
+    "heartbeatTimeout": 90000,
+    "fileResolutionMode": "proxy"
+  }
+}

@@ -1,9 +1,13 @@
 import express from 'express'
+import { authenticateToken } from '../middleware/authMiddleware.js'
 
 const router = express.Router()
+router.use(authenticateToken)
 
 const KLIPY_API_BASE = 'https://api.klipy.com/api/v1'
-const DEFAULT_API_KEY = process.env.KLIPY_API_KEY || '2r1MIMBg4NdErEylItHGb6vvntahrw8t4WnyHLR9fYzidFzqs6FOQsSaJXa7YzFK'
+const KLIPY_API_KEY = process.env.KLIPY_API_KEY || ''
+const MAX_QUERY_LENGTH = 256
+const MAX_REASON_LENGTH = 500
 
 const CONTENT_TYPES = {
   gifs: { endpoint: 'gifs', formats: ['gif', 'webp', 'jpg', 'mp4', 'webm'] },
@@ -81,8 +85,13 @@ const normalizeItem = (item, type) => {
 }
 
 const proxyKlipy = async (endpoint, query = {}, options = {}) => {
-  const apiKey = DEFAULT_API_KEY
-  const url = new URL(`${KLIPY_API_BASE}/${apiKey}${endpoint}`)
+  if (!KLIPY_API_KEY) {
+    const error = new Error('Klipy provider is not configured')
+    error.status = 503
+    throw error
+  }
+
+  const url = new URL(`${KLIPY_API_BASE}/${KLIPY_API_KEY}${endpoint}`)
 
   Object.entries(query).forEach(([key, value]) => {
     if (value !== undefined && value !== null && value !== '') {
@@ -143,12 +152,23 @@ const extractAdParams = (query) => {
   return adParams
 }
 
+const sanitizeSlug = (slug) => {
+  const value = String(slug || '').trim()
+  if (!value) return null
+  return encodeURIComponent(value)
+}
+
 const createSearchHandler = (type) => async (req, res) => {
   const contentType = type || getTypeFromPath(req.path)
   const { q, limit = '24', pos, content_filter = 'medium', format_filter } = req.query
   const enableTracking = req.query.tracking === 'true'
   
   if (!q) {
+    return res.status(400).json({ error: 'Query parameter "q" is required' })
+  }
+
+  const safeQuery = String(q).trim().slice(0, MAX_QUERY_LENGTH)
+  if (!safeQuery) {
     return res.status(400).json({ error: 'Query parameter "q" is required' })
   }
 
@@ -160,7 +180,7 @@ const createSearchHandler = (type) => async (req, res) => {
     const query = {
       page,
       per_page: Math.min(50, Math.max(1, Number.parseInt(String(limit), 10) || 24)),
-      q,
+      q: safeQuery,
       customer_id: customerId,
       locale: getLocale(req),
       content_filter,
@@ -196,7 +216,7 @@ const createSearchHandler = (type) => async (req, res) => {
     })
   } catch (error) {
     console.error(`${contentType} search proxy error:`, error)
-    res.status(error.status || 500).json({ error: 'Failed to proxy request', details: error.payload || error.message })
+    res.status(error.status || 500).json({ error: 'Failed to proxy request' })
   }
 }
 
@@ -251,7 +271,7 @@ const createTrendingHandler = (type) => async (req, res) => {
     })
   } catch (error) {
     console.error(`${contentType} trending proxy error:`, error)
-    res.status(error.status || 500).json({ error: 'Failed to proxy request', details: error.payload || error.message })
+    res.status(error.status || 500).json({ error: 'Failed to proxy request' })
   }
 }
 
@@ -268,15 +288,20 @@ const createCategoriesHandler = (type) => async (req, res) => {
     })
   } catch (error) {
     console.error(`${contentType} categories proxy error:`, error)
-    res.status(error.status || 500).json({ error: 'Failed to proxy request', details: error.payload || error.message })
+    res.status(error.status || 500).json({ error: 'Failed to proxy request' })
   }
 }
 
 const createShareHandler = (type) => async (req, res) => {
   const contentType = type || getTypeFromPath(req.path)
   const { slug } = req.params
+  const safeSlug = sanitizeSlug(slug)
   const enableTracking = req.query.tracking === 'true'
   const customerId = req.query.customer_id || getCustomerId(req, enableTracking)
+
+  if (!safeSlug) {
+    return res.status(400).json({ error: 'Valid slug is required' })
+  }
   
   if (!enableTracking) {
     return res.json({ result: true, tracked: false, message: 'Tracking disabled by user preference' })
@@ -285,33 +310,38 @@ const createShareHandler = (type) => async (req, res) => {
   try {
     const config = CONTENT_TYPES[contentType]
     
-    await proxyKlipy(`/${config.endpoint}/share/${slug}`, {
+    await proxyKlipy(`/${config.endpoint}/share/${safeSlug}`, {
       customer_id: customerId
     }, { method: 'POST', body: { customer_id: customerId } })
 
     res.json({ result: true, tracked: true })
   } catch (error) {
     console.error(`${contentType} share proxy error:`, error)
-    res.status(error.status || 500).json({ error: 'Failed to proxy request', details: error.payload || error.message })
+    res.status(error.status || 500).json({ error: 'Failed to proxy request' })
   }
 }
 
 const createReportHandler = (type) => async (req, res) => {
   const contentType = type || getTypeFromPath(req.path)
   const { slug } = req.params
-  const { reason } = req.body || {}
+  const safeSlug = sanitizeSlug(slug)
+  const safeReason = typeof req.body?.reason === 'string' ? req.body.reason.slice(0, MAX_REASON_LENGTH) : ''
+
+  if (!safeSlug) {
+    return res.status(400).json({ error: 'Valid slug is required' })
+  }
   
   try {
     const config = CONTENT_TYPES[contentType]
     
-    await proxyKlipy(`/${config.endpoint}/report/${slug}`, {
-      reason
-    }, { method: 'POST', body: { reason } })
+    await proxyKlipy(`/${config.endpoint}/report/${safeSlug}`, {
+      reason: safeReason
+    }, { method: 'POST', body: { reason: safeReason } })
 
     res.json({ result: true })
   } catch (error) {
     console.error(`${contentType} report proxy error:`, error)
-    res.status(error.status || 500).json({ error: 'Failed to proxy request', details: error.payload || error.message })
+    res.status(error.status || 500).json({ error: 'Failed to proxy request' })
   }
 }
 

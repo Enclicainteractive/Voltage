@@ -4,6 +4,8 @@
  * Provides comprehensive input validation and sanitization using built-in Node.js features
  */
 
+import net from 'net'
+
 class ValidationError extends Error {
   constructor(message, errors = []) {
     super(message)
@@ -59,6 +61,127 @@ const patterns = {
   // Server/channel names
   serverName: /^[a-zA-Z0-9\s._-]{1,100}$/,
   channelName: /^[a-zA-Z0-9_-]{1,100}$/
+}
+
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+const MAX_PAYLOAD_DEPTH = 20
+const MAX_PAYLOAD_KEYS = 4000
+const MAX_PAYLOAD_ARRAY_LENGTH = 2000
+
+const normalizeIpAddress = (rawIp) => {
+  if (!rawIp || typeof rawIp !== 'string') return null
+
+  let ip = rawIp.trim()
+  if (!ip) return null
+
+  if (ip.startsWith('[') && ip.includes(']')) {
+    ip = ip.slice(1, ip.indexOf(']'))
+  }
+
+  if (ip.includes('%')) {
+    ip = ip.split('%')[0]
+  }
+
+  if (ip.startsWith('::ffff:')) {
+    const mapped = ip.slice(7)
+    if (net.isIP(mapped) === 4) {
+      ip = mapped
+    }
+  }
+
+  if (net.isIP(ip)) return ip
+
+  const ipv4WithPort = ip.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/)
+  if (ipv4WithPort && net.isIP(ipv4WithPort[1]) === 4) {
+    return ipv4WithPort[1]
+  }
+
+  return null
+}
+
+const configuredTrustedProxies = new Set(
+  String(process.env.TRUSTED_PROXY_IPS || '')
+    .split(',')
+    .map((ip) => normalizeIpAddress(ip))
+    .filter(Boolean)
+)
+
+const isTrustedProxyIp = (ip) => {
+  if (!ip) return false
+  if (configuredTrustedProxies.has(ip)) return true
+
+  if (net.isIP(ip) === 4) {
+    const parts = ip.split('.').map((part) => Number.parseInt(part, 10))
+    if (parts[0] === 10) return true
+    if (parts[0] === 127) return true
+    if (parts[0] === 192 && parts[1] === 168) return true
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
+    if (parts[0] === 169 && parts[1] === 254) return true
+    return false
+  }
+
+  const lower = ip.toLowerCase()
+  if (lower === '::1') return true
+  if (lower.startsWith('fc') || lower.startsWith('fd')) return true
+  if (lower.startsWith('fe80:')) return true
+
+  return false
+}
+
+const getClientIp = (req) => {
+  const remoteIp = normalizeIpAddress(
+    req.socket?.remoteAddress ||
+      req.connection?.remoteAddress ||
+      req.ip ||
+      ''
+  )
+  const forwardedFor = req.headers?.['x-forwarded-for']
+
+  if (typeof forwardedFor === 'string' && isTrustedProxyIp(remoteIp)) {
+    const clientIp = forwardedFor
+      .split(',')
+      .map((candidate) => normalizeIpAddress(candidate))
+      .filter(Boolean)[0]
+
+    if (clientIp) return clientIp
+  }
+
+  return remoteIp || 'unknown'
+}
+
+const inspectPayload = (value, path = 'payload', depth = 0, stats = { keys: 0 }) => {
+  if (depth > MAX_PAYLOAD_DEPTH) {
+    return { valid: false, reason: `${path} nesting is too deep` }
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length > MAX_PAYLOAD_ARRAY_LENGTH) {
+      return { valid: false, reason: `${path} array is too large` }
+    }
+    for (let i = 0; i < value.length; i += 1) {
+      const result = inspectPayload(value[i], `${path}[${i}]`, depth + 1, stats)
+      if (!result.valid) return result
+    }
+    return { valid: true }
+  }
+
+  if (!value || typeof value !== 'object') {
+    return { valid: true }
+  }
+
+  for (const key of Object.keys(value)) {
+    stats.keys += 1
+    if (stats.keys > MAX_PAYLOAD_KEYS) {
+      return { valid: false, reason: 'Payload has too many keys' }
+    }
+    if (DANGEROUS_KEYS.has(key)) {
+      return { valid: false, reason: `Blocked key at ${path}.${key}` }
+    }
+    const result = inspectPayload(value[key], `${path}.${key}`, depth + 1, stats)
+    if (!result.valid) return result
+  }
+
+  return { valid: true }
 }
 
 /**
@@ -363,7 +486,7 @@ const query = (field) => new ValidationRule(`query.${field}`)
 const validationSchemas = {
   // User profile validation
   userProfile: [
-    body('username').isRequired().isString().matches(patterns.username, 'Username must be 2-32 characters, alphanumeric with underscores and periods only'),
+    body('username').isOptional().isString().matches(patterns.username, 'Username must be 2-32 characters, alphanumeric with underscores and periods only'),
     body('displayName').isOptional().isString().matches(patterns.displayName, 'Display name must be 1-50 characters'),
     body('email').isOptional().isEmail(),
     body('bio').isOptional().isString().isLength(0, 1000),
@@ -429,6 +552,51 @@ const validationSchemas = {
 const validateRequest = (schema) => {
   return (req, res, next) => {
     const errors = []
+
+    const bodyInspection = inspectPayload(req.body, 'body')
+    if (!bodyInspection.valid) {
+      console.warn('[Validation] Rejected unsafe request payload:', {
+        path: req.path,
+        method: req.method,
+        reason: bodyInspection.reason,
+        ip: getClientIp(req)
+      })
+      res.locals.__validationFailed = true
+      return res.status(400).json({
+        error: 'Invalid request payload',
+        timestamp: Date.now()
+      })
+    }
+
+    const queryInspection = inspectPayload(req.query, 'query')
+    if (!queryInspection.valid) {
+      console.warn('[Validation] Rejected unsafe query payload:', {
+        path: req.path,
+        method: req.method,
+        reason: queryInspection.reason,
+        ip: getClientIp(req)
+      })
+      res.locals.__validationFailed = true
+      return res.status(400).json({
+        error: 'Invalid request payload',
+        timestamp: Date.now()
+      })
+    }
+
+    const paramsInspection = inspectPayload(req.params, 'params')
+    if (!paramsInspection.valid) {
+      console.warn('[Validation] Rejected unsafe params payload:', {
+        path: req.path,
+        method: req.method,
+        reason: paramsInspection.reason,
+        ip: getClientIp(req)
+      })
+      res.locals.__validationFailed = true
+      return res.status(400).json({
+        error: 'Invalid request payload',
+        timestamp: Date.now()
+      })
+    }
     
     for (const rule of schema) {
       let value
@@ -454,9 +622,10 @@ const validateRequest = (schema) => {
         path: req.path,
         method: req.method,
         errors: errors.map(e => ({ field: e.field, message: e.message })),
-        ip: req.ip
+        ip: getClientIp(req)
       })
-      
+
+      res.locals.__validationFailed = true
       return res.status(400).json({
         error: 'Validation failed',
         errors: errors,
@@ -472,6 +641,29 @@ const validateRequest = (schema) => {
  * Input sanitization middleware
  */
 const sanitizeInput = (req, res, next) => {
+  const stripDangerousKeys = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || depth > MAX_PAYLOAD_DEPTH) return
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        stripDangerousKeys(item, depth + 1)
+      }
+      return
+    }
+
+    for (const key of Object.keys(value)) {
+      if (DANGEROUS_KEYS.has(key)) {
+        delete value[key]
+        continue
+      }
+      stripDangerousKeys(value[key], depth + 1)
+    }
+  }
+
+  stripDangerousKeys(req.body)
+  stripDangerousKeys(req.query)
+  stripDangerousKeys(req.params)
+
   if (req.body && typeof req.body === 'object') {
     // Sanitize common string fields
     const stringFields = ['content', 'username', 'displayName', 'name', 'description', 'topic', 'bio']
@@ -506,7 +698,7 @@ const sanitizeInput = (req, res, next) => {
 const validationFailures = new Map()
 
 const validationRateLimit = (req, res, next) => {
-  const clientIp = req.ip || req.connection.remoteAddress || 'unknown'
+  const clientIp = getClientIp(req)
   const key = `validation_failures_${clientIp}`
   const now = Date.now()
   const windowMs = 5 * 60 * 1000 // 5 minutes
@@ -524,15 +716,13 @@ const validationRateLimit = (req, res, next) => {
     })
   }
   
-  // Track failures
-  const originalSend = res.send
-  res.send = function(data) {
-    if (res.statusCode >= 400 && res.statusCode < 500) {
+  // Track actual validation failures emitted by validateRequest.
+  res.on('finish', () => {
+    if (res.locals.__validationFailed === true && res.statusCode === 400) {
       recentFailures.push(now)
       validationFailures.set(key, recentFailures)
     }
-    originalSend.call(this, data)
-  }
+  })
   
   next()
 }

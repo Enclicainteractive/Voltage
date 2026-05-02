@@ -3,19 +3,57 @@ import { authenticateToken } from '../middleware/authMiddleware.js'
 import { e2eService, userKeyService, dmE2eService } from '../services/e2eService.js'
 import { io } from '../server.js'
 import * as crypto from '../services/cryptoService.js'
-import { serverService } from '../services/dataService.js'
+import { dmService, serverService } from '../services/dataService.js'
 
 const getServers = () => {
-  const data = serverService.getAllServers()
-  if (Array.isArray(data)) return data
-  if (data && typeof data === 'object') return Object.values(data)
+  try {
+    const data = serverService.getAllServers()
+    if (Array.isArray(data)) return data
+    if (data && typeof data === 'object') return Object.values(data)
+  } catch (err) {
+    console.error('[E2E] Failed to load servers for access check:', err?.message)
+  }
   return []
+}
+
+const getServerById = (serverId) => getServers().find(s => s?.id === serverId) || null
+
+const isServerMember = (server, userId) => {
+  if (!server || !userId) return false
+  if (server.ownerId === userId) return true
+  const members = Array.isArray(server.members) ? server.members : []
+  return members.some(member => {
+    if (!member) return false
+    if (typeof member === 'string') return member === userId
+    return member.id === userId
+  })
+}
+
+const getMemberAccessibleServer = (serverId, userId) => {
+  const server = getServerById(serverId)
+  if (!server) return null
+  if (!isServerMember(server, userId)) return null
+  return server
+}
+
+const getConversationForUser = (userId, conversationId) => {
+  try {
+    return dmService.getConversationForUser(userId, conversationId)
+  } catch (err) {
+    console.error('[E2E] Failed to resolve DM conversation access:', err?.message)
+    return null
+  }
 }
 
 const router = express.Router()
 
 router.get('/status/:serverId', authenticateToken, (req, res) => {
   const { serverId } = req.params
+  const server = getMemberAccessibleServer(serverId, req.user.id)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
+
   const keys = e2eService.getServerKeys(serverId)
   
   if (!keys) {
@@ -24,16 +62,13 @@ router.get('/status/:serverId', authenticateToken, (req, res) => {
   
   res.json({
     enabled: keys.enabled,
-    keyId: keys.keyId,
-    createdAt: keys.createdAt,
-    updatedAt: keys.updatedAt
+    keyId: keys.keyId
   })
 })
 
-router.post('/enable/:serverId', authenticateToken, (req, res) => {
+router.post('/enable/:serverId', authenticateToken, async (req, res) => {
   const { serverId } = req.params
-  const servers = getServers()
-  const server = servers.find(s => s.id === serverId)
+  const server = getMemberAccessibleServer(serverId, req.user.id)
   
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
@@ -43,7 +78,7 @@ router.post('/enable/:serverId', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Only server owner can enable encryption' })
   }
   
-  const keys = e2eService.enableServerEncryption(serverId)
+  const keys = await e2eService.enableServerEncryption(serverId)
   
   io.to(`server:${serverId}`).emit('e2e:enabled', {
     serverId,
@@ -57,10 +92,9 @@ router.post('/enable/:serverId', authenticateToken, (req, res) => {
   })
 })
 
-router.post('/disable/:serverId', authenticateToken, (req, res) => {
+router.post('/disable/:serverId', authenticateToken, async (req, res) => {
   const { serverId } = req.params
-  const servers = getServers()
-  const server = servers.find(s => s.id === serverId)
+  const server = getMemberAccessibleServer(serverId, req.user.id)
   
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
@@ -70,7 +104,7 @@ router.post('/disable/:serverId', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Only server owner can disable encryption' })
   }
   
-  const keys = e2eService.disableServerEncryption(serverId)
+  await e2eService.disableServerEncryption(serverId)
   
   io.to(`server:${serverId}`).emit('e2e:disabled', {
     serverId
@@ -80,10 +114,9 @@ router.post('/disable/:serverId', authenticateToken, (req, res) => {
   res.json({ enabled: false })
 })
 
-router.post('/rotate/:serverId', authenticateToken, (req, res) => {
+router.post('/rotate/:serverId', authenticateToken, async (req, res) => {
   const { serverId } = req.params
-  const servers = getServers()
-  const server = servers.find(s => s.id === serverId)
+  const server = getMemberAccessibleServer(serverId, req.user.id)
   
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
@@ -97,7 +130,7 @@ router.post('/rotate/:serverId', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Encryption is not enabled on this server' })
   }
   
-  const keys = e2eService.rotateServerKey(serverId)
+  const keys = await e2eService.rotateServerKey(serverId)
   
   io.to(`server:${serverId}`).emit('e2e:key-rotated', {
     serverId,
@@ -112,6 +145,10 @@ router.post('/rotate/:serverId', authenticateToken, (req, res) => {
 
 router.get('/keys/:serverId', authenticateToken, (req, res) => {
   const { serverId } = req.params
+  const server = getMemberAccessibleServer(serverId, req.user.id)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
   
   if (!e2eService.isEncryptionEnabled(serverId)) {
     return res.status(400).json({ error: 'Encryption is not enabled on this server' })
@@ -138,9 +175,13 @@ router.get('/keys/:serverId', authenticateToken, (req, res) => {
   })
 })
 
-router.post('/join/:serverId', authenticateToken, (req, res) => {
+router.post('/join/:serverId', authenticateToken, async (req, res) => {
   const { serverId } = req.params
   const { encryptedKey } = req.body
+  const server = getMemberAccessibleServer(serverId, req.user.id)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
   
   if (!e2eService.isEncryptionEnabled(serverId)) {
     return res.status(400).json({ error: 'Encryption is not enabled on this server' })
@@ -151,7 +192,7 @@ router.post('/join/:serverId', authenticateToken, (req, res) => {
   }
   
   const userId = req.user.id
-  e2eService.setMemberEncryptedKey(serverId, userId, encryptedKey)
+  await e2eService.setMemberEncryptedKey(serverId, userId, encryptedKey)
   
   io.to(`server:${serverId}`).emit('e2e:member-key-added', {
     serverId,
@@ -164,16 +205,10 @@ router.post('/join/:serverId', authenticateToken, (req, res) => {
 
 router.get('/member-keys/:serverId', authenticateToken, (req, res) => {
   const { serverId } = req.params
-  const servers = getServers()
-  const server = servers.find(s => s.id === serverId)
+  const server = getMemberAccessibleServer(serverId, req.user.id)
   
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
-  }
-  
-  const member = server.members?.find(m => m.id === req.user.id)
-  if (!member) {
-    return res.status(403).json({ error: 'Not a member of this server' })
   }
   
   if (!e2eService.isEncryptionEnabled(serverId)) {
@@ -185,8 +220,7 @@ router.get('/member-keys/:serverId', authenticateToken, (req, res) => {
   
   const membersWithKeys = Object.keys(memberKeys).map(userId => ({
     userId,
-    hasKey: true,
-    timestamp: memberKeys[userId].timestamp
+    hasKey: true
   }))
   
   res.json({
@@ -215,6 +249,10 @@ router.get('/user/keys', authenticateToken, (req, res) => {
 router.get('/user/keys/:serverId', authenticateToken, (req, res) => {
   const userId = req.user.id
   const { serverId } = req.params
+  const server = getMemberAccessibleServer(serverId, userId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
   
   let keys = userKeyService.getUserKeys(userId)
   
@@ -295,6 +333,11 @@ router.post('/user/restore', authenticateToken, (req, res) => {
 
 router.get('/dm/status/:conversationId', authenticateToken, (req, res) => {
   const { conversationId } = req.params
+  const conversation = getConversationForUser(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
+
   const keys = dmE2eService.getDmKeys(conversationId)
   
   if (!keys) {
@@ -303,16 +346,18 @@ router.get('/dm/status/:conversationId', authenticateToken, (req, res) => {
   
   res.json({
     enabled: keys.enabled,
-    keyId: keys.keyId,
-    createdAt: keys.createdAt,
-    updatedAt: keys.updatedAt
+    keyId: keys.keyId
   })
 })
 
-router.post('/dm/enable/:conversationId', authenticateToken, (req, res) => {
+router.post('/dm/enable/:conversationId', authenticateToken, async (req, res) => {
   const { conversationId } = req.params
+  const conversation = getConversationForUser(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
-  const keys = dmE2eService.enableDmEncryption(conversationId)
+  const keys = await dmE2eService.enableDmEncryption(conversationId)
   
   io.to(`dm:${conversationId}`).emit('e2e:dm-enabled', {
     conversationId,
@@ -326,10 +371,14 @@ router.post('/dm/enable/:conversationId', authenticateToken, (req, res) => {
   })
 })
 
-router.post('/dm/disable/:conversationId', authenticateToken, (req, res) => {
+router.post('/dm/disable/:conversationId', authenticateToken, async (req, res) => {
   const { conversationId } = req.params
+  const conversation = getConversationForUser(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
-  const keys = dmE2eService.disableDmEncryption(conversationId)
+  await dmE2eService.disableDmEncryption(conversationId)
   
   io.to(`dm:${conversationId}`).emit('e2e:dm-disabled', {
     conversationId
@@ -341,6 +390,10 @@ router.post('/dm/disable/:conversationId', authenticateToken, (req, res) => {
 
 router.get('/dm/keys/:conversationId', authenticateToken, (req, res) => {
   const { conversationId } = req.params
+  const conversation = getConversationForUser(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
   if (!dmE2eService.isDmEncryptionEnabled(conversationId)) {
     return res.status(400).json({ error: 'Encryption is not enabled for this DM' })
@@ -366,9 +419,13 @@ router.get('/dm/keys/:conversationId', authenticateToken, (req, res) => {
   })
 })
 
-router.post('/dm/join/:conversationId', authenticateToken, (req, res) => {
+router.post('/dm/join/:conversationId', authenticateToken, async (req, res) => {
   const { conversationId } = req.params
   const { encryptedKey } = req.body
+  const conversation = getConversationForUser(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
   if (!dmE2eService.isDmEncryptionEnabled(conversationId)) {
     return res.status(400).json({ error: 'Encryption is not enabled for this DM' })
@@ -379,7 +436,7 @@ router.post('/dm/join/:conversationId', authenticateToken, (req, res) => {
   }
   
   const userId = req.user.id
-  dmE2eService.setParticipantEncryptedKey(conversationId, userId, encryptedKey)
+  await dmE2eService.setParticipantEncryptedKey(conversationId, userId, encryptedKey)
   
   io.to(`dm:${conversationId}`).emit('e2e:dm-member-key-added', {
     conversationId,
@@ -408,6 +465,10 @@ router.get('/dm/keys', authenticateToken, (req, res) => {
 router.get('/dm/user-keys/:conversationId', authenticateToken, (req, res) => {
   const userId = req.user.id
   const { conversationId } = req.params
+  const conversation = getConversationForUser(userId, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
   let keys = userKeyService.getUserKeys(userId)
   
@@ -439,14 +500,18 @@ router.get('/dm/user-keys/:conversationId', authenticateToken, (req, res) => {
   })
 })
 
-router.post('/dm/rotate/:conversationId', authenticateToken, (req, res) => {
+router.post('/dm/rotate/:conversationId', authenticateToken, async (req, res) => {
   const { conversationId } = req.params
+  const conversation = getConversationForUser(req.user.id, conversationId)
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
   
   if (!dmE2eService.isDmEncryptionEnabled(conversationId)) {
     return res.status(400).json({ error: 'Encryption is not enabled for this DM' })
   }
   
-  const keys = dmE2eService.rotateDmKey(conversationId)
+  const keys = await dmE2eService.rotateDmKey(conversationId)
   
   io.to(`dm:${conversationId}`).emit('e2e:dm-key-rotated', {
     conversationId,

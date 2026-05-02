@@ -1144,6 +1144,32 @@ export const importAllData = async (data) => {
   return results
 }
 
+const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+const PRIVILEGED_USER_FIELDS = new Set(['adminRole', 'role', 'isAdmin', 'isModerator'])
+
+const sanitizeUserMutation = (updates, { allowPrivilegeUpdates = false, allowCreatedAt = false } = {}) => {
+  if (!updates || typeof updates !== 'object' || Array.isArray(updates)) return {}
+
+  const sanitized = {}
+  for (const [key, value] of Object.entries(updates)) {
+    if (typeof key !== 'string') continue
+    if (UNSAFE_OBJECT_KEYS.has(key)) continue
+    if (key === 'id' || key === 'updatedAt') continue
+    if (key === 'createdAt' && !allowCreatedAt) continue
+    if (PRIVILEGED_USER_FIELDS.has(key) && !allowPrivilegeUpdates) continue
+    sanitized[key] = value
+  }
+
+  return sanitized
+}
+
+const resolveStoredFlag = (value, fallback = 0) => {
+  if (value === 1 || value === true || value === '1') return 1
+  if (value === 0 || value === false || value === '0') return 0
+  if (fallback === 1 || fallback === true || fallback === '1') return 1
+  return 0
+}
+
 export const userService = {
   getUser(userId) {
     const users = loadDataRef(FILES.users, {})
@@ -1173,26 +1199,39 @@ export const userService = {
     }
   },
 
-  async saveUser(userId, userData) {
-    // Always read fresh from DB to avoid cluster cache race conditions
-    // where multiple workers each have stale in-memory caches
+  async saveUser(userId, userData, options = {}) {
+    const allowPrivilegeUpdates = options?.allowPrivilegeUpdates === true
+    const safeUserData = sanitizeUserMutation(userData, { allowPrivilegeUpdates, allowCreatedAt: true })
+    // Always read fresh from storage to avoid cluster cache race conditions
+    // where multiple workers each have stale in-memory caches.
     const table = getTableName(FILES.users)
-    const freshUsers = loadFromIndividualTable(table, {})
-    // Update the in-memory cache with fresh data
+    const freshUsersResult = await loadFreshData(FILES.users, {})
+    const freshUsers = isObjectLike(freshUsersResult) ? freshUsersResult : {}
+    // Keep the in-memory cache aligned with the just-refreshed table snapshot.
     storageCache[table] = cloneData(freshUsers)
     const existingUser = freshUsers[userId]
     
     // CRITICAL: Preserve ALL existing user data, only override with explicitly provided fields
+    const nextAdminRole = allowPrivilegeUpdates
+      ? (safeUserData.adminRole ?? existingUser?.adminRole ?? null)
+      : (existingUser?.adminRole ?? null)
+    const nextIsAdmin = allowPrivilegeUpdates
+      ? resolveStoredFlag(safeUserData.isAdmin, existingUser?.isAdmin)
+      : resolveStoredFlag(existingUser?.isAdmin, 0)
+    const nextIsModerator = allowPrivilegeUpdates
+      ? resolveStoredFlag(safeUserData.isModerator, existingUser?.isModerator)
+      : resolveStoredFlag(existingUser?.isModerator, 0)
+
     freshUsers[userId] = {
       ...existingUser,  // Start with ALL existing data
-      ...userData,      // Override with new data
+      ...safeUserData,  // Override with validated data
       id: userId,       // Always ensure ID is set
-      // CRITICAL: Preserve admin/moderator flags - prefer existing over new
-      adminRole: existingUser?.adminRole ?? userData.adminRole ?? null,
-      isAdmin: existingUser?.isAdmin ?? userData.isAdmin ?? 0,
-      isModerator: existingUser?.isModerator ?? userData.isModerator ?? 0,
+      // Privileged fields can only be changed by trusted internal callers.
+      adminRole: nextAdminRole,
+      isAdmin: nextIsAdmin,
+      isModerator: nextIsModerator,
       // CRITICAL: Preserve birthDate - prefer existing over new
-      birthDate: existingUser?.birthDate ?? userData.birthDate ?? null,
+      birthDate: existingUser?.birthDate ?? safeUserData.birthDate ?? null,
       updatedAt: new Date().toISOString()
     }
     if (!freshUsers[userId].createdAt) {
@@ -1202,7 +1241,9 @@ export const userService = {
     return freshUsers[userId]
   },
 
-  async updateProfile(userId, updates) {
+  async updateProfile(userId, updates, options = {}) {
+    const allowPrivilegeUpdates = options?.allowPrivilegeUpdates === true
+    const safeUpdates = sanitizeUserMutation(updates, { allowPrivilegeUpdates })
     // Use atomic operation to prevent race conditions
     return transactionService.executeTransaction(async (connection) => {
       // Reload fresh data within transaction to prevent stale data issues
@@ -1212,18 +1253,29 @@ export const userService = {
       if (!existingUser) {
         users[userId] = { id: userId, createdAt: new Date().toISOString() }
       }
+      const baseUser = users[userId] || existingUser || { id: userId, createdAt: new Date().toISOString() }
       
       // CRITICAL: Preserve ALL existing user data, only override with explicitly provided fields
+      const nextAdminRole = allowPrivilegeUpdates
+        ? (safeUpdates.adminRole ?? baseUser?.adminRole ?? null)
+        : (baseUser?.adminRole ?? null)
+      const nextIsAdmin = allowPrivilegeUpdates
+        ? resolveStoredFlag(safeUpdates.isAdmin, baseUser?.isAdmin)
+        : resolveStoredFlag(baseUser?.isAdmin, 0)
+      const nextIsModerator = allowPrivilegeUpdates
+        ? resolveStoredFlag(safeUpdates.isModerator, baseUser?.isModerator)
+        : resolveStoredFlag(baseUser?.isModerator, 0)
+
       const updatedUser = {
-        ...existingUser,  // Start with ALL existing data
-        ...updates,       // Override with new data
+        ...baseUser,      // Start with ALL existing data
+        ...safeUpdates,   // Override with validated data
         id: userId,       // Always ensure ID is set
-        // CRITICAL: Preserve admin/moderator flags - prefer existing over new
-        adminRole: existingUser?.adminRole ?? updates.adminRole ?? null,
-        isAdmin: existingUser?.isAdmin ?? updates.isAdmin ?? 0,
-        isModerator: existingUser?.isModerator ?? updates.isModerator ?? 0,
+        // Privileged fields can only be changed by trusted internal callers.
+        adminRole: nextAdminRole,
+        isAdmin: nextIsAdmin,
+        isModerator: nextIsModerator,
         // CRITICAL: Preserve birthDate - prefer existing over new
-        birthDate: existingUser?.birthDate ?? updates.birthDate ?? null,
+        birthDate: baseUser?.birthDate ?? safeUpdates.birthDate ?? null,
         updatedAt: new Date().toISOString()
       }
       
@@ -1238,7 +1290,9 @@ export const userService = {
   /**
    * Optimistic locking version of updateProfile for high-concurrency scenarios
    */
-  async updateProfileOptimistic(userId, updates, maxRetries = 3) {
+  async updateProfileOptimistic(userId, updates, maxRetries = 3, options = {}) {
+    const allowPrivilegeUpdates = options?.allowPrivilegeUpdates === true
+    const safeUpdates = sanitizeUserMutation(updates, { allowPrivilegeUpdates })
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         // Load current version with timestamp
@@ -1249,18 +1303,29 @@ export const userService = {
         if (!existingUser) {
           users[userId] = { id: userId, createdAt: new Date().toISOString() }
         }
+        const baseUser = users[userId] || existingUser || { id: userId, createdAt: new Date().toISOString() }
         
         // Create updated user with version check
         const now = new Date().toISOString()
+        const nextAdminRole = allowPrivilegeUpdates
+          ? (safeUpdates.adminRole ?? baseUser?.adminRole ?? null)
+          : (baseUser?.adminRole ?? null)
+        const nextIsAdmin = allowPrivilegeUpdates
+          ? resolveStoredFlag(safeUpdates.isAdmin, baseUser?.isAdmin)
+          : resolveStoredFlag(baseUser?.isAdmin, 0)
+        const nextIsModerator = allowPrivilegeUpdates
+          ? resolveStoredFlag(safeUpdates.isModerator, baseUser?.isModerator)
+          : resolveStoredFlag(baseUser?.isModerator, 0)
+
         const updatedUser = {
-          ...existingUser,
-          ...updates,
+          ...baseUser,
+          ...safeUpdates,
           id: userId,
-          // Preserve critical fields as before
-          adminRole: existingUser?.adminRole ?? updates.adminRole ?? null,
-          isAdmin: existingUser?.isAdmin ?? updates.isAdmin ?? 0,
-          isModerator: existingUser?.isModerator ?? updates.isModerator ?? 0,
-          birthDate: existingUser?.birthDate ?? updates.birthDate ?? null,
+          // Privileged fields can only be changed by trusted internal callers.
+          adminRole: nextAdminRole,
+          isAdmin: nextIsAdmin,
+          isModerator: nextIsModerator,
+          birthDate: baseUser?.birthDate ?? safeUpdates.birthDate ?? null,
           updatedAt: now,
           version: currentVersion
         }
@@ -1439,6 +1504,15 @@ export const friendService = {
     return []
   },
 
+  async getFriendsFresh(userId) {
+    const friends = await loadFreshData(FILES.friends, {})
+    const userFriends = friends?.[userId]
+    if (Array.isArray(userFriends)) {
+      return [...userFriends]
+    }
+    return []
+  },
+
   async addFriend(userId, friendId) {
     if (await addFriendRows(userId, friendId)) {
       return true
@@ -1493,8 +1567,7 @@ export const friendService = {
 }
 
 export const friendRequestService = {
-  getRequests(userId) {
-    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+  _hydrateRequests(userId, requests) {
     const incomingMap = requests?.incoming && typeof requests.incoming === 'object' ? requests.incoming : {}
     const outgoingMap = requests?.outgoing && typeof requests.outgoing === 'object' ? requests.outgoing : {}
     const hydrateRequest = (request, fallbackFrom, fallbackTo) => {
@@ -1517,6 +1590,16 @@ export const friendRequestService = {
       incoming,
       outgoing
     }
+  },
+
+  getRequests(userId) {
+    const requests = loadData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+    return this._hydrateRequests(userId, requests)
+  },
+
+  async getRequestsFresh(userId) {
+    const requests = await loadFreshData(FILES.friendRequests, { incoming: {}, outgoing: {} })
+    return this._hydrateRequests(userId, requests)
   },
 
   async sendRequest(fromUserId, toUserId, fromUsername, toUsername) {
@@ -2147,6 +2230,14 @@ export const serverService = {
     return servers[serverId] || null
   },
 
+  async getServerFresh(serverId) {
+    const servers = await this.getAllServersFresh()
+    if (Array.isArray(servers)) {
+      return servers.find(s => s.id === serverId) || null
+    }
+    return servers?.[serverId] || null
+  },
+
   async createServer(serverData) {
     const servers = loadData(FILES.servers, {})
     servers[serverData.id] = {
@@ -2188,8 +2279,24 @@ export const serverService = {
     return loadData(FILES.servers, {})
   },
 
+  async getAllServersFresh() {
+    return await loadFreshData(FILES.servers, {})
+  },
+
   getAllCategoriesGrouped() {
     const categories = loadData(FILES.categories, {})
+    const grouped = {}
+    const values = Array.isArray(categories) ? categories : Object.values(categories || {})
+    for (const category of values) {
+      if (!category?.serverId) continue
+      if (!grouped[category.serverId]) grouped[category.serverId] = []
+      grouped[category.serverId].push(category)
+    }
+    return grouped
+  },
+
+  async getAllCategoriesGroupedFresh() {
+    const categories = await loadFreshData(FILES.categories, {})
     const grouped = {}
     const values = Array.isArray(categories) ? categories : Object.values(categories || {})
     for (const category of values) {
@@ -2261,6 +2368,19 @@ export const channelService = {
       return this._flattenLegacy(raw)
     }
     return raw
+  },
+
+  _normalizeFlatFromRaw(raw = {}) {
+    if (Object.keys(raw).length === 0) return raw
+    if (this._isLegacyFormat(raw)) {
+      return this._flattenLegacy(raw)
+    }
+    return raw
+  },
+
+  async _loadFlatFresh() {
+    const raw = await loadFreshData(FILES.channels, {})
+    return this._normalizeFlatFromRaw(raw)
   },
 
   getChannel(channelId) {
@@ -2409,8 +2529,24 @@ export const channelService = {
     return loadData(FILES.channels, {})
   },
 
+  async getAllChannelsFresh() {
+    return await loadFreshData(FILES.channels, {})
+  },
+
   getAllChannelsGrouped() {
-    const channels = this.getAllChannels()
+    const channels = this._normalizeFlatFromRaw(this.getAllChannels())
+    const grouped = {}
+    const values = Array.isArray(channels) ? channels : Object.values(channels || {})
+    for (const channel of values) {
+      if (!channel?.serverId) continue
+      if (!grouped[channel.serverId]) grouped[channel.serverId] = []
+      grouped[channel.serverId].push(channel)
+    }
+    return grouped
+  },
+
+  async getAllChannelsGroupedFresh() {
+    const channels = this._normalizeFlatFromRaw(await this.getAllChannelsFresh())
     const grouped = {}
     const values = Array.isArray(channels) ? channels : Object.values(channels || {})
     for (const channel of values) {
@@ -3312,7 +3448,7 @@ export const adminService = {
   },
 
   setUserRole(userId, role) {
-    return userService.updateProfile(userId, { adminRole: role })
+    return userService.updateProfile(userId, { adminRole: role }, { allowPrivilegeUpdates: true })
   },
 
   logAction(userId, action, targetId, details) {

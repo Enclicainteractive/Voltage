@@ -1,6 +1,7 @@
 import express from 'express'
 import { authenticateToken } from '../middleware/authMiddleware.js'
 import { adminService, globalBanService, serverBanService, userService, discoveryService, serverService, channelService, messageService, FILES } from '../services/dataService.js'
+import { toSafeUser, toSafeUsers } from '../services/userService.js'
 import config from '../config/config.js'
 import { getOnlineUsers } from '../services/socketService.js'
 import { supportsDirectQuery, directQuery } from '../services/dataService.js'
@@ -146,6 +147,127 @@ const getAvatarUrl = (userId) => {
   return `${baseUrl}/api/images/users/${encodeURIComponent(safeUserId)}/profile`
 }
 
+const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+const ROLE_LEVEL = Object.freeze({
+  user: 0,
+  moderator: 1,
+  admin: 2,
+  owner: 3
+})
+const ASSIGNABLE_ROLES = new Set(['user', 'moderator', 'admin', 'owner'])
+const BAN_TYPE_ALLOWLIST = new Set(['permanent', 'temporary'])
+
+const normalizeText = (value) => typeof value === 'string' ? value.trim() : ''
+const normalizeRole = (value) => normalizeText(value).toLowerCase()
+
+const isSafeId = (value) => {
+  const normalized = normalizeText(value)
+  if (!normalized || normalized.length > 160) return false
+  if (RESERVED_OBJECT_KEYS.has(normalized)) return false
+  return /^[a-zA-Z0-9_.:@-]+$/.test(normalized)
+}
+
+const parseBoundedInt = (value, fallback, { min = 0, max = 500 } = {}) => {
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isFinite(parsed)) return fallback
+  if (parsed < min) return min
+  if (parsed > max) return max
+  return parsed
+}
+
+const getConfiguredAdminEntries = () => {
+  return (config.config.security?.adminUsers || [])
+    .map(entry => normalizeText(entry))
+    .filter(Boolean)
+}
+
+const isConfiguredAdminUser = (userId) => {
+  const entries = getConfiguredAdminEntries()
+  if (entries.length === 0) return false
+
+  const normalizedId = normalizeText(userId)
+  const lowerEntries = new Set(entries.map(entry => entry.toLowerCase()))
+
+  if (normalizedId && (entries.includes(normalizedId) || lowerEntries.has(normalizedId.toLowerCase()))) {
+    return true
+  }
+  return false
+}
+
+const getTrustedPrivilege = (userId, cachedUser = null) => {
+  const normalizedUserId = normalizeText(userId)
+  const persistedUser = cachedUser || (normalizedUserId ? userService.getUser(normalizedUserId) : null)
+
+  if (isConfiguredAdminUser(normalizedUserId)) {
+    return { user: persistedUser, role: 'owner', level: ROLE_LEVEL.owner, configuredAdmin: true }
+  }
+
+  const persistedRole = normalizeRole(persistedUser?.adminRole || persistedUser?.role)
+  if (Object.prototype.hasOwnProperty.call(ROLE_LEVEL, persistedRole)) {
+    return { user: persistedUser, role: persistedRole, level: ROLE_LEVEL[persistedRole], configuredAdmin: false }
+  }
+
+  if (normalizedUserId && adminService.isAdmin(normalizedUserId)) {
+    return { user: persistedUser, role: 'admin', level: ROLE_LEVEL.admin, configuredAdmin: false }
+  }
+
+  if (normalizedUserId && adminService.isModerator(normalizedUserId)) {
+    return { user: persistedUser, role: 'moderator', level: ROLE_LEVEL.moderator, configuredAdmin: false }
+  }
+
+  return { user: persistedUser, role: 'user', level: ROLE_LEVEL.user, configuredAdmin: false }
+}
+
+const readSafeRouteId = (req, res, paramName, label) => {
+  const value = normalizeText(req.params?.[paramName])
+  if (!isSafeId(value)) {
+    res.status(400).json({ error: `Invalid ${label}` })
+    return null
+  }
+  return value
+}
+
+const getTargetUserContext = (req, res, {
+  minActorLevel = ROLE_LEVEL.moderator,
+  allowSelfTarget = false,
+  requireExistingTarget = true,
+  actionLabel = 'perform this action'
+} = {}) => {
+  const actorId = normalizeText(req.user?.id || req.user?.userId)
+  if (!isSafeId(actorId)) {
+    res.status(403).json({ error: 'Invalid authenticated user context' })
+    return null
+  }
+
+  const targetId = readSafeRouteId(req, res, 'userId', 'user id')
+  if (!targetId) return null
+
+  if (!allowSelfTarget && actorId === targetId) {
+    res.status(403).json({ error: `You cannot ${actionLabel} on your own account` })
+    return null
+  }
+
+  const actorPrivilege = getTrustedPrivilege(actorId)
+  if (actorPrivilege.level < minActorLevel) {
+    res.status(403).json({ error: 'Insufficient privilege level for this action' })
+    return null
+  }
+
+  const targetUser = userService.getUser(targetId)
+  if (requireExistingTarget && !targetUser) {
+    res.status(404).json({ error: 'User not found' })
+    return null
+  }
+
+  const targetPrivilege = getTrustedPrivilege(targetId, targetUser)
+  if (actorId !== targetId && actorPrivilege.level <= targetPrivilege.level) {
+    res.status(403).json({ error: 'Insufficient privilege to manage this account' })
+    return null
+  }
+
+  return { actorId, targetId, actorPrivilege, targetPrivilege, targetUser }
+}
+
 const buildMemberSnapshot = (serverId, member = {}) => {
   const profile = member?.id ? userService.getUser(member.id) : null
   const username = member.username || profile?.username || profile?.displayName || profile?.email || member.id || 'Unknown user'
@@ -248,24 +370,18 @@ const buildServerMetrics = async () => {
 }
 
 const requireAdmin = (req, res, next) => {
-  if (!adminService.isAdmin(req.user.id)) {
+  const userId = normalizeText(req.user?.id || req.user?.userId)
+  const privilege = getTrustedPrivilege(userId)
+  if (privilege.level < ROLE_LEVEL.admin) {
     return res.status(403).json({ error: 'Admin access required' })
   }
   next()
 }
 
 const requireModerator = (req, res, next) => {
-  const adminUsers = config.config.security?.adminUsers || []
-  const tokenUserId = req.user?.id || req.user?.userId || null
-  const tokenUsername = req.user?.username || null
-  const tokenRole = req.user?.adminRole
-  const tokenIsAdmin = req.user?.isAdmin === true || req.user?.isAdmin === 1 || req.user?.isAdmin === '1' || req.user?.isAdmin === 'true'
-  const tokenIsModerator = req.user?.isModerator === true || req.user?.isModerator === 1 || req.user?.isModerator === '1' || req.user?.isModerator === 'true'
-  const servers = serverService.getAllServers()
-  const serverArray = Array.isArray(servers) ? servers : Object.values(servers || {})
-  const ownsAnyServer = tokenUserId ? serverArray.some(s => s?.ownerId === tokenUserId) : false
-  const isConfiguredAdmin = (tokenUserId && adminUsers.includes(tokenUserId)) || (tokenUsername && adminUsers.includes(tokenUsername))
-  if (!(isConfiguredAdmin || (tokenUserId && adminService.isModerator(tokenUserId)) || tokenIsAdmin || tokenIsModerator || tokenRole === 'admin' || tokenRole === 'owner' || tokenRole === 'moderator' || ownsAnyServer)) {
+  const userId = normalizeText(req.user?.id || req.user?.userId)
+  const privilege = getTrustedPrivilege(userId)
+  if (privilege.level < ROLE_LEVEL.moderator) {
     return res.status(403).json({ error: 'Moderator access required' })
   }
   next()
@@ -291,9 +407,11 @@ router.get('/online-users', authenticateToken, requireModerator, (req, res) => {
 router.get('/users', authenticateToken, requireModerator, (req, res) => {
   const { search, role, limit = 50, offset = 0 } = req.query
   let users = adminService.getAllUsers()
+  const safeLimit = parseBoundedInt(limit, 50, { min: 1, max: 250 })
+  const safeOffset = parseBoundedInt(offset, 0, { min: 0, max: 5000 })
   
   if (search) {
-    const searchLower = search.toLowerCase()
+    const searchLower = String(search).toLowerCase()
     users = users.filter(u => 
       u.username?.toLowerCase().includes(searchLower) ||
       u.email?.toLowerCase().includes(searchLower)
@@ -301,91 +419,162 @@ router.get('/users', authenticateToken, requireModerator, (req, res) => {
   }
   
   if (role) {
-    users = users.filter(u => u.adminRole === role)
+    const normalizedRole = normalizeRole(role)
+    if (!ASSIGNABLE_ROLES.has(normalizedRole)) {
+      return res.status(400).json({ error: 'Invalid role filter' })
+    }
+    users = users.filter(u => normalizeRole(u.adminRole || u.role || 'user') === normalizedRole)
   }
   
   const total = users.length
-  users = users.slice(parseInt(offset), parseInt(offset) + parseInt(limit))
+  users = toSafeUsers(users.slice(safeOffset, safeOffset + safeLimit))
   
   res.json({ users, total })
 })
 
 router.get('/users/:userId', authenticateToken, requireModerator, (req, res) => {
-  const user = userService.getUser(req.params.userId)
+  const targetUserId = readSafeRouteId(req, res, 'userId', 'user id')
+  if (!targetUserId) return
+
+  const user = userService.getUser(targetUserId)
   if (!user) {
     return res.status(404).json({ error: 'User not found' })
   }
   
-  const isBanned = globalBanService.isBanned(req.params.userId)
-  const ban = globalBanService.getBan(req.params.userId)
-  const adminRole = adminService.getUserRole(req.params.userId)
+  const isBanned = globalBanService.isBanned(targetUserId)
+  const adminRole = adminService.getUserRole(targetUserId)
   
-  res.json({ ...user, isBanned, ban, adminRole })
+  res.json({ ...toSafeUser(user), isBanned, adminRole })
 })
 
 router.put('/users/:userId/role', authenticateToken, requireAdmin, async (req, res) => {
-  const { role } = req.body
-  const user = await adminService.setUserRole(req.params.userId, role)
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.admin,
+    actionLabel: 'change roles',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
+  const desiredRole = normalizeRole(req.body?.role)
+  if (!ASSIGNABLE_ROLES.has(desiredRole)) {
+    return res.status(400).json({ error: 'Invalid role value' })
+  }
+
+  if ((desiredRole === 'owner' || desiredRole === 'admin') && context.actorPrivilege.level < ROLE_LEVEL.owner) {
+    return res.status(403).json({ error: 'Only owner-level staff can assign admin/owner roles' })
+  }
+
+  const user = await adminService.setUserRole(context.targetId, desiredRole)
   
-  adminService.logAction(req.user.id, 'set_role', req.params.userId, { role })
+  await adminService.logAction(context.actorId, 'set_role', context.targetId, { role: desiredRole })
   
-  res.json(user)
+  res.json(toSafeUser(user))
 })
 
-router.post('/users/:userId/ban', authenticateToken, requireModerator, (req, res) => {
-  const { reason, banType } = req.body
+router.post('/users/:userId/ban', authenticateToken, requireModerator, async (req, res) => {
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.moderator,
+    actionLabel: 'ban this user',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
+  const reason = normalizeText(req.body?.reason)
+  const requestedBanType = normalizeRole(req.body?.banType)
+  const normalizedBanType = BAN_TYPE_ALLOWLIST.has(requestedBanType) ? requestedBanType : 'permanent'
   
-  if (globalBanService.isBanned(req.params.userId)) {
+  if (globalBanService.isBanned(context.targetId)) {
     return res.status(400).json({ error: 'User already banned' })
   }
   
-  const ban = globalBanService.banUser(req.params.userId, reason, req.user.id, banType || 'permanent')
+  const ban = await globalBanService.banUser(context.targetId, {
+    reason: reason || null,
+    bannedBy: context.actorId,
+    banType: normalizedBanType
+  })
   
-  adminService.logAction(req.user.id, 'ban_user', req.params.userId, { reason, banType })
+  await adminService.logAction(context.actorId, 'ban_user', context.targetId, {
+    reason: reason || null,
+    banType: normalizedBanType
+  })
   
   res.json(ban)
 })
 
-router.delete('/users/:userId/ban', authenticateToken, requireModerator, (req, res) => {
-  if (!globalBanService.isBanned(req.params.userId)) {
+router.delete('/users/:userId/ban', authenticateToken, requireModerator, async (req, res) => {
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.moderator,
+    actionLabel: 'unban this user',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
+  if (!globalBanService.isBanned(context.targetId)) {
     return res.status(400).json({ error: 'User not banned' })
   }
   
-  globalBanService.unbanUser(req.params.userId)
+  await globalBanService.unbanUser(context.targetId)
   
-  adminService.logAction(req.user.id, 'unban_user', req.params.userId, {})
+  await adminService.logAction(context.actorId, 'unban_user', context.targetId, {})
   
   res.json({ success: true })
 })
 
 router.post('/users/:userId/reset-password', authenticateToken, requireAdmin, async (req, res) => {
-  const result = await adminService.resetUserPassword(req.params.userId)
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.admin,
+    actionLabel: 'reset password',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
+  const result = await adminService.resetUserPassword(context.targetId)
   
   if (result.error) {
     return res.status(404).json(result)
   }
   
-  adminService.logAction(req.user.id, 'reset_password', req.params.userId, {})
+  await adminService.logAction(context.actorId, 'reset_password', context.targetId, {})
   
   res.json(result)
 })
 
 router.delete('/users/:userId', authenticateToken, requireAdmin, async (req, res) => {
-  const result = await adminService.deleteUser(req.params.userId)
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.admin,
+    actionLabel: 'delete this user',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
+  const result = await adminService.deleteUser(context.targetId)
   
   if (result.error) {
     return res.status(404).json(result)
   }
   
-  adminService.logAction(req.user.id, 'delete_user', req.params.userId, {})
+  await adminService.logAction(context.actorId, 'delete_user', context.targetId, {})
   
   res.json(result)
 })
 
 // Age Verification Management
 router.post('/users/:userId/age-verify', authenticateToken, requireModerator, async (req, res) => {
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.moderator,
+    actionLabel: 'verify age',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
   const { category, method, age, birthYear, expiresInDays } = req.body
-  const existingUser = userService.getUser(req.params.userId)
+  const existingUser = context.targetUser
   
   const verification = {
     verified: true,
@@ -402,53 +591,71 @@ router.post('/users/:userId/age-verify', authenticateToken, requireModerator, as
     jurisdictionCode: existingUser?.ageVerificationJurisdiction || existingUser?.ageVerification?.jurisdictionCode
   }
   
-  const user = await userService.setAgeVerification(req.params.userId, verification)
+  const user = await userService.setAgeVerification(context.targetId, verification)
   
-  adminService.logAction(req.user.id, 'age_verify', req.params.userId, { category, method })
+  await adminService.logAction(context.actorId, 'age_verify', context.targetId, { category, method })
   
-  res.json(user)
+  res.json(toSafeUser(user))
 })
 
 router.delete('/users/:userId/age-verification', authenticateToken, requireModerator, async (req, res) => {
-  const users = loadData(FILES.users, {})
-  
-  if (users[req.params.userId]) {
-    delete users[req.params.userId].ageVerification
-    users[req.params.userId].updatedAt = new Date().toISOString()
-    await saveData(FILES.users, users)
-    
-    adminService.logAction(req.user.id, 'remove_age_verify', req.params.userId, {})
-    
-    return res.json({ success: true })
-  }
-  
-  res.json({ error: 'User not found' })
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.moderator,
+    actionLabel: 'remove age verification',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
+  await userService.updateProfile(context.targetId, {
+    ageVerification: null,
+    ageVerificationJurisdiction: null
+  })
+
+  await adminService.logAction(context.actorId, 'remove_age_verify', context.targetId, {})
+
+  res.json({ success: true })
 })
 
 // User Status Management
 router.put('/users/:userId/status', authenticateToken, requireModerator, async (req, res) => {
+  const context = getTargetUserContext(req, res, {
+    minActorLevel: ROLE_LEVEL.moderator,
+    actionLabel: 'change status',
+    allowSelfTarget: false,
+    requireExistingTarget: true
+  })
+  if (!context) return
+
   const { status, customStatus } = req.body
+  const normalizedStatus = normalizeText(status)
   
-  const user = await userService.setStatus(req.params.userId, status, customStatus)
+  if (!normalizedStatus || normalizedStatus.length > 50) {
+    return res.status(400).json({ error: 'Invalid status value' })
+  }
+
+  const user = await userService.setStatus(context.targetId, normalizedStatus, customStatus)
   
-  adminService.logAction(req.user.id, 'set_status', req.params.userId, { status, customStatus })
+  await adminService.logAction(context.actorId, 'set_status', context.targetId, { status: normalizedStatus, customStatus })
   
-  res.json(user)
+  res.json(toSafeUser(user))
 })
 
 router.get('/servers', authenticateToken, requireModerator, async (req, res) => {
   const { search, limit = 50, offset = 0 } = req.query
   const { servers, serverMessageStats } = await buildServerMetrics()
+  const safeLimit = parseBoundedInt(limit, 50, { min: 1, max: 250 })
+  const safeOffset = parseBoundedInt(offset, 0, { min: 0, max: 5000 })
   
   let filtered = servers
   
   if (search) {
-    const searchLower = search.toLowerCase()
+    const searchLower = String(search).toLowerCase()
     filtered = filtered.filter(s => s.name.toLowerCase().includes(searchLower))
   }
   
   const total = filtered.length
-  filtered = filtered.slice(parseInt(offset), parseInt(offset) + parseInt(limit))
+  filtered = filtered.slice(safeOffset, safeOffset + safeLimit)
   
   const serversWithBanned = filtered.map(s => ({
     ...s,
@@ -479,8 +686,11 @@ router.get('/servers', authenticateToken, requireModerator, async (req, res) => 
 })
 
 router.get('/servers/:serverId', authenticateToken, requireModerator, async (req, res) => {
+  const serverId = readSafeRouteId(req, res, 'serverId', 'server id')
+  if (!serverId) return
+
   const { servers, channelsByServer, channelMessageStats, serverMessageStats } = await buildServerMetrics()
-  const server = servers.find(item => item.id === req.params.serverId)
+  const server = servers.find(item => item.id === serverId)
 
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
@@ -528,7 +738,10 @@ router.get('/servers/:serverId', authenticateToken, requireModerator, async (req
 })
 
 router.post('/servers/:serverId/join', authenticateToken, requireModerator, async (req, res) => {
-  const server = serverService.getServer(req.params.serverId)
+  const serverId = readSafeRouteId(req, res, 'serverId', 'server id')
+  if (!serverId) return
+
+  const server = serverService.getServer(serverId)
 
   if (!server) {
     return res.status(404).json({ error: 'Server not found' })
@@ -555,7 +768,7 @@ router.post('/servers/:serverId/join', authenticateToken, requireModerator, asyn
 
   server.members.push(memberEntry)
   const updated = await serverService.updateServer(server.id, { members: server.members })
-  adminService.logAction(req.user.id, 'join_server_admin', req.params.serverId, { serverName: server.name })
+  await adminService.logAction(req.user.id, 'join_server_admin', serverId, { serverName: server.name })
 
   res.json({
     success: true,
@@ -567,32 +780,42 @@ router.post('/servers/:serverId/join', authenticateToken, requireModerator, asyn
   })
 })
 
-router.post('/servers/:serverId/ban', authenticateToken, requireModerator, (req, res) => {
+router.post('/servers/:serverId/ban', authenticateToken, requireModerator, async (req, res) => {
+  const serverId = readSafeRouteId(req, res, 'serverId', 'server id')
+  if (!serverId) return
   const { reason } = req.body
+
+  const server = serverService.getServer(serverId)
+  if (!server) {
+    return res.status(404).json({ error: 'Server not found' })
+  }
   
-  if (serverBanService.isServerBanned(req.params.serverId)) {
+  if (serverBanService.isServerBanned(serverId)) {
     return res.status(400).json({ error: 'Server already banned' })
   }
   
-  const result = serverBanService.banServer(req.params.serverId, reason, req.user.id)
+  const result = await serverBanService.banServer(serverId, normalizeText(reason) || null, req.user.id)
   
   if (result.error) {
     return res.status(404).json(result)
   }
   
-  adminService.logAction(req.user.id, 'ban_server', req.params.serverId, { reason })
+  await adminService.logAction(req.user.id, 'ban_server', serverId, { reason: normalizeText(reason) || null })
   
   res.json(result)
 })
 
-router.delete('/servers/:serverId/ban', authenticateToken, requireModerator, (req, res) => {
-  if (!serverBanService.isServerBanned(req.params.serverId)) {
+router.delete('/servers/:serverId/ban', authenticateToken, requireModerator, async (req, res) => {
+  const serverId = readSafeRouteId(req, res, 'serverId', 'server id')
+  if (!serverId) return
+
+  if (!serverBanService.isServerBanned(serverId)) {
     return res.status(400).json({ error: 'Server not banned' })
   }
   
-  serverBanService.unbanServer(req.params.serverId)
+  await serverBanService.unbanServer(serverId)
   
-  adminService.logAction(req.user.id, 'unban_server', req.params.serverId, {})
+  await adminService.logAction(req.user.id, 'unban_server', serverId, {})
   
   res.json({ success: true })
 })
@@ -609,18 +832,28 @@ router.get('/banned-servers', authenticateToken, requireModerator, (req, res) =>
 
 router.get('/logs', authenticateToken, requireModerator, (req, res) => {
   const { limit = 100 } = req.query
-  const logs = adminService.getLogs(parseInt(limit))
+  const safeLimit = parseBoundedInt(limit, 100, { min: 1, max: 500 })
+  const logs = adminService.getLogs(safeLimit)
   res.json(logs)
 })
 
 router.get('/my-role', authenticateToken, (req, res) => {
-  const role = adminService.getUserRole(req.user.id)
   const isAdmin = adminService.isAdmin(req.user.id)
   const isModerator = adminService.isModerator(req.user.id)
+
+  // For non-privileged users, do NOT echo back any admin-side metadata
+  // (role names, moderator flags, role-permission lists). They simply learn
+  // they are not staff. This prevents the endpoint from being used to
+  // enumerate admin role identifiers / structures.
+  if (!isAdmin && !isModerator) {
+    return res.json({ role: null, isAdmin: false })
+  }
+
+  const role = adminService.getUserRole(req.user.id)
   res.json({ role, isAdmin, isModerator })
 })
 
-router.get('/maintenance', authenticateToken, async (req, res) => {
+router.get('/maintenance', authenticateToken, requireModerator, async (req, res) => {
   const windowData = getMaintenanceWindow()
   const status = computeMaintenanceStatus(windowData)
   
@@ -713,28 +946,36 @@ router.get('/discovery/pending', authenticateToken, requireModerator, (req, res)
 
 router.get('/discovery/approved', authenticateToken, requireModerator, async (req, res) => {
   const { limit = 50, offset = 0 } = req.query
-  const result = await discoveryService.getApprovedServers(parseInt(limit), parseInt(offset))
+  const safeLimit = parseBoundedInt(limit, 50, { min: 1, max: 250 })
+  const safeOffset = parseBoundedInt(offset, 0, { min: 0, max: 5000 })
+  const result = await discoveryService.getApprovedServers(safeLimit, safeOffset)
   res.json(result)
 })
 
 router.post('/discovery/approve/:submissionId', authenticateToken, requireModerator, (req, res) => {
-  const result = discoveryService.approveSubmission(req.params.submissionId)
+  const submissionId = readSafeRouteId(req, res, 'submissionId', 'submission id')
+  if (!submissionId) return
+  const result = discoveryService.approveSubmission(submissionId)
   if (result.error) {
     return res.status(400).json({ error: result.error })
   }
-  adminService.logAction(req.user.id, 'approve_discovery', req.params.submissionId, { serverName: result.name })
+  adminService.logAction(req.user.id, 'approve_discovery', submissionId, { serverName: result.name })
   res.json(result)
 })
 
 router.post('/discovery/reject/:submissionId', authenticateToken, requireModerator, (req, res) => {
-  const result = discoveryService.rejectSubmission(req.params.submissionId)
-  adminService.logAction(req.user.id, 'reject_discovery', req.params.submissionId, {})
+  const submissionId = readSafeRouteId(req, res, 'submissionId', 'submission id')
+  if (!submissionId) return
+  const result = discoveryService.rejectSubmission(submissionId)
+  adminService.logAction(req.user.id, 'reject_discovery', submissionId, {})
   res.json(result)
 })
 
 router.delete('/discovery/remove/:serverId', authenticateToken, requireModerator, (req, res) => {
-  const result = discoveryService.removeFromDiscovery(req.params.serverId)
-  adminService.logAction(req.user.id, 'remove_discovery', req.params.serverId, {})
+  const serverId = readSafeRouteId(req, res, 'serverId', 'server id')
+  if (!serverId) return
+  const result = discoveryService.removeFromDiscovery(serverId)
+  adminService.logAction(req.user.id, 'remove_discovery', serverId, {})
   res.json(result)
 })
 
@@ -832,8 +1073,10 @@ router.get('/self-volts', authenticateToken, requireModerator, async (req, res) 
 })
 
 router.get('/self-volts/:voltId', authenticateToken, requireModerator, async (req, res) => {
+  const voltId = readSafeRouteId(req, res, 'voltId', 'self-volt id')
+  if (!voltId) return
   const selfVolts = await loadData(SELF_VOLT_FILE, [])
-  const volt = selfVolts.find(v => v.id === req.params.voltId)
+  const volt = selfVolts.find(v => v.id === voltId)
   if (!volt) {
     return res.status(404).json({ error: 'Self-Volt not found' })
   }
@@ -841,24 +1084,50 @@ router.get('/self-volts/:voltId', authenticateToken, requireModerator, async (re
 })
 
 router.delete('/self-volts/:voltId', authenticateToken, requireModerator, async (req, res) => {
+  const voltId = readSafeRouteId(req, res, 'voltId', 'self-volt id')
+  if (!voltId) return
   let selfVolts = await loadData(SELF_VOLT_FILE, [])
-  selfVolts = selfVolts.filter(v => v.id !== req.params.voltId)
+  const beforeCount = selfVolts.length
+  selfVolts = selfVolts.filter(v => v.id !== voltId)
+  if (selfVolts.length === beforeCount) {
+    return res.status(404).json({ error: 'Self-Volt not found' })
+  }
   await saveData(SELF_VOLT_FILE, selfVolts)
   
-  adminService.logAction(req.user.id, 'delete_self_volt', req.params.voltId, {})
+  adminService.logAction(req.user.id, 'delete_self_volt', voltId, {})
   res.json({ success: true })
 })
 
 router.post('/self-volts/:voltId/test', authenticateToken, requireModerator, async (req, res) => {
-  const selfVolts = loadData(SELF_VOLT_FILE, [])
-  const volt = selfVolts.find(v => v.id === req.params.voltId)
+  const voltId = readSafeRouteId(req, res, 'voltId', 'self-volt id')
+  if (!voltId) return
+
+  const selfVolts = await loadData(SELF_VOLT_FILE, [])
+  const volt = selfVolts.find(v => v.id === voltId)
   
   if (!volt) {
     return res.status(404).json({ error: 'Self-Volt not found' })
   }
+
+  let targetUrl = null
+  try {
+    targetUrl = new URL(`${volt.url || ''}`)
+  } catch {
+    return res.status(400).json({ error: 'Self-Volt URL is invalid' })
+  }
+
+  if (!['http:', 'https:'].includes(targetUrl.protocol)) {
+    return res.status(400).json({ error: 'Self-Volt URL protocol must be http or https' })
+  }
+
+  const loopbackHosts = new Set(['127.0.0.1', '::1', 'localhost'])
+  const hostLower = targetUrl.hostname.toLowerCase()
+  if (loopbackHosts.has(hostLower) || hostLower.endsWith('.local')) {
+    return res.status(400).json({ error: 'Loopback and local network hosts are not allowed for probe tests' })
+  }
   
   try {
-    const response = await fetch(`${volt.url}/api/health`, {
+    const response = await fetch(`${targetUrl.toString().replace(/\/+$/, '')}/api/health`, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(5000)

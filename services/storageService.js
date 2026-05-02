@@ -11,6 +11,11 @@ const require = createRequire(import.meta.url)
 let db = null
 let storage = null
 
+const unwrapQueryRows = (result) => {
+  if (Array.isArray(result) && Array.isArray(result[0])) return result[0]
+  return Array.isArray(result) ? result : []
+}
+
 const TABLES = [
   'users',
   'friends',
@@ -418,60 +423,6 @@ const buildDmMessagesStateFromRows = (rows = []) => {
     })
   }
   return result
-}
-
-const initJsonStorage = () => {
-  const storageConfig = config.config.storage
-  const dataDir = storageConfig.json?.dataDir || path.join(__dirname, '..', 'data')
-  
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true })
-  }
-  
-  return {
-    type: 'json',
-    provider: 'json',
-    dataDir,
-    files: {
-      users: path.join(dataDir, 'users.json'),
-      friends: path.join(dataDir, 'friends.json'),
-      friendRequests: path.join(dataDir, 'friend-requests.json'),
-      dms: path.join(dataDir, 'dms.json'),
-      dmMessages: path.join(dataDir, 'dm-messages.json'),
-      servers: path.join(dataDir, 'servers.json'),
-      channels: path.join(dataDir, 'channels.json'),
-      messages: path.join(dataDir, 'messages.json'),
-      reactions: path.join(dataDir, 'reactions.json'),
-      serverInvites: path.join(dataDir, 'server-invites.json'),
-      blocked: path.join(dataDir, 'blocked.json'),
-      files: path.join(dataDir, 'files.json'),
-      attachments: path.join(dataDir, 'attachments.json'),
-      discovery: path.join(dataDir, 'discovery.json'),
-      globalBans: path.join(dataDir, 'global-bans.json'),
-      serverBans: path.join(dataDir, 'server-bans.json'),
-      adminLogs: path.join(dataDir, 'admin-logs.json'),
-      moderationReports: path.join(dataDir, 'moderation-reports.json')
-    },
-    load(file, defaultValue = {}) {
-      try {
-        if (fs.existsSync(file)) {
-          return JSON.parse(fs.readFileSync(file, 'utf8'))
-        }
-      } catch (err) {
-        console.error(`[Data] Error loading ${file}:`, err.message)
-      }
-      return defaultValue
-    },
-    save(file, data) {
-      try {
-        fs.writeFileSync(file, JSON.stringify(data, null, 2))
-        return true
-      } catch (err) {
-        console.error(`[Data] Error saving ${file}:`, err.message)
-        return false
-      }
-    }
-  }
 }
 
 const initSqliteStorage = () => {
@@ -3604,215 +3555,11 @@ const initMssqlStorage = () => {
   }
 }
 
-const initMongodbStorage = () => {
-  let client
-  let database
-  try {
-    const { MongoClient } = require('mongodb')
-    const storageConfig = config.config.storage.mongodb
-    
-    let connectionUri
-    if (storageConfig.connectionString) {
-      connectionUri = storageConfig.connectionString
-    } else {
-      const auth = storageConfig.user && storageConfig.password 
-        ? `${storageConfig.user}:${encodeURIComponent(storageConfig.password)}@`
-        : ''
-      const authSource = storageConfig.authSource ? `?authSource=${storageConfig.authSource}` : ''
-      connectionUri = `mongodb://${auth}${storageConfig.host || 'localhost'}:${storageConfig.port || 27017}/${storageConfig.database || 'voltchat'}${authSource}`
-    }
-    
-    client = new MongoClient(connectionUri)
-    
-    const createCollections = async () => {
-      await client.connect()
-      database = client.db(storageConfig.database || 'voltchat')
-      
-      await database.createCollection('users').catch(() => {})
-      await database.createCollection('servers').catch(() => {})
-      await database.createCollection('channels').catch(() => {})
-      await database.createCollection('messages').catch(() => {})
-      await database.createCollection('friends').catch(() => {})
-      await database.createCollection('friend_requests').catch(() => {})
-      await database.createCollection('dms').catch(() => {})
-      await database.createCollection('dm_messages').catch(() => {})
-      await database.createCollection('reactions').catch(() => {})
-      await database.createCollection('blocked').catch(() => {})
-      await database.createCollection('files').catch(() => {})
-      await database.createCollection('attachments').catch(() => {})
-      await database.createCollection('discovery').catch(() => {})
-      await database.createCollection('global_bans').catch(() => {})
-      await database.createCollection('admin_logs').catch(() => {})
-      
-      await database.collection('messages').createIndex({ channelId: 1, createdAt: -1 }).catch(() => {})
-      await database.collection('channels').createIndex({ serverId: 1 }).catch(() => {})
-      await database.collection('servers').createIndex({ ownerId: 1 }).catch(() => {})
-      
-      console.log('[Storage] MongoDB collections initialized')
-    }
-    
-    createCollections().catch(err => {
-      console.error('[Storage] Error creating MongoDB collections:', err.message)
-    })
-    
-    console.log('[Storage] MongoDB client created')
-    
-    return {
-      type: 'mongodb',
-      provider: 'mongodb',
-      client,
-      db: database,
-      load: async (table, defaultValue = {}) => {
-        table = assertSafeTableName(table)
-        try {
-          if (!database) await createCollections()
-          const collection = database.collection(table)
-          const cursor = collection.find({})
-          const result = {}
-          await cursor.forEach(doc => {
-            result[doc._id] = doc.data || doc
-            if (result[doc._id]._id) delete result[doc._id]._id
-          })
-          return result
-        } catch (err) {
-          console.error(`[Storage] Error loading ${table}:`, err.message)
-          return defaultValue
-        }
-      },
-      save: async (table, data) => {
-        table = assertSafeTableName(table)
-        try {
-          if (!database) await createCollections()
-          const collection = database.collection(table)
-          const bulkOps = []
-          for (const [id, row] of Object.entries(data)) {
-            bulkOps.push({
-              replaceOne: {
-                filter: { _id: id },
-                replacement: { _id: id, data: row },
-                upsert: true
-              }
-            })
-          }
-          if (bulkOps.length > 0) {
-            await collection.bulkWrite(bulkOps)
-          }
-          return true
-        } catch (err) {
-          console.error(`[Storage] Error saving ${table}:`, err.message)
-          return false
-        }
-      },
-      close: async () => {
-        await client.close()
-      }
-    }
-  } catch (err) {
-    console.error('[Storage] MongoDB not available:', err.message)
-    throw new Error('MongoDB not available. Install mongodb with: npm install mongodb')
-  }
-}
-
-const initRedisStorage = () => {
-  let redisClient
-  try {
-    const redis = require('redis')
-    const storageConfig = config.config.storage.redis
-    
-    const redisConfig = {
-      host: storageConfig.host || 'localhost',
-      port: storageConfig.port || 6379,
-      password: storageConfig.password || undefined,
-      db: storageConfig.db || 0
-    }
-    
-    redisClient = redis.createClient(redisConfig)
-    
-    redisClient.on('error', err => {
-      console.error('[Storage] Redis error:', err.message)
-    })
-    
-    redisClient.connect().then(() => {
-      console.log('[Storage] Redis client connected')
-    }).catch(err => {
-      console.error('[Storage] Redis connection error:', err.message)
-    })
-    
-    const prefix = storageConfig.keyPrefix || 'voltchat:'
-    
-    return {
-      type: 'redis',
-      provider: 'redis',
-      client: redisClient,
-      load: async (table, defaultValue = {}) => {
-        table = assertSafeTableName(table)
-        try {
-          const keys = await redisClient.keys(`${prefix}${table}:*`)
-          const result = {}
-          for (const key of keys) {
-            const id = key.replace(`${prefix}${table}:`, '')
-            const data = await redisClient.get(key)
-            try {
-              result[id] = JSON.parse(data)
-            } catch {
-              result[id] = data
-            }
-          }
-          return result
-        } catch (err) {
-          console.error(`[Storage] Error loading ${table}:`, err.message)
-          return defaultValue
-        }
-      },
-      save: async (table, data) => {
-        table = assertSafeTableName(table)
-        try {
-          const pipeline = redisClient.multi()
-          for (const [id, row] of Object.entries(data)) {
-            pipeline.set(`${prefix}${table}:${id}`, JSON.stringify(row))
-          }
-          await pipeline.exec()
-          return true
-        } catch (err) {
-          console.error(`[Storage] Error saving ${table}:`, err.message)
-          return false
-        }
-      },
-      close: async () => {
-        await redisClient.quit()
-      }
-    }
-  } catch (err) {
-    console.error('[Storage] Redis not available:', err.message)
-    throw new Error('Redis not available. Install redis with: npm install redis')
-  }
-}
-
 export const initStorage = () => {
   if (storage) return storage
   
-  const storageType = config.config.storage?.type || 'json'
-  
-  // JSON is deprecated and blocked - must use a proper database
-  if (storageType === 'json') {
-    console.error('==============================================')
-    console.error('[Storage] ERROR: JSON storage is DEPRECATED and BLOCKED!')
-    console.error('[Storage] You must configure a proper database in your config.')
-    console.error('[Storage] Supported databases: sqlite, mysql, mariadb, postgres, cockroachdb, mssql, mongodb, redis')
-    console.error('')
-    console.error('[Storage] Example config.json:')
-    console.error('{')
-    console.error('  "storage": {')
-    console.error('    "type": "sqlite",')
-    console.error('    "sqlite": {')
-    console.error('      "dbPath": "./data/voltage.db"')
-    console.error('    }')
-    console.error('  }')
-    console.error('}')
-    console.error('==============================================')
-    throw new Error('JSON storage is deprecated. Configure a proper database (sqlite, mysql, postgres, etc.) to continue.')
-  }
-  
+  const storageType = config.config.storage?.type || 'sqlite'
+
   switch (storageType) {
     case 'sqlite':
       try {
@@ -3868,27 +3615,9 @@ export const initStorage = () => {
       }
       break
       
-    case 'mongodb':
-      try {
-        storage = initMongodbStorage()
-      } catch (err) {
-        console.error('[Storage] MongoDB init failed:', err.message)
-        throw err
-      }
-      break
-      
-    case 'redis':
-      try {
-        storage = initRedisStorage()
-      } catch (err) {
-        console.error('[Storage] Redis init failed:', err.message)
-        throw err
-      }
-      break
-      
     default:
       console.error(`[Storage] Unknown storage type: ${storageType}`)
-      throw new Error(`Unknown storage type: ${storageType}. Supported: sqlite, mysql, mariadb, postgres, cockroachdb, mssql, mongodb, redis`)
+      throw new Error(`Unknown storage type: ${storageType}. Supported: sqlite, mysql, mariadb, postgres, cockroachdb, mssql`)
   }
   
   console.log(`[Storage] Initialized: ${storage.type}`)
@@ -3911,21 +3640,26 @@ export const initStorageAndDistribute = async () => {
   
   console.log('[Storage] Storage initialized, type:', storage.type)
   
-  // Auto-distribute from storage_kv for database backends
-  if (storage.type !== 'json') {
+  // Auto-distribute from storage_kv for SQL backends
+  if (storage) {
     try {
       console.log('[Storage] Checking for storage_kv table...')
       const hasKvTable = await checkStorageKvExists()
       console.log('[Storage] storage_kv exists with data:', hasKvTable)
       
       if (hasKvTable) {
-        console.log('[Storage] Found storage_kv table, distributing to individual tables...')
-        const results = await distributeFromStorageKv()
-        if (results.success) {
-          console.log('[Storage] Successfully distributed data from storage_kv')
-          console.log('[Storage] Distribution results:', JSON.stringify(results.distributed, null, 2))
+        const hasExistingIndividualData = await checkIndividualTablesHaveData()
+        if (hasExistingIndividualData) {
+          console.warn('[Storage] storage_kv contains data but individual tables are already populated; skipping auto-distribution to avoid overwriting live records on restart')
         } else {
-          console.error('[Storage] Distribution had errors:', results.errors)
+          console.log('[Storage] Found storage_kv table, distributing to individual tables...')
+          const results = await distributeFromStorageKv()
+          if (results.success) {
+            console.log('[Storage] Successfully distributed data from storage_kv')
+            console.log('[Storage] Distribution results:', JSON.stringify(results.distributed, null, 2))
+          } else {
+            console.error('[Storage] Distribution had errors:', results.errors)
+          }
         }
       } else {
         console.log('[Storage] No storage_kv data to distribute')
@@ -3937,6 +3671,39 @@ export const initStorageAndDistribute = async () => {
   }
   
   return storage
+}
+
+const checkIndividualTablesHaveData = async () => {
+  if (!storage) return false
+
+  const candidateTables = ['users', 'servers', 'channels', 'friends']
+
+  try {
+    if (storage.type === 'sqlite') {
+      for (const tableName of candidateTables) {
+        const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`).get(tableName)
+        if (!tableExists) continue
+        const count = db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).get()?.count || 0
+        if (count > 0) return true
+      }
+      return false
+    }
+
+    if (storage.type === 'mysql' || storage.type === 'mariadb') {
+      for (const tableName of candidateTables) {
+        const existsRows = unwrapQueryRows(await storage.pool.query(`SHOW TABLES LIKE ?`, [tableName]))
+        if (existsRows.length === 0) continue
+        const countRows = unwrapQueryRows(await storage.pool.query(`SELECT COUNT(*) as count FROM ${tableName}`))
+        const count = countRows[0]?.count || 0
+        if (count > 0) return true
+      }
+      return false
+    }
+  } catch (err) {
+    console.warn('[Storage] Failed to detect individual table data before storage_kv distribution:', err.message)
+  }
+
+  return false
 }
 
 /**
@@ -3955,11 +3722,11 @@ const checkStorageKvExists = async () => {
       const countResult = db.prepare(`SELECT COUNT(*) as count FROM storage_kv`).get()
       return countResult && countResult.count > 0
     } else if (storage.type === 'mysql' || storage.type === 'mariadb') {
-      const [rows] = await storage.pool.query(`SHOW TABLES LIKE 'storage_kv'`)
+      const rows = unwrapQueryRows(await storage.pool.query(`SHOW TABLES LIKE 'storage_kv'`))
       if (rows.length === 0) return false
       
       // Check if table has any data
-      const [countRows] = await storage.pool.query(`SELECT COUNT(*) as count FROM storage_kv`)
+      const countRows = unwrapQueryRows(await storage.pool.query(`SELECT COUNT(*) as count FROM storage_kv`))
       return countRows && countRows[0] && countRows[0].count > 0
     }
   } catch (err) {
@@ -4168,7 +3935,7 @@ export const distributeFromStorageKv = async () => {
       }
     } else if (storage.type === 'mysql' || storage.type === 'mariadb') {
       try {
-        const [rows] = await storage.pool.execute('SELECT id, data FROM storage_kv')
+        const rows = unwrapQueryRows(await storage.pool.query('SELECT id, data FROM storage_kv'))
         for (const row of rows) {
           try {
             kvData[row.id] = JSON.parse(row.data)

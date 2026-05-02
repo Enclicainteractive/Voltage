@@ -20,6 +20,7 @@ import {
   supportsDirectQuery
 } from '../services/dataService.js'
 import { isUserOnline } from '../services/socketService.js'
+import { toSafeUser } from '../services/userService.js'
 import { validateUsername, validateDisplayName } from '../utils/validation.js'
 import { AGE_VERIFICATION_JURISDICTIONS, getAgeVerificationJurisdiction, normalizeAgeVerification } from '../utils/ageVerificationPolicy.js'
 import { validationSchemas, validateRequest, sanitizeInput, validationRateLimit } from '../middleware/builtinValidationMiddleware.js'
@@ -32,33 +33,81 @@ const toArray = (value) => {
 
 const router = express.Router()
 const TEMP_UPLOAD_DIR = path.join(os.tmpdir(), 'volt-avatar-uploads')
+const MAX_AVATAR_UPLOAD_BYTES = 10 * 1024 * 1024 // 10MB
+const MAX_DATA_IMAGE_BYTES = 10 * 1024 * 1024 // 10MB decoded payload
+const MAX_IMAGE_REFERENCE_LENGTH = 4096
+
+const ALLOWED_IMAGE_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'image/avif'
+])
+
+const ALLOWED_IMAGE_EXTENSIONS = new Set([
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.webp',
+  '.gif',
+  '.avif'
+])
 
 if (!fs.existsSync(TEMP_UPLOAD_DIR)) {
   fs.mkdirSync(TEMP_UPLOAD_DIR, { recursive: true })
+}
+
+const sanitizeFilenameSegment = (value, fallback = 'user') => {
+  const normalized = String(value || '')
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 64)
+  return normalized || fallback
+}
+
+const getExtensionForMimeType = (mimeType) => {
+  const normalized = String(mimeType || '').toLowerCase()
+  if (normalized === 'image/jpeg' || normalized === 'image/jpg') return '.jpg'
+  if (normalized === 'image/png') return '.png'
+  if (normalized === 'image/webp') return '.webp'
+  if (normalized === 'image/gif') return '.gif'
+  if (normalized === 'image/avif') return '.avif'
+  return null
+}
+
+const isSafeUploadFilename = (value) => {
+  const raw = String(value || '').trim()
+  if (!raw || raw.length > 128) return false
+  if (raw.includes('..') || raw.includes('/') || raw.includes('\\')) return false
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(raw)
 }
 
 const avatarUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, TEMP_UPLOAD_DIR),
     filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname || '').toLowerCase()
-      const safeExt = ext || '.bin'
-      cb(null, `${req.user?.id || 'user'}-${Date.now()}${safeExt}`)
+      const mimeExt = getExtensionForMimeType(file?.mimetype)
+      const originalExt = path.extname(file?.originalname || '').toLowerCase()
+      const safeExt = mimeExt || (ALLOWED_IMAGE_EXTENSIONS.has(originalExt) ? originalExt : '.bin')
+      const userPrefix = sanitizeFilenameSegment(req.user?.id, 'user')
+      cb(null, `${userPrefix}-${Date.now()}${safeExt}`)
     }
   }),
   fileFilter: (req, file, cb) => {
-    if (typeof file?.mimetype === 'string' && file.mimetype.startsWith('image/')) {
+    const mimeType = String(file?.mimetype || '').toLowerCase()
+    if (ALLOWED_IMAGE_MIME_TYPES.has(mimeType)) {
       return cb(null, true)
     }
     cb(new Error('Only image files can be used as profile pictures'))
   },
   limits: {
-    fileSize: 2 * 1024 * 1024 * 1024, // 2GB limit
-    files: 1
+    fileSize: MAX_AVATAR_UPLOAD_BYTES,
+    files: 1,
+    fields: 8,
+    fieldSize: 4 * 1024 * 1024
   }
 })
-
-const isExternalImage = (value) => typeof value === 'string' && (/^https?:\/\//i.test(value) || /^data:image\//i.test(value))
 
 const removeTempFile = (filePath) => {
   if (!filePath) return
@@ -79,22 +128,84 @@ const toAbsoluteFileUrl = (value) => {
   return `${baseUrl}${raw.startsWith('/') ? raw : `/${raw}`}`
 }
 
-const resolveStoredProfileImage = (value, fallbackUrl = null) => {
+const normalizeManagedUploadPath = (value) => {
   const raw = String(value || '').trim()
-  if (!raw) return fallbackUrl
-  if (raw.startsWith('data:image/')) return raw
-  if (/^https?:\/\//i.test(raw)) return raw
-  if (raw.startsWith('/')) return toAbsoluteFileUrl(raw)
+  if (!raw || raw.length > MAX_IMAGE_REFERENCE_LENGTH) return null
+  const absoluteBase = String(config.getImageServerUrl() || config.getServerUrl() || '').replace(/\/$/, '')
+  const normalized = absoluteBase && raw.startsWith(absoluteBase) ? raw.slice(absoluteBase.length) : raw
+  const match = normalized.match(/^\/api\/upload\/file\/([^/?#]+)$/)
+  if (!match?.[1]) return null
+
+  let decoded = match[1]
+  try {
+    decoded = decodeURIComponent(decoded)
+  } catch {
+    return null
+  }
+
+  if (!isSafeUploadFilename(decoded)) return null
+  return `/api/upload/file/${decoded}`
+}
+
+const normalizeDataImageUrl = (value, maxBytes = MAX_DATA_IMAGE_BYTES) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const match = raw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\s]+)$/)
+  if (!match) return null
+
+  const mimeType = String(match[1] || '').toLowerCase()
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(mimeType)) return null
+
+  const base64Payload = String(match[2] || '').replace(/\s+/g, '')
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64Payload)) return null
+
+  const padding = base64Payload.endsWith('==') ? 2 : base64Payload.endsWith('=') ? 1 : 0
+  const estimatedBytes = Math.floor((base64Payload.length * 3) / 4) - padding
+  if (!Number.isFinite(estimatedBytes) || estimatedBytes <= 0 || estimatedBytes > maxBytes) return null
+
+  return `data:${mimeType};base64,${base64Payload}`
+}
+
+const sanitizeImageReference = (value, { allowDataUrl = true, maxDataBytes = MAX_DATA_IMAGE_BYTES } = {}) => {
+  if (value === null || typeof value === 'undefined') return null
+  const raw = String(value || '').trim()
+  if (!raw || raw.length > MAX_IMAGE_REFERENCE_LENGTH) return null
+
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw)
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        return raw
+      }
+    } catch {
+      return null
+    }
+    return null
+  }
+
+  const managedPath = normalizeManagedUploadPath(raw)
+  if (managedPath) return toAbsoluteFileUrl(managedPath)
+
+  if (allowDataUrl) {
+    const normalizedDataUrl = normalizeDataImageUrl(raw, maxDataBytes)
+    if (normalizedDataUrl) return normalizedDataUrl
+  }
+
+  return null
+}
+
+const resolveStoredProfileImage = (value, fallbackUrl = null, options = {}) => {
+  const sanitized = sanitizeImageReference(value, options)
+  if (sanitized) return sanitized
   return fallbackUrl
 }
 
 const extractManagedUploadFilename = (value) => {
-  const raw = String(value || '').trim()
-  if (!raw) return null
-  const absoluteBase = String(config.getImageServerUrl() || config.getServerUrl() || '').replace(/\/$/, '')
-  const normalized = absoluteBase && raw.startsWith(absoluteBase) ? raw.slice(absoluteBase.length) : raw
-  const match = normalized.match(/^\/api\/upload\/file\/([^/?#]+)$/)
-  return match?.[1] || null
+  const normalizedPath = normalizeManagedUploadPath(value)
+  if (!normalizedPath) return null
+  const filename = normalizedPath.split('/').pop() || null
+  if (!isSafeUploadFilename(filename)) return null
+  return filename
 }
 
 const runAvatarUpload = (req, res) => new Promise((resolve, reject) => {
@@ -265,6 +376,308 @@ const buildAddress = (profile = {}) => {
   return username && host ? `${username}:${host}` : username || ''
 }
 
+const INTERNAL_USER_RESPONSE_DENYLIST = new Set([
+  'proofSummary',
+  'device',
+  'remoteUserId',
+  'localUserId',
+  'age_verification_jurisdiction',
+  'birth_date',
+  'password',
+  'passwordHash',
+  'password_hash',
+  'passwordSalt',
+  'salt',
+  'resetToken',
+  'reset_token',
+  'recoveryToken',
+  'recovery_token',
+  'refreshToken',
+  'refresh_token',
+  'accessToken',
+  'access_token',
+  'sessionSecret',
+  'mfaSecret',
+  'totpSecret',
+  'twoFactorSecret',
+  'jwtSecret',
+  'apiKey',
+  'privateKey'
+])
+
+const PUBLIC_PROFILE_FIELDS = new Set([
+  'id',
+  'username',
+  'customUsername',
+  'displayName',
+  'bio',
+  'customStatus',
+  'socialLinks',
+  'guildTag',
+  'guildTagServerId',
+  'guildTagPrivate',
+  'accentColor',
+  'profileEffect',
+  'profileCSS',
+  'profileTemplate',
+  'bannerEffect',
+  'profileLayout',
+  'badgeStyle',
+  'profileTheme',
+  'profileBackground',
+  'profileAccentColor',
+  'profileFont',
+  'profileAnimation',
+  'profileBackgroundType',
+  'profileBackgroundOpacity',
+  'customization'
+])
+
+const OWN_ONLY_PROFILE_FIELDS = new Set([
+  'email',
+  'birthDate',
+  'ageVerification',
+  'ageVerificationJurisdiction',
+  'clientCSS',
+  'clientCSSEnabled'
+])
+
+const PUBLIC_CUSTOMIZATION_FIELDS = new Set([
+  'accentColor',
+  'bannerEffect',
+  'profileCSS',
+  'profileTemplate',
+  'profileLayout',
+  'badgeStyle',
+  'animatedAvatar'
+])
+
+const PROFILE_UPDATE_ALLOWED_FIELDS = new Set([
+  'displayName',
+  'bio',
+  'customStatus',
+  'socialLinks',
+  'banner',
+  'avatar',
+  'customUsername',
+  'birthDate',
+  'accentColor',
+  'profileEffect',
+  'profileCSS',
+  'profileTemplate',
+  'bannerEffect',
+  'profileLayout',
+  'badgeStyle',
+  'clientCSS',
+  'clientCSSEnabled'
+])
+
+const PREFERENCES_KEY_PATTERN = /^[a-zA-Z0-9_.-]{1,64}$/
+const MAX_PREFERENCES_KEYS = 100
+const MAX_PREFERENCE_DEPTH = 3
+const MAX_PREFERENCE_ARRAY_LENGTH = 50
+const MAX_PREFERENCE_STRING_LENGTH = 1024
+const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
+const RESOURCE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,100}$/
+
+const isPlainObject = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const proto = Object.getPrototypeOf(value)
+  return proto === Object.prototype || proto === null
+}
+
+const hasUnsafeObjectKeys = (value, depth = 0) => {
+  if (!value || typeof value !== 'object') return false
+  if (depth > MAX_PREFERENCE_DEPTH + 2) return true
+  if (Array.isArray(value)) {
+    return value.some((item) => hasUnsafeObjectKeys(item, depth + 1))
+  }
+  if (!isPlainObject(value)) return true
+  return Object.entries(value).some(([key, childValue]) => {
+    if (UNSAFE_OBJECT_KEYS.has(String(key || '').toLowerCase())) return true
+    return hasUnsafeObjectKeys(childValue, depth + 1)
+  })
+}
+
+const sanitizePreferenceValue = (value, depth = 0) => {
+  if (depth > MAX_PREFERENCE_DEPTH) return undefined
+  if (value === null) return null
+  if (typeof value === 'string') return value.slice(0, MAX_PREFERENCE_STRING_LENGTH)
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+
+  if (Array.isArray(value)) {
+    const sanitized = []
+    for (const entry of value.slice(0, MAX_PREFERENCE_ARRAY_LENGTH)) {
+      const normalized = sanitizePreferenceValue(entry, depth + 1)
+      if (typeof normalized !== 'undefined') sanitized.push(normalized)
+    }
+    return sanitized
+  }
+
+  if (!isPlainObject(value)) return undefined
+  const sanitized = {}
+  let count = 0
+  for (const [key, childValue] of Object.entries(value)) {
+    const normalizedKey = String(key || '')
+    if (!PREFERENCES_KEY_PATTERN.test(normalizedKey)) continue
+    if (UNSAFE_OBJECT_KEYS.has(normalizedKey.toLowerCase())) continue
+    const normalizedValue = sanitizePreferenceValue(childValue, depth + 1)
+    if (typeof normalizedValue === 'undefined') continue
+    sanitized[normalizedKey] = normalizedValue
+    count += 1
+    if (count >= MAX_PREFERENCES_KEYS) break
+  }
+  return sanitized
+}
+
+const sanitizePreferencePatch = (value) => {
+  if (!isPlainObject(value)) return null
+  if (hasUnsafeObjectKeys(value)) return null
+
+  const sanitized = {}
+  let count = 0
+  for (const [key, childValue] of Object.entries(value)) {
+    const normalizedKey = String(key || '')
+    if (!PREFERENCES_KEY_PATTERN.test(normalizedKey)) continue
+    if (UNSAFE_OBJECT_KEYS.has(normalizedKey.toLowerCase())) continue
+    const normalizedValue = sanitizePreferenceValue(childValue, 0)
+    if (typeof normalizedValue === 'undefined') continue
+    sanitized[normalizedKey] = normalizedValue
+    count += 1
+    if (count >= MAX_PREFERENCES_KEYS) break
+  }
+  return sanitized
+}
+
+const sanitizeCustomizationPatch = (value) => {
+  if (!isPlainObject(value)) return null
+  if (hasUnsafeObjectKeys(value)) return null
+  return sanitizePublicCustomization(value) || {}
+}
+
+const pickFields = (source, fields) => {
+  const selected = {}
+  if (!source || typeof source !== 'object') return selected
+  fields.forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(source, field)) {
+      selected[field] = source[field]
+    }
+  })
+  return selected
+}
+
+const sanitizeSelfUserPayload = (user) => {
+  const safe = toSafeUser(user) || {}
+  if (!safe || typeof safe !== 'object') return {}
+  const sanitized = { ...safe }
+  INTERNAL_USER_RESPONSE_DENYLIST.forEach((key) => {
+    delete sanitized[key]
+  })
+  return sanitized
+}
+
+const sanitizePublicCustomization = (customization) => {
+  if (!customization || typeof customization !== 'object' || Array.isArray(customization)) return undefined
+  const sanitized = {}
+  PUBLIC_CUSTOMIZATION_FIELDS.forEach((key) => {
+    const value = customization[key]
+    if (typeof value === 'string') {
+      const maxLen = key === 'profileCSS' ? 20480 : 256
+      sanitized[key] = value.slice(0, maxLen)
+      return
+    }
+    if (typeof value === 'boolean' || typeof value === 'number') {
+      sanitized[key] = value
+    }
+  })
+  return Object.keys(sanitized).length ? sanitized : undefined
+}
+
+const buildSelfProfileResponse = (authUser = {}, profile = null) => {
+  const safeAuthUser = sanitizeSelfUserPayload(authUser)
+  const safeProfile = sanitizeSelfUserPayload(profile)
+  const merged = { ...safeAuthUser, ...safeProfile }
+  const userId = String(authUser?.id || safeProfile?.id || safeAuthUser?.id || '').trim()
+
+  return {
+    ...merged,
+    id: userId || merged.id || null,
+    host: profile?.host || authUser?.host || config.getHost(),
+    avatarHost: profile?.avatarHost || safeProfile?.avatarHost || config.getImageServerUrl(),
+    imageUrl: resolveStoredProfileImage(
+      profile?.imageUrl || profile?.imageurl || profile?.avatar || merged.imageUrl || merged.avatar,
+      null,
+      { allowDataUrl: true, maxDataBytes: MAX_AVATAR_UPLOAD_BYTES }
+    ),
+    avatar: resolveUserAvatar(userId || authUser?.id, profile || safeProfile),
+    banner: resolveStoredProfileImage(profile?.banner || merged.banner, null, {
+      allowDataUrl: true,
+      maxDataBytes: MAX_DATA_IMAGE_BYTES
+    })
+  }
+}
+
+const buildPublicProfileResponse = (viewerId, targetUserId, profile) => {
+  const safeProfile = sanitizeSelfUserPayload(profile)
+  const isOwn = viewerId === targetUserId
+  const publicProfile = pickFields(safeProfile, PUBLIC_PROFILE_FIELDS)
+  const safeCustomization = sanitizePublicCustomization(safeProfile.customization)
+  if (safeCustomization) {
+    publicProfile.customization = safeCustomization
+  } else {
+    delete publicProfile.customization
+  }
+
+  const response = {
+    ...publicProfile,
+    id: targetUserId,
+    username: publicProfile.customUsername || publicProfile.username || safeProfile.username || 'Unknown User',
+    host: profile?.host || config.getHost(),
+    avatarHost: profile?.avatarHost || config.getImageServerUrl(),
+    imageUrl: resolveStoredProfileImage(profile?.imageUrl || profile?.imageurl || profile?.avatar, null, {
+      allowDataUrl: true,
+      maxDataBytes: MAX_AVATAR_UPLOAD_BYTES
+    }),
+    avatar: resolveUserAvatar(targetUserId, profile),
+    banner: resolveStoredProfileImage(profile?.banner, null, {
+      allowDataUrl: true,
+      maxDataBytes: MAX_DATA_IMAGE_BYTES
+    }),
+    status: resolvePresenceStatus(targetUserId, profile),
+    address: buildAddress(profile),
+    isFriend: friendService.areFriends(viewerId, targetUserId),
+    isBlocked: blockService.isBlocked(viewerId, targetUserId)
+  }
+
+  if (isOwn) {
+    Object.assign(response, pickFields(safeProfile, OWN_ONLY_PROFILE_FIELDS))
+  }
+
+  return response
+}
+
+const resolveCanonicalUser = (rawUserId) => {
+  const profile = resolveUserByAnyId(rawUserId)
+  if (!profile) return null
+  const canonicalId = String(profile?.id || rawUserId || '').trim()
+  if (!canonicalId) return null
+  return { profile, userId: canonicalId }
+}
+
+const hasBlockedRelationship = (viewerId, targetUserId) => {
+  if (!viewerId || !targetUserId) return false
+  return blockService.isBlocked(viewerId, targetUserId)
+}
+
+const canAccessUserScopedData = (viewerId, targetUserId, { requireFriend = false } = {}) => {
+  if (!viewerId || !targetUserId) return false
+  if (viewerId === targetUserId) return true
+  if (hasBlockedRelationship(viewerId, targetUserId)) return false
+  if (requireFriend && !friendService.areFriends(viewerId, targetUserId)) return false
+  return true
+}
+
 // Ensure authenticated user's profile exists in storage
 // OPTIMIZATION: Only create profile if it truly doesn't exist
 // This prevents excessive "Auto-created profile" logs and unnecessary DB writes
@@ -327,19 +740,7 @@ router.use(authenticateToken, ensureUserProfile)
 router.get('/me', async (req, res) => {
   try {
     const profile = userService.getUser(req.user.id)
-    const avatarUrl = resolveUserAvatar(req.user.id, profile)
-    const bannerUrl = resolveStoredProfileImage(profile?.banner, null)
-    
-    res.json({
-      ...req.user,
-      ...profile,
-      id: req.user.id,
-      host: profile?.host || req.user.host || config.getHost(),
-      avatarHost: profile?.avatarHost || config.getImageServerUrl(),
-      imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
-      avatar: avatarUrl,
-      banner: bannerUrl
-    })
+    res.json(buildSelfProfileResponse(req.user, profile))
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch user info' })
   }
@@ -350,7 +751,13 @@ router.post('/avatar', async (req, res) => {
     await runAvatarUpload(req, res)
 
     if (!req.file && typeof req.body?.avatar === 'string') {
-      const avatarUrl = resolveStoredProfileImage(req.body.avatar, req.body.avatar)
+      const avatarUrl = sanitizeImageReference(req.body.avatar, {
+        allowDataUrl: true,
+        maxDataBytes: MAX_AVATAR_UPLOAD_BYTES
+      })
+      if (!avatarUrl) {
+        return res.status(400).json({ error: 'Invalid avatar image format' })
+      }
       const profile = await userService.updateProfile(req.user.id, {
         avatar: avatarUrl,
         imageUrl: avatarUrl,
@@ -373,7 +780,10 @@ router.post('/avatar', async (req, res) => {
     const existingProfile = userService.getUser(req.user.id) || {}
     const previousFilename = extractManagedUploadFilename(existingProfile.imageUrl || existingProfile.avatar)
     const uploadResult = await cdnService.upload(req.file, { userId: req.user.id, type: 'avatar' })
-    const avatarUrl = toAbsoluteFileUrl(uploadResult?.url)
+    const avatarUrl = resolveStoredProfileImage(uploadResult?.url, null, { allowDataUrl: false })
+    if (!avatarUrl) {
+      throw new Error('Uploaded avatar URL is invalid')
+    }
 
     const profile = await userService.updateProfile(req.user.id, {
       avatar: avatarUrl,
@@ -401,7 +811,17 @@ router.post('/avatar', async (req, res) => {
   } catch (error) {
     removeTempFile(req.file?.path)
     console.error('[API] Avatar upload failed:', error)
-    const statusCode = error?.message?.includes('Only image files') || error?.message?.includes('File too large') ? 400 : 500
+    const errorMessage = String(error?.message || '')
+    const clientError = (
+      errorMessage.includes('Only image files') ||
+      errorMessage.includes('File too large') ||
+      errorMessage.includes('Invalid avatar image format') ||
+      errorMessage.includes('Field value too long') ||
+      error?.code === 'LIMIT_FILE_SIZE' ||
+      error?.code === 'LIMIT_FIELD_VALUE' ||
+      error?.code === 'LIMIT_UNEXPECTED_FILE'
+    )
+    const statusCode = clientError ? 400 : 500
     res.status(statusCode).json({ error: error.message || 'Avatar upload failed' })
   }
 })
@@ -439,6 +859,17 @@ router.put('/profile',
   sanitizeInput,
   validateRequest(validationSchemas.userProfile),
   async (req, res) => {
+  if (!isPlainObject(req.body)) {
+    return res.status(400).json({ error: 'Invalid request body' })
+  }
+  if (hasUnsafeObjectKeys(req.body)) {
+    return res.status(400).json({ error: 'Invalid request body keys' })
+  }
+  const unknownKeys = Object.keys(req.body).filter((key) => !PROFILE_UPDATE_ALLOWED_FIELDS.has(key))
+  if (unknownKeys.length > 0) {
+    return res.status(400).json({ error: `Unsupported profile fields: ${unknownKeys.join(', ')}` })
+  }
+
   const {
     displayName, bio, customStatus, socialLinks, banner, avatar, customUsername, birthDate,
     accentColor, profileEffect,
@@ -479,9 +910,30 @@ router.put('/profile',
   }
   if (bio !== undefined) updates.bio = bio
   if (customStatus !== undefined) updates.customStatus = customStatus
-  if (banner !== undefined) updates.banner = resolveStoredProfileImage(banner, banner)
+  if (banner !== undefined) {
+    if (banner === null || banner === '') {
+      updates.banner = null
+    } else {
+      const sanitizedBanner = sanitizeImageReference(banner, {
+        allowDataUrl: true,
+        maxDataBytes: MAX_DATA_IMAGE_BYTES
+      })
+      if (!sanitizedBanner) {
+        return res.status(400).json({ error: 'Invalid banner image format' })
+      }
+      updates.banner = sanitizedBanner
+    }
+  }
   if (avatar !== undefined) {
-    const resolvedAvatar = resolveStoredProfileImage(avatar, avatar)
+    const resolvedAvatar = avatar === null || avatar === ''
+      ? null
+      : sanitizeImageReference(avatar, {
+          allowDataUrl: true,
+          maxDataBytes: MAX_AVATAR_UPLOAD_BYTES
+        })
+    if (avatar !== null && avatar !== '' && !resolvedAvatar) {
+      return res.status(400).json({ error: 'Invalid avatar image format' })
+    }
     updates.avatar = resolvedAvatar
     updates.imageUrl = resolvedAvatar
     updates.imageurl = resolvedAvatar
@@ -489,9 +941,11 @@ router.put('/profile',
   if (socialLinks !== undefined) {
     const allowed = ['github', 'twitter', 'youtube', 'twitch', 'website', 'steam', 'spotify']
     const sanitized = {}
-    for (const [key, value] of Object.entries(socialLinks)) {
-      if (allowed.includes(key) && typeof value === 'string') {
-        sanitized[key] = value.slice(0, 256)
+    if (socialLinks && typeof socialLinks === 'object' && !Array.isArray(socialLinks)) {
+      for (const [key, value] of Object.entries(socialLinks)) {
+        if (allowed.includes(key) && typeof value === 'string') {
+          sanitized[key] = value.slice(0, 256)
+        }
       }
     }
     updates.socialLinks = sanitized
@@ -535,7 +989,7 @@ router.put('/profile',
   
   const profile = await userService.updateProfile(req.user.id, updates)
   console.log(`[API] Profile updated for ${req.user.username}`)
-  res.json(profile)
+  res.json(buildSelfProfileResponse(req.user, profile))
 })
 
 // Get user guild tag
@@ -596,7 +1050,7 @@ router.put('/status', async (req, res) => {
   
   const profile = await userService.setStatus(req.user.id, status, customStatus)
   console.log(`[API] Status updated for ${req.user.username}: ${status}`)
-  res.json(profile)
+  res.json(buildSelfProfileResponse(req.user, profile))
 })
 
 // Age verification status
@@ -703,6 +1157,7 @@ router.get('/search', async (req, res) => {
   const allUsers = userService.getAllUsers()
   const results = Object.values(allUsers)
     .filter(u => {
+      if (!u?.id || hasBlockedRelationship(req.user.id, u.id)) return false
       const usernameMatch = u.username?.toLowerCase().includes(searchUsername.toLowerCase()) || 
                            u.customUsername?.toLowerCase().includes(searchUsername.toLowerCase()) ||
                            u.displayName?.toLowerCase().includes(searchUsername.toLowerCase())
@@ -720,7 +1175,10 @@ router.get('/search', async (req, res) => {
       username: u.customUsername || u.username,
       originalUsername: u.username,
       displayName: u.displayName,
-      imageUrl: u.imageUrl || u.imageurl || u.avatar || null,
+      imageUrl: resolveStoredProfileImage(u.imageUrl || u.imageurl || u.avatar, null, {
+        allowDataUrl: true,
+        maxDataBytes: MAX_AVATAR_UPLOAD_BYTES
+      }),
       avatar: resolveUserAvatar(u.id, u),
       host: u.host || localHost,
       address: buildAddress(u)
@@ -731,7 +1189,9 @@ router.get('/search', async (req, res) => {
 
 // Get friends list - MUST be before /:userId
 router.get('/friends', async (req, res) => {
-  const friendIds = friendService.getFriends(req.user.id)
+  const friendIds = typeof friendService.getFriendsFresh === 'function'
+    ? await friendService.getFriendsFresh(req.user.id)
+    : friendService.getFriends(req.user.id)
   const localHost = config.getHost()
   const friends = friendIds.map(friendId => {
     const profile = userService.getUser(friendId)
@@ -741,7 +1201,10 @@ router.get('/friends', async (req, res) => {
       username: profile?.customUsername || profile?.username || 'Unknown',
       originalUsername: profile?.username,
       displayName: profile?.displayName,
-      imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+      imageUrl: resolveStoredProfileImage(profile?.imageUrl || profile?.imageurl || profile?.avatar, null, {
+        allowDataUrl: true,
+        maxDataBytes: MAX_AVATAR_UPLOAD_BYTES
+      }),
       avatar: resolveUserAvatar(friendId, profile),
       status,
       customStatus: profile?.customStatus,
@@ -756,7 +1219,9 @@ router.get('/friends', async (req, res) => {
 
 // Get friend requests - MUST be before /:userId
 router.get('/friend-requests', async (req, res) => {
-  const requests = friendRequestService.getRequests(req.user.id)
+  const requests = typeof friendRequestService.getRequestsFresh === 'function'
+    ? await friendRequestService.getRequestsFresh(req.user.id)
+    : friendRequestService.getRequests(req.user.id)
   console.log(`[API] Get friend requests for ${req.user.username} - ${requests.incoming.length} incoming, ${requests.outgoing.length} outgoing`)
   res.json(requests)
 })
@@ -769,18 +1234,19 @@ router.get('/blocked', async (req, res) => {
     return {
       id,
       username: profile?.username || 'Unknown',
-      imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+      imageUrl: resolveStoredProfileImage(profile?.imageUrl || profile?.imageurl || profile?.avatar, null, {
+        allowDataUrl: true,
+        maxDataBytes: MAX_AVATAR_UPLOAD_BYTES
+      }),
       avatar: resolveUserAvatar(id, profile)
     }
   })
   res.json(blocked)
 })
 
-// Get user profile - This must come AFTER all specific GET routes
-router.get('/:userId', async (req, res) => {
-  const userId = req.params.userId
+const handleGetUserProfile = async (req, res) => {
+  const userId = String(req.params.userId || '').trim()
   const profile = userService.getUser(userId)
-  
   if (!profile) {
     return res.json({
       id: userId,
@@ -788,104 +1254,20 @@ router.get('/:userId', async (req, res) => {
       status: 'offline'
     })
   }
-  
-  const isFriend = friendService.areFriends(req.user.id, userId)
-  const isBlocked = blockService.isBlocked(req.user.id, userId)
-  const liveStatus = resolvePresenceStatus(userId, profile)
-  
-  // Generate avatar URL dynamically to ensure correct server
-  const avatarUrl = resolveUserAvatar(userId, profile)
-  const bannerUrl = resolveStoredProfileImage(profile.banner, null)
-  
-  // Strip private/sensitive fields from public profile response
-  const { clientCSS, clientCSSEnabled, passwordHash, serverNicks, email, ...publicProfile } = profile
-  const isOwn = req.user.id === userId
 
-  res.json({
-    ...publicProfile,
-    host: profile.host || config.getHost(),
-    avatarHost: profile.avatarHost || config.getImageServerUrl(),
-    imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
-    avatar: avatarUrl,
-    banner: bannerUrl,
-    status: liveStatus,
-    address: buildAddress(profile),
-    isFriend,
-    isBlocked,
-    // Only include email for own profile
-    ...(isOwn ? { email: profile.email } : {}),
-    // Include profileCSS so viewers can render it
-    profileCSS: profile.profileCSS || null,
-    profileTemplate: profile.profileTemplate || 'default',
-    bannerEffect: profile.bannerEffect || 'none',
-    profileLayout: profile.profileLayout || 'standard',
-    badgeStyle: profile.badgeStyle || 'default',
-    accentColor: profile.accentColor || null,
-    // Profile theme fields
-    profileTheme: profile.profileTheme || null,
-    profileBackground: profile.profileBackground || null,
-    profileAccentColor: profile.profileAccentColor || null,
-    profileFont: profile.profileFont || null,
-    profileAnimation: profile.profileAnimation || null,
-    profileBackgroundType: profile.profileBackgroundType || null,
-    profileBackgroundOpacity: profile.profileBackgroundOpacity ?? 100,
-    // clientCSS is only returned to the owner
-    ...(isOwn ? { clientCSS: profile.clientCSS || null, clientCSSEnabled: profile.clientCSSEnabled !== false } : {})
-  })
-})
+  if (hasBlockedRelationship(req.user.id, userId)) {
+    return res.status(404).json({ error: 'User not found' })
+  }
+
+  res.json(buildPublicProfileResponse(req.user.id, userId, profile))
+}
+
+// Get user profile - This must come AFTER all specific GET routes
+router.get('/:userId', handleGetUserProfile)
 
 // Profile alias - GET /:userId/profile is an alias for GET /:userId
 // This fixes 404s from clients calling /users/:userId/profile
-router.get('/:userId/profile', async (req, res) => {
-  // Reuse the same logic as /:userId by forwarding to that handler
-  req.params.userId = req.params.userId
-  const userId = req.params.userId
-  const profile = userService.getUser(userId)
-
-  if (!profile) {
-    return res.json({
-      id: userId,
-      username: 'Unknown User',
-      status: 'offline'
-    })
-  }
-
-  const isFriend = friendService.areFriends(req.user.id, userId)
-  const isBlocked = blockService.isBlocked(req.user.id, userId)
-  const liveStatus = resolvePresenceStatus(userId, profile)
-  const avatarUrl = resolveUserAvatar(userId, profile)
-  const bannerUrl = resolveStoredProfileImage(profile.banner, null)
-  const { clientCSS, clientCSSEnabled, passwordHash, serverNicks, email, ...publicProfile } = profile
-  const isOwn = req.user.id === userId
-
-  res.json({
-    ...publicProfile,
-    host: profile.host || config.getHost(),
-    avatarHost: profile.avatarHost || config.getImageServerUrl(),
-    imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
-    avatar: avatarUrl,
-    banner: bannerUrl,
-    status: liveStatus,
-    address: buildAddress(profile),
-    isFriend,
-    isBlocked,
-    ...(isOwn ? { email: profile.email } : {}),
-    profileCSS: profile.profileCSS || null,
-    profileTemplate: profile.profileTemplate || 'default',
-    bannerEffect: profile.bannerEffect || 'none',
-    profileLayout: profile.profileLayout || 'standard',
-    badgeStyle: profile.badgeStyle || 'default',
-    accentColor: profile.accentColor || null,
-    profileTheme: profile.profileTheme || null,
-    profileBackground: profile.profileBackground || null,
-    profileAccentColor: profile.profileAccentColor || null,
-    profileFont: profile.profileFont || null,
-    profileAnimation: profile.profileAnimation || null,
-    profileBackgroundType: profile.profileBackgroundType || null,
-    profileBackgroundOpacity: profile.profileBackgroundOpacity ?? 100,
-    ...(isOwn ? { clientCSS: profile.clientCSS || null, clientCSSEnabled: profile.clientCSSEnabled !== false } : {})
-  })
-})
+router.get('/:userId/profile', handleGetUserProfile)
 
 // Send friend request
 router.post('/friend-request', async (req, res) => {
@@ -988,7 +1370,10 @@ router.post('/friend-request', async (req, res) => {
 
 // Accept friend request
 router.post('/friend-request/:id/accept', async (req, res) => {
-  const incomingRequest = friendRequestService.getRequests(req.user.id).incoming?.find(request => request.id === req.params.id)
+  const currentRequests = typeof friendRequestService.getRequestsFresh === 'function'
+    ? await friendRequestService.getRequestsFresh(req.user.id)
+    : friendRequestService.getRequests(req.user.id)
+  const incomingRequest = currentRequests.incoming?.find(request => request.id === req.params.id)
   const result = await friendRequestService.acceptRequest(req.user.id, req.params.id)
   
   if (result.error) {
@@ -1057,7 +1442,9 @@ router.delete('/friend-request/:id', async (req, res) => {
 // Cancel friend request by userId
 router.delete('/friend-request/user/:userId', async (req, res) => {
   const targetUserId = req.params.userId
-  const requests = friendRequestService.getRequests(req.user.id)
+  const requests = typeof friendRequestService.getRequestsFresh === 'function'
+    ? await friendRequestService.getRequestsFresh(req.user.id)
+    : friendRequestService.getRequests(req.user.id)
   const outgoingRequest = requests.outgoing?.find(r => r.from === targetUserId || r.to === targetUserId)
   
   if (!outgoingRequest) {
@@ -1146,11 +1533,22 @@ router.get('/unread-counts', async (req, res) => {
 router.post('/mark-read', async (req, res) => {
   try {
     const userId = req.user.id
-    const { channelId } = req.body
-    if (!channelId) return res.status(400).json({ error: 'channelId required' })
+    const channelId = String(req.body?.channelId || '').trim()
+    if (!RESOURCE_ID_PATTERN.test(channelId)) {
+      return res.status(400).json({ error: 'channelId required' })
+    }
 
     const userData = userService.getUser(userId) || {}
-    const lastRead = { ...(userData.lastRead || {}) }
+    const lastRead = {}
+    if (isPlainObject(userData.lastRead)) {
+      for (const [key, value] of Object.entries(userData.lastRead)) {
+        if (!RESOURCE_ID_PATTERN.test(key)) continue
+        const ts = Number(value)
+        if (Number.isFinite(ts) && ts > 0) {
+          lastRead[key] = ts
+        }
+      }
+    }
     lastRead[channelId] = Date.now()
 
     // Use updateProfile instead of saveUser to avoid full user object serialization
@@ -1164,11 +1562,21 @@ router.post('/mark-read', async (req, res) => {
 
 // Update server mute setting
 router.put('/settings/server-mute', async (req, res) => {
-  const { serverId, muted } = req.body
+  const serverId = String(req.body?.serverId || '').trim()
+  const muted = req.body?.muted
+  if (!RESOURCE_ID_PATTERN.test(serverId) || typeof muted !== 'boolean') {
+    return res.status(400).json({ error: 'Invalid server mute payload' })
+  }
   const userId = req.user.id
   
   const userData = userService.getUser(userId) || {}
-  const serverMutes = userData.serverMutes || {}
+  const serverMutes = {}
+  if (isPlainObject(userData.serverMutes)) {
+    for (const [key, value] of Object.entries(userData.serverMutes)) {
+      if (!RESOURCE_ID_PATTERN.test(key) || typeof value !== 'boolean') continue
+      serverMutes[key] = value
+    }
+  }
   serverMutes[serverId] = muted
   
   // Use updateProfile instead of saveUser to avoid resetting admin roles
@@ -1180,10 +1588,17 @@ router.put('/settings/server-mute', async (req, res) => {
 
 // Get mutual friends with another user
 router.get('/:userId/mutual-friends', async (req, res) => {
-  const targetUserId = req.params.userId
-  const currentUserId = req.user.id
-  
   try {
+    const currentUserId = req.user.id
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+    const targetUserId = resolvedTarget.userId
+    if (hasBlockedRelationship(currentUserId, targetUserId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
+
     const mutualFriends = await getMutualFriendsFast(currentUserId, targetUserId)
     
     const friendsData = mutualFriends.map(friendId => {
@@ -1192,7 +1607,10 @@ router.get('/:userId/mutual-friends', async (req, res) => {
         id: friendId,
         username: profile?.username || 'Unknown',
         displayName: profile?.displayName,
-        imageUrl: profile?.imageUrl || profile?.imageurl || profile?.avatar || null,
+        imageUrl: resolveStoredProfileImage(profile?.imageUrl || profile?.imageurl || profile?.avatar, null, {
+          allowDataUrl: true,
+          maxDataBytes: MAX_AVATAR_UPLOAD_BYTES
+        }),
         avatar: resolveUserAvatar(friendId, profile)
       }
     })
@@ -1270,10 +1688,17 @@ router.put('/me/themes/active', async (req, res) => {
 
 // Get mutual servers with another user
 router.get('/:userId/mutual-servers', async (req, res) => {
-  const targetUserId = req.params.userId
-  const currentUserId = req.user.id
-  
   try {
+    const currentUserId = req.user.id
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+    const targetUserId = resolvedTarget.userId
+    if (hasBlockedRelationship(currentUserId, targetUserId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
+
     const mutualServers = await getMutualServersFast(currentUserId, targetUserId)
     res.json(mutualServers)
   } catch (err) {
@@ -1297,9 +1722,13 @@ const getProfileComments = (userId) => {
 // GET /api/users/:userId/comments
 router.get('/:userId/comments', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.params
-    const target = userService.getUser(userId)
-    if (!target) return res.status(404).json({ error: 'User not found' })
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { profile: target, userId } = resolvedTarget
+
+    if (userId !== req.user.id && hasBlockedRelationship(req.user.id, userId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
 
     // Respect allowComments privacy setting
     if (target.allowComments === false && req.user.id !== userId) {
@@ -1317,7 +1746,9 @@ router.get('/:userId/comments', authenticateToken, async (req, res) => {
 // POST /api/users/:userId/comments
 router.post('/:userId/comments', authenticateToken, async (req, res) => {
   try {
-    const { userId } = req.params
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { profile: target, userId } = resolvedTarget
     const { content } = req.body
 
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
@@ -1327,8 +1758,9 @@ router.post('/:userId/comments', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: `Comment must be ${MAX_COMMENT_LENGTH} characters or less` })
     }
 
-    const target = userService.getUser(userId)
-    if (!target) return res.status(404).json({ error: 'User not found' })
+    if (userId !== req.user.id && hasBlockedRelationship(req.user.id, userId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
 
     // Respect allowComments privacy setting
     if (target.allowComments === false) {
@@ -1368,13 +1800,18 @@ router.delete('/comments/:commentId', authenticateToken, async (req, res) => {
     const { commentId } = req.params
     // We need to find which user's profile has this comment
     // For efficiency, check if a targetUserId is passed as query param
-    const targetUserId = req.query.profileUserId
-    if (!targetUserId) {
+    const targetUserIdRaw = String(req.query.profileUserId || '').trim()
+    if (!targetUserIdRaw) {
       return res.status(400).json({ error: 'profileUserId query param required' })
     }
 
-    const target = userService.getUser(targetUserId)
-    if (!target) return res.status(404).json({ error: 'User not found' })
+    const resolvedTarget = resolveCanonicalUser(targetUserIdRaw)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { userId: targetUserId } = resolvedTarget
+
+    if (targetUserId !== req.user.id && hasBlockedRelationship(req.user.id, targetUserId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
 
     const comments = getProfileComments(targetUserId)
     const comment = comments.find(c => c.id === commentId)
@@ -1399,11 +1836,19 @@ router.delete('/comments/:commentId', authenticateToken, async (req, res) => {
 router.post('/comments/:commentId/like', authenticateToken, async (req, res) => {
   try {
     const { commentId } = req.params
-    const targetUserId = req.query.profileUserId
-    if (!targetUserId) return res.status(400).json({ error: 'profileUserId query param required' })
+    const targetUserIdRaw = String(req.query.profileUserId || '').trim()
+    if (!targetUserIdRaw) return res.status(400).json({ error: 'profileUserId query param required' })
 
-    const target = userService.getUser(targetUserId)
-    if (!target) return res.status(404).json({ error: 'User not found' })
+    const resolvedTarget = resolveCanonicalUser(targetUserIdRaw)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { profile: target, userId: targetUserId } = resolvedTarget
+
+    if (targetUserId !== req.user.id && hasBlockedRelationship(req.user.id, targetUserId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
+    if (target.allowComments === false && req.user.id !== targetUserId) {
+      return res.status(403).json({ error: 'This user has disabled profile comments' })
+    }
 
     const comments = getProfileComments(targetUserId)
     const idx = comments.findIndex(c => c.id === commentId)
@@ -1428,11 +1873,19 @@ router.post('/comments/:commentId/like', authenticateToken, async (req, res) => 
 router.delete('/comments/:commentId/like', authenticateToken, async (req, res) => {
   try {
     const { commentId } = req.params
-    const targetUserId = req.query.profileUserId
-    if (!targetUserId) return res.status(400).json({ error: 'profileUserId query param required' })
+    const targetUserIdRaw = String(req.query.profileUserId || '').trim()
+    if (!targetUserIdRaw) return res.status(400).json({ error: 'profileUserId query param required' })
 
-    const target = userService.getUser(targetUserId)
-    if (!target) return res.status(404).json({ error: 'User not found' })
+    const resolvedTarget = resolveCanonicalUser(targetUserIdRaw)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { profile: target, userId: targetUserId } = resolvedTarget
+
+    if (targetUserId !== req.user.id && hasBlockedRelationship(req.user.id, targetUserId)) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
+    if (target.allowComments === false && req.user.id !== targetUserId) {
+      return res.status(403).json({ error: 'This user has disabled profile comments' })
+    }
 
     const comments = getProfileComments(targetUserId)
     const idx = comments.findIndex(c => c.id === commentId)
@@ -1457,7 +1910,8 @@ router.get('/me/preferences', authenticateToken, async (req, res) => {
   try {
     const user = userService.getUser(req.user.id)
     if (!user) return res.status(404).json({ error: 'User not found' })
-    res.json(user.preferences || {})
+    const sanitizedPreferences = sanitizePreferencePatch(user.preferences || {}) || {}
+    res.json(sanitizedPreferences)
   } catch (err) {
     console.error('[API] Get preferences error:', err)
     res.status(500).json({ error: 'Failed to get preferences' })
@@ -1469,7 +1923,12 @@ router.put('/me/preferences', authenticateToken, async (req, res) => {
   try {
     const user = userService.getUser(req.user.id)
     if (!user) return res.status(404).json({ error: 'User not found' })
-    const updated = { ...(user.preferences || {}), ...req.body }
+    const existingPreferences = sanitizePreferencePatch(user.preferences || {}) || {}
+    const incomingPatch = sanitizePreferencePatch(req.body)
+    if (incomingPatch === null) {
+      return res.status(400).json({ error: 'Invalid preferences payload' })
+    }
+    const updated = { ...existingPreferences, ...incomingPatch }
     await userService.updateProfile(req.user.id, { preferences: updated })
     res.json(updated)
   } catch (err) {
@@ -1481,11 +1940,15 @@ router.put('/me/preferences', authenticateToken, async (req, res) => {
 // GET /api/users/:userId/activity
 router.get('/:userId/activity', authenticateToken, async (req, res) => {
   try {
-    const user = resolveUserByAnyId(req.params.userId)
-    if (!user) return res.status(404).json({ error: 'User not found' })
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { profile: user, userId } = resolvedTarget
+    if (!canAccessUserScopedData(req.user.id, userId, { requireFriend: true })) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
     // Return basic activity info - can be expanded later
     res.json({
-      userId: req.params.userId,
+      userId,
       lastSeen: user.lastSeen || user.updatedAt || null,
       status: user.status || 'offline',
       activity: user.activity || null
@@ -1499,13 +1962,17 @@ router.get('/:userId/activity', authenticateToken, async (req, res) => {
 // GET /api/users/:userId/stats
 router.get('/:userId/stats', authenticateToken, async (req, res) => {
   try {
-    const user = resolveUserByAnyId(req.params.userId)
-    if (!user) return res.status(404).json({ error: 'User not found' })
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { profile: user, userId } = resolvedTarget
+    if (!canAccessUserScopedData(req.user.id, userId, { requireFriend: true })) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
     res.json({
-      userId: req.params.userId,
+      userId,
       joinedAt: user.createdAt || null,
       messageCount: user.messageCount || 0,
-      friendCount: friendService.getFriends(user.id || req.params.userId).length
+      friendCount: friendService.getFriends(userId).length
     })
   } catch (err) {
     console.error('[API] Get user stats error:', err)
@@ -1516,9 +1983,14 @@ router.get('/:userId/stats', authenticateToken, async (req, res) => {
 // GET /api/users/:userId/customization
 router.get('/:userId/customization', authenticateToken, async (req, res) => {
   try {
-    const user = resolveUserByAnyId(req.params.userId)
-    if (!user) return res.status(404).json({ error: 'User not found' })
-    res.json(user.customization || {})
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) return res.status(404).json({ error: 'User not found' })
+    const { profile: user, userId } = resolvedTarget
+    if (userId !== req.user.id) {
+      return res.status(403).json({ error: 'Cannot access another user\'s customization' })
+    }
+    const sanitizedCustomization = sanitizeCustomizationPatch(user.customization || {}) || {}
+    res.json(sanitizedCustomization)
   } catch (err) {
     console.error('[API] Get customization error:', err)
     res.status(500).json({ error: 'Failed to get customization' })
@@ -1528,12 +2000,18 @@ router.get('/:userId/customization', authenticateToken, async (req, res) => {
 // PUT /api/users/:userId/customization
 router.put('/:userId/customization', authenticateToken, async (req, res) => {
   try {
-    if (req.params.userId !== req.user.id) {
+    const resolvedTarget = resolveCanonicalUser(req.params.userId) || { userId: String(req.params.userId || '').trim() }
+    if (resolvedTarget.userId !== req.user.id) {
       return res.status(403).json({ error: 'Cannot update another user\'s customization' })
     }
     const user = userService.getUser(req.user.id)
     if (!user) return res.status(404).json({ error: 'User not found' })
-    const updated = { ...(user.customization || {}), ...req.body }
+    const existingCustomization = sanitizeCustomizationPatch(user.customization || {}) || {}
+    const incomingPatch = sanitizeCustomizationPatch(req.body)
+    if (incomingPatch === null) {
+      return res.status(400).json({ error: 'Invalid customization payload' })
+    }
+    const updated = { ...existingCustomization, ...incomingPatch }
     await userService.updateProfile(req.user.id, { customization: updated })
     res.json(updated)
   } catch (err) {
@@ -1545,12 +2023,19 @@ router.put('/:userId/customization', authenticateToken, async (req, res) => {
 // GET /api/users/:userId/banner - returns banner image URL for a user
 router.get('/:userId/banner', async (req, res) => {
   try {
-    const user = resolveUserByAnyId(req.params.userId)
-    if (!user) {
+    const resolvedTarget = resolveCanonicalUser(req.params.userId)
+    if (!resolvedTarget) {
       return res.json({ banner: null })
     }
-    const bannerUrl = resolveStoredProfileImage(user.banner, null)
-    res.json({ banner: bannerUrl, userId: req.params.userId })
+    const { profile: user, userId } = resolvedTarget
+    if (hasBlockedRelationship(req.user.id, userId)) {
+      return res.json({ banner: null, userId })
+    }
+    const bannerUrl = resolveStoredProfileImage(user.banner, null, {
+      allowDataUrl: true,
+      maxDataBytes: MAX_DATA_IMAGE_BYTES
+    })
+    res.json({ banner: bannerUrl, userId })
   } catch (err) {
     console.error('[API] Get user banner error:', err)
     res.status(500).json({ error: 'Failed to get user banner' })
